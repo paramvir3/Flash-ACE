@@ -30,7 +30,7 @@ from torch_cluster import radius_graph
 
 from flashace.physics import ACE_Descriptor
 # AtomicClusterExpansion is the ACE descriptor module shipped with mace-torch
-from mace.modules.ace import AtomicClusterExpansion
+from mace.modules.atomic_cluster_expansion import AtomicClusterExpansion
 
 # 1) Load a tiny subset
 qm9 = QM9(root="./data/QM9", pre_transform=None)
