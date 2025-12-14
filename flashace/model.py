@@ -26,13 +26,17 @@ class FlashACE(nn.Module):
     def forward(self, data, training=False):
         z, pos, edge_index = data['z'], data['pos'], data['edge_index']
         cell_volume = data.get('volume', None)
-        
+
+        # We always need gradients w.r.t. atomic positions to compute forces.
+        # Detach to ensure we work with a leaf tensor before enabling grads.
+        pos = pos.detach()
+        pos.requires_grad_(True)
+
         if training and cell_volume is not None:
             epsilon = torch.zeros(3, 3, device=pos.device, requires_grad=True)
             pos = pos @ (torch.eye(3, device=pos.device) + epsilon)
         else:
             epsilon = None
-            pos.requires_grad_(True)
 
         edge_vec = pos[edge_index[0]] - pos[edge_index[1]]
         edge_len = torch.norm(edge_vec, dim=1)

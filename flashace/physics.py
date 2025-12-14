@@ -61,19 +61,27 @@ class ACE_Descriptor(nn.Module):
 
     def forward(self, node_attrs, edge_index, edge_vec, edge_len):
         sender, receiver = edge_index
-        
+
         # Stage 1: Projection
         radial_emb = soft_one_hot_linspace(
-            edge_len, 0.0, self.r_max, self.num_radial, 
+            edge_len, 0.0, self.r_max, self.num_radial,
             basis='bessel', cutoff=True
         )
         R_n = self.radial_net(radial_emb)
         Y_lm = self.sh(edge_vec)
-        
-        edge_feats = self.tp_a(R_n, Y_lm)
-        
+
+        # Incorporate atomic attributes on the sending atoms and gate them
+        # with the learned radial functions before combining with the
+        # spherical harmonics. This mirrors the ACE construction used by
+        # MACE, where chemical identity enters the A-basis.
+        node_feats = node_attrs[sender] * R_n
+        edge_feats = self.tp_a(node_feats, Y_lm)
+
         # Sum Neighbors
-        A_basis = torch.zeros(node_attrs.shape[0], edge_feats.shape[1], device=node_attrs.device)
+        A_basis = torch.zeros(
+            node_attrs.shape[0], edge_feats.shape[1],
+            device=node_attrs.device, dtype=edge_feats.dtype
+        )
         A_basis.index_add_(0, receiver, edge_feats)
         
         # Stage 2: Contraction (Linear scaling with N)
