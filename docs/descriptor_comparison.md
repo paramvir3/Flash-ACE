@@ -29,7 +29,8 @@ from torch_geometric.loader import DataLoader
 from torch_cluster import radius_graph
 
 from flashace.physics import ACE_Descriptor
-from mace.modules.ace import ACE
+# AtomicClusterExpansion is the ACE descriptor module shipped with mace-torch
+from mace.modules.ace import AtomicClusterExpansion
 
 # 1) Load a tiny subset
 qm9 = QM9(root="./data/QM9", pre_transform=None)
@@ -46,7 +47,7 @@ rel_vec = rel_vec / edge_len.view(-1, 1)
 # 3) Instantiate both descriptors with matching hyperparameters
 params = dict(r_max=cutoff, l_max=2, num_radial=6, hidden_dim=64)
 flash_desc = ACE_Descriptor(**params).eval()
-mace_desc = ACE(**params).eval()  # provided by mace-torch
+mace_desc = AtomicClusterExpansion(**params).eval()  # provided by mace-torch
 
 with torch.no_grad():
     flash_out = flash_desc(batch.x.float(), edge_index, rel_vec, edge_len)
