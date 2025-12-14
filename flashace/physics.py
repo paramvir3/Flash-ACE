@@ -101,40 +101,60 @@ class ACE_Descriptor(nn.Module):
 
         # 2. A-Basis Components
         self.radial_basis = ACERadialBasis(r_max, num_radial)
-        self.radial_net = FullyConnectedNet([num_radial, 64, hidden_dim], torch.nn.functional.silu)
-        self.sh = o3.SphericalHarmonics(self.irreps_sh, normalize=True, normalization='component')
-        
-        # Tensor Product (Radial * Angular)
+        self.sh = o3.SphericalHarmonics(
+            self.irreps_sh, normalize=True, normalization="component"
+        )
+
+        # In MACE, the radial network provides the weights for the tensor
+        # product that mixes atomic scalars with spherical harmonics. We mimic
+        # that by disabling internal weights on the tensor product and feeding
+        # in a learned radial-dependent weight vector at runtime.
         self.tp_a = o3.FullyConnectedTensorProduct(
-            self.irreps_node, self.irreps_sh, self.irreps_out,
-            internal_weights=True, shared_weights=True
+            self.irreps_node,
+            self.irreps_sh,
+            self.irreps_out,
+            internal_weights=False,
+            shared_weights=False,
+            normalization="component",
         )
-        
+        self.radial_net = FullyConnectedNet(
+            [num_radial, 64, self.tp_a.weight_numel], torch.nn.functional.silu
+        )
+
         # 3. B-Basis (Symmetric Contraction)
-        # Using Elementwise allows us to scale to high L without OOM
-        # (This is similar to the ACE 'scaling' approximation)
-        self.contraction = o3.ElementwiseTensorProduct(
-            self.irreps_out,     # Input 1
-            self.irreps_out      # Input 2
+        # Use a proper tensor product (Clebsch–Gordan coupling) rather than an
+        # elementwise product so the descriptor follows the ACE/MACE
+        # construction.
+        self.tp_b = o3.FullyConnectedTensorProduct(
+            self.irreps_out,
+            self.irreps_out,
+            self.irreps_out,
+            internal_weights=False,
+            shared_weights=True,
+            normalization="component",
         )
-        
+        self.b_weights = nn.Parameter(torch.randn(self.tp_b.weight_numel))
+
         # Linear Mixing to recover full feature interactions
-        self.mix = o3.Linear(self.contraction.irreps_out, self.irreps_out)
+        self.mix = o3.Linear(
+            self.tp_b.irreps_out, self.irreps_out, internal_weights=True, shared_weights=True
+        )
 
     def forward(self, node_attrs, edge_index, edge_vec, edge_len):
         sender, receiver = edge_index
 
         # Stage 1: Projection
         radial_emb = self.radial_basis(edge_len)
-        R_n = self.radial_net(radial_emb)
         Y_lm = self.sh(edge_vec)
+        tp_weights = self.radial_net(radial_emb)
 
-        # Incorporate atomic attributes on the sending atoms and gate them
-        # with the learned radial functions before combining with the
-        # spherical harmonics. This mirrors the ACE construction used by
-        # MACE, where chemical identity enters the A-basis.
-        node_feats = node_attrs[sender] * R_n
-        edge_feats = self.tp_a(node_feats, Y_lm)
+        # Incorporate atomic attributes on the sending atoms and gate the
+        # tensor product weights with the learned radial functions before
+        # combining with the spherical harmonics. This mirrors the ACE
+        # construction used by MACE, where chemical identity enters the
+        # A-basis through the tensor-product weights.
+        node_feats = node_attrs[sender]
+        edge_feats = self.tp_a(node_feats, Y_lm, tp_weights)
 
         # Sum Neighbors
         A_basis = torch.zeros(
@@ -144,8 +164,8 @@ class ACE_Descriptor(nn.Module):
         A_basis.index_add_(0, receiver, edge_feats)
         
         # Stage 2: Contraction (Linear scaling with N)
-        # B = A * A (Elementwise)
-        B_basis = self.contraction(A_basis, A_basis)
-        
+        # B = A ⊗ A with Clebsch–Gordan structure and shared learnable weights
+        B_basis = self.tp_b(A_basis, A_basis, self.b_weights)
+
         # Mix and Add Residual
         return self.mix(B_basis) + A_basis
