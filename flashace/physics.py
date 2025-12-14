@@ -1,8 +1,69 @@
+import math
+
 import torch
 import torch.nn as nn
 from e3nn import o3
 from e3nn.nn import FullyConnectedNet
-from e3nn.math import soft_one_hot_linspace
+
+
+class PolynomialCutoff(nn.Module):
+    """Smooth polynomial envelope used in MACE's radial basis.
+
+    The expression ``1 - (p + 1) * x**p + p * x**(p + 1)`` forces both the value and
+    first derivative to vanish at the cutoff, matching the formulation in
+    mace/modules/radial.py.
+    """
+
+    def __init__(self, r_max: float, p: int = 5):
+        super().__init__()
+        self.r_max = float(r_max)
+        self.p = p
+
+    def forward(self, distances: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(distances / self.r_max, max=1.0)
+        x_p = torch.pow(x, self.p)
+        return 1 - (self.p + 1) * x_p + self.p * x_p * x
+
+
+class BesselBasis(nn.Module):
+    """Bessel basis with normalization matching mace/modules/radial.py."""
+
+    def __init__(self, r_max: float, num_radial: int, trainable: bool = False):
+        super().__init__()
+        self.r_max = float(r_max)
+        freq = torch.arange(1, num_radial + 1, dtype=torch.get_default_dtype()) * math.pi
+        if trainable:
+            self.freq = nn.Parameter(freq)
+        else:
+            self.register_buffer("freq", freq)
+        self.norm = math.sqrt(2 / self.r_max)
+
+    def forward(self, distances: torch.Tensor) -> torch.Tensor:
+        distances = torch.clamp(distances, min=0.0)
+        scaled = distances.unsqueeze(-1) * self.freq / self.r_max
+
+        # Use the analytical limit for r -> 0 to avoid NaNs.
+        safe_dist = distances.unsqueeze(-1).clamp(min=torch.finfo(distances.dtype).eps)
+        bessel = torch.sin(scaled) / safe_dist
+        bessel = torch.where(
+            distances.unsqueeze(-1) == 0,
+            self.freq / self.r_max,
+            bessel,
+        )
+        return self.norm * bessel
+
+
+class ACERadialBasis(nn.Module):
+    """Polynomial cutoff times Bessel basis, mirroring MACE."""
+
+    def __init__(self, r_max: float, num_radial: int, envelope_exponent: int = 5):
+        super().__init__()
+        self.cutoff = PolynomialCutoff(r_max, p=envelope_exponent)
+        self.bessel = BesselBasis(r_max, num_radial)
+
+    def forward(self, distances: torch.Tensor) -> torch.Tensor:
+        cutoff = self.cutoff(distances)
+        return cutoff.unsqueeze(-1) * self.bessel(distances)
 
 class ACE_Descriptor(nn.Module):
     def __init__(self, r_max, l_max, num_radial, hidden_dim):
@@ -39,6 +100,7 @@ class ACE_Descriptor(nn.Module):
         # ------------------------------------------------------------------
 
         # 2. A-Basis Components
+        self.radial_basis = ACERadialBasis(r_max, num_radial)
         self.radial_net = FullyConnectedNet([num_radial, 64, hidden_dim], torch.nn.functional.silu)
         self.sh = o3.SphericalHarmonics(self.irreps_sh, normalize=True, normalization='component')
         
@@ -61,19 +123,24 @@ class ACE_Descriptor(nn.Module):
 
     def forward(self, node_attrs, edge_index, edge_vec, edge_len):
         sender, receiver = edge_index
-        
+
         # Stage 1: Projection
-        radial_emb = soft_one_hot_linspace(
-            edge_len, 0.0, self.r_max, self.num_radial, 
-            basis='bessel', cutoff=True
-        )
+        radial_emb = self.radial_basis(edge_len)
         R_n = self.radial_net(radial_emb)
         Y_lm = self.sh(edge_vec)
-        
-        edge_feats = self.tp_a(R_n, Y_lm)
-        
+
+        # Incorporate atomic attributes on the sending atoms and gate them
+        # with the learned radial functions before combining with the
+        # spherical harmonics. This mirrors the ACE construction used by
+        # MACE, where chemical identity enters the A-basis.
+        node_feats = node_attrs[sender] * R_n
+        edge_feats = self.tp_a(node_feats, Y_lm)
+
         # Sum Neighbors
-        A_basis = torch.zeros(node_attrs.shape[0], edge_feats.shape[1], device=node_attrs.device)
+        A_basis = torch.zeros(
+            node_attrs.shape[0], edge_feats.shape[1],
+            device=node_attrs.device, dtype=edge_feats.dtype
+        )
         A_basis.index_add_(0, receiver, edge_feats)
         
         # Stage 2: Contraction (Linear scaling with N)
