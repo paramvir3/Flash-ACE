@@ -28,3 +28,10 @@ the tensor shape unchanged, confirming the descriptor construction matches the M
 behavior.
 
 
+
+## Comparing descriptors on public datasets
+
+See `docs/descriptor_comparison.md` for recommended datasets (QM9, rMD17/MD17, OC20) and
+a short script that computes cosine similarity between the Flash-ACE and MACE
+implementations on a QM9 mini-batch. Running that check helps confirm the Flash-ACE
+descriptor matches the established MACE construction beyond the synthetic regression test.
