@@ -119,15 +119,18 @@ class ACE_Descriptor(nn.Module):
         )
 
         # 3. B-Basis (Symmetric Contraction)
-        # Use a proper tensor product (Clebsch–Gordan coupling) rather than an
-        # elementwise product so the descriptor follows the ACE/MACE
-        # construction.
+        # In MACE the B-basis is a pure Clebsch–Gordan contraction of A-basis
+        # channels with no additional learned weights inside the tensor
+        # product; the only learnable mixing happens in the following linear
+        # layer. Matching that behavior requires ``internal_weights=False`` and
+        # ``shared_weights=False`` so that the tensor product exactly mirrors
+        # the ACE construction before being remixed.
         self.tp_b = o3.FullyConnectedTensorProduct(
             self.irreps_out,
             self.irreps_out,
             self.irreps_out,
-            internal_weights=True,
-            shared_weights=True,
+            internal_weights=False,
+            shared_weights=False,
         )
 
         # Linear Mixing to recover full feature interactions
@@ -141,6 +144,12 @@ class ACE_Descriptor(nn.Module):
         Y_lm = self.sh(edge_vec)
         tp_weights = self.radial_net(radial_emb)
 
+        # Zero out contributions beyond the cutoff exactly as in MACE. The
+        # radial basis already vanishes at ``r_max`` but masking protects the
+        # downstream tensor products from spurious numerical noise when edges
+        # are padded or left over from a larger neighbor list.
+        edge_mask = (edge_len <= self.r_max).unsqueeze(-1)
+
         # Incorporate atomic attributes on the sending atoms and gate the
         # tensor product weights with the learned radial functions before
         # combining with the spherical harmonics. This mirrors the ACE
@@ -148,6 +157,7 @@ class ACE_Descriptor(nn.Module):
         # A-basis through the tensor-product weights.
         node_feats = node_attrs[sender]
         edge_feats = self.tp_a(node_feats, Y_lm, tp_weights)
+        edge_feats = edge_feats * edge_mask
 
         # Sum Neighbors
         A_basis = torch.zeros(
