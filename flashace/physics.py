@@ -62,7 +62,7 @@ class GaussianBasis(nn.Module):
     """Gaussian radial basis with optional learnable centers/widths.
 
     The centered Gaussians mirror the smoothly decaying descriptors used in
-    many message-passing potentials (e.g., PaiNN, SpookyNet) and can reduce the
+    modern equivariant potentials (e.g., PaiNN, SpookyNet) and can reduce the
     Gibbs-like ringing that Bessel bases sometimes exhibit near the cutoff.
     """
 
