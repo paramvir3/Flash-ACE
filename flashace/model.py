@@ -57,7 +57,9 @@ class FlashACE(nn.Module):
         # Avoid building second-order graphs during evaluation to reduce memory.
         grad_opts = {
             'create_graph': training,  # only keep graph for higher-order grads when training
-            'retain_graph': False,
+            # Retain the graph during training so we can also differentiate w.r.t. strain
+            # (epsilon) after computing forces.
+            'retain_graph': training and epsilon is not None,
             'allow_unused': True,
         }
 
