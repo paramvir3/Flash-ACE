@@ -68,7 +68,15 @@ class FlashACE(nn.Module):
         
         S = torch.zeros(3, 3, device=pos.device)
         if training and epsilon is not None:
-            g_eps = torch.autograd.grad(E, epsilon, create_graph=True, retain_graph=False, allow_unused=True)[0]
+            # Retain the graph so the outer loss.backward() can still traverse
+            # the computation graph built when taking the strain derivative.
+            g_eps = torch.autograd.grad(
+                E,
+                epsilon,
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True,
+            )[0]
             if g_eps is not None: S = -g_eps / cell_volume
                 
         return E, F, S
