@@ -185,6 +185,7 @@ def main():
     use_amp = config.get('use_amp', False) and device_type == 'cuda'
     amp_dtype = torch.float16 if config.get('amp_dtype', 'float16') == 'float16' else torch.bfloat16
     grad_accum_steps = max(1, int(config.get('grad_accum_steps', 1)))
+    
 
     print(f"Reading data from {config['train_file']}...")
     all_atoms = read(config['train_file'], index=":")
@@ -283,6 +284,8 @@ def main():
     energy_shift = torch.tensor(energy_shift_per_atom, dtype=torch.float32, device=device)
 
     history = {'train_loss':[], 'val_loss':[]}
+
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     
     print(f"{'Epoch':>5} | {'Loss':>8} | {'E (meV)':>8} | {'F (eV/A)':>8} | {'S (eV/A³)':>8} || {'Val Loss':>8} | {'Val E':>8} | {'Val F':>8}")
     print("-" * 95)
@@ -388,6 +391,27 @@ def main():
 
         print(f"{epoch+1:5d} | {avg_train_loss:8.4f} | {tr_e:8.2f} | {tr_f:8.4f} | {tr_s:8.4f} || {avg_val_loss:8.4f} | {val_e:8.2f} | {val_f:8.4f}")
 
+    # SAVE
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'config': {
+            'r_max': config['r_max'],
+            'l_max': config['l_max'],
+            'num_radial': config['num_radial'],
+            'hidden_dim': config['hidden_dim'],
+            'num_layers': config['num_layers'],
+            'radial_basis_type': config.get('radial_basis_type', 'bessel'),
+            'radial_trainable': config.get('radial_trainable', False),
+            'envelope_exponent': config.get('envelope_exponent', 5),
+            'gaussian_width': config.get('gaussian_width', 0.5),
+            'energy_shift_per_atom': energy_shift_per_atom,
+            'amp_dtype': config.get('amp_dtype', 'float16'),
+            'use_amp': config.get('use_amp', False),
+            'grad_accum_steps': grad_accum_steps,
+            'precompute_neighbors': config.get('precompute_neighbors', False),
+        }
+    }
+    torch.save(checkpoint, config['model_save_path'])
         ckpt_interval = int(config.get('checkpoint_interval', 0) or 0)
         if ckpt_interval > 0 and (epoch + 1) % ckpt_interval == 0:
             ckpt_dir = config.get('checkpoint_dir', 'checkpoints')
