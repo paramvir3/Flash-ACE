@@ -280,23 +280,25 @@ def main():
         val_metrics = MetricTracker()
         val_loss_accum = 0.0
 
-        with torch.no_grad():
-            for batch in valid_loader:
-                for item in batch:
-                    for k, v in item.items():
-                        if isinstance(v, torch.Tensor):
-                            item[k] = v.to(device, non_blocking=True)
+        for batch in valid_loader:
+            for item in batch:
+                for k, v in item.items():
+                    if isinstance(v, torch.Tensor):
+                        item[k] = v.to(device, non_blocking=True)
 
-                    with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-                        p_E, p_F, p_S = model(item, training=False)
-                        n_ats = len(item['z'])
-                        target_E = item['t_E'] - energy_shift * n_ats
-                        loss_e = ((p_E - target_E) / n_ats)**2
-                        loss_f = torch.mean((p_F - item['t_F'])**2)
-                        val_loss_accum += (config['energy_weight']*loss_e) + (config['forces_weight']*loss_f)
+                # Keep grad tracking on so autograd can form forces/stresses; we
+                # still avoid higher-order graphs with ``create_graph=False``
+                # inside the model during validation.
+                with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
+                    p_E, p_F, p_S = model(item, training=False)
+                    n_ats = len(item['z'])
+                    target_E = item['t_E'] - energy_shift * n_ats
+                    loss_e = ((p_E - target_E) / n_ats)**2
+                    loss_f = torch.mean((p_F - item['t_F'])**2)
+                    val_loss_accum += (config['energy_weight']*loss_e) + (config['forces_weight']*loss_f)
 
-                    pred_E_abs = p_E + energy_shift * n_ats
-                    val_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
+                pred_E_abs = p_E + energy_shift * n_ats
+                val_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
 
         avg_val_loss = val_loss_accum / len(val_atoms)
         val_e, val_f, val_s = val_metrics.get_metrics()
