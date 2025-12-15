@@ -4,6 +4,7 @@ import torch.optim as optim
 import numpy as np
 import time
 from ase.io import read
+from e3nn import o3
 from flashace.model import FlashACE
 from flashace.plotting import plot_training_results
 from ase.neighborlist import neighbor_list
@@ -15,9 +16,10 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 class AtomisticDataset(Dataset):
-    def __init__(self, atoms_list, r_max):
+    def __init__(self, atoms_list, r_max, random_rotation=False):
         self.atoms_list = atoms_list
         self.r_max = r_max
+        self.random_rotation = random_rotation
         
     def __len__(self): return len(self.atoms_list)
     
@@ -57,9 +59,18 @@ class AtomisticDataset(Dataset):
             if len(t_S.shape) == 1: t_S = t_S.view(3,3)
         
         # Neighbors
+        if self.random_rotation:
+            # Random SO(3) rotation applied via Wigner matrices to encourage rotationally
+            # equivariant learning even on small datasets. Energies remain invariant
+            # while forces/stresses are rotated consistently.
+            rot = o3.rand_matrix().to(dtype=pos.dtype)
+            pos = pos @ rot.T
+            t_F = t_F @ rot.T
+            t_S = rot @ t_S @ rot.T
+
         i, j = neighbor_list('ij', atoms, self.r_max)
         edge_index = torch.stack([torch.tensor(i), torch.tensor(j)], dim=0)
-        
+
         return {'z':z, 'pos':pos, 'edge_index':edge_index, 'volume':vol, 't_E':t_E, 't_F':t_F, 't_S':t_S}
     
     @staticmethod
@@ -123,8 +134,10 @@ def main():
     energy_shift = torch.tensor(energy_shift_per_atom, dtype=torch.float32, device=device)
 
     # DATALOADERS
-    train_ds = AtomisticDataset(train_atoms, config['r_max'])
-    val_ds = AtomisticDataset(val_atoms, config['r_max'])
+    train_ds = AtomisticDataset(
+        train_atoms, config['r_max'], random_rotation=config.get('random_rotation', False)
+    )
+    val_ds = AtomisticDataset(val_atoms, config['r_max'], random_rotation=False)
 
     # Reduced workers to prevent CPU overhead issues
     train_loader = DataLoader(train_ds, batch_size=config['batch_size'], 

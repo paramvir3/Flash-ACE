@@ -14,4 +14,8 @@ The Flash-ACE blocks add self-attention on top of an ACE-style message passing b
 
 Attention helps when its optimization and capacity needs are matched to the dataset. Treat layer count, basis size, LR schedule, and loss weights as coupled knobs rather than increasing depth alone.
 
+## Rotational augmentation with Wigner matrices
+
+If your dataset is small or lacks diverse orientations, you can enable per-item SO(3) rotations during training (`random_rotation: true` in `config.yaml`). The loader samples a random Wigner rotation, applies it to atomic positions, and consistently rotates forces and stresses. Energies stay invariant, so this augmentation teaches the network the expected equivariant responses without changing the underlying physics. Disable the flag for validation/test splits to measure accuracy on unaugmented geometries.
+
 
