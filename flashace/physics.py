@@ -26,7 +26,12 @@ class PolynomialCutoff(nn.Module):
 
 
 class BesselBasis(nn.Module):
-    """Bessel basis with normalization matching mace/modules/radial.py."""
+    """Bessel basis with normalization matching mace/modules/radial.py.
+
+    Setting ``trainable=True`` makes the frequencies learnable, similar to the
+    adaptive radial grids explored in GRACE and NequIP variants that refine the
+    basis where the data needs more resolution.
+    """
 
     def __init__(self, r_max: float, num_radial: int, trainable: bool = False):
         super().__init__()
@@ -53,20 +58,80 @@ class BesselBasis(nn.Module):
         return self.norm * bessel
 
 
-class ACERadialBasis(nn.Module):
-    """Polynomial cutoff times Bessel basis, mirroring MACE."""
+class GaussianBasis(nn.Module):
+    """Gaussian radial basis with optional learnable centers/widths.
 
-    def __init__(self, r_max: float, num_radial: int, envelope_exponent: int = 5):
+    The centered Gaussians mirror the smoothly decaying descriptors used in
+    many message-passing potentials (e.g., PaiNN, SpookyNet) and can reduce the
+    Gibbs-like ringing that Bessel bases sometimes exhibit near the cutoff.
+    """
+
+    def __init__(
+        self,
+        r_max: float,
+        num_radial: int,
+        width_factor: float = 0.5,
+        trainable: bool = False,
+    ) -> None:
+        super().__init__()
+        self.r_max = float(r_max)
+
+        centers = torch.linspace(0.0, self.r_max, num_radial + 2, dtype=torch.get_default_dtype())[1:-1]
+        delta = centers[1] - centers[0]
+        widths = torch.full_like(centers, width_factor * delta)
+
+        if trainable:
+            self.centers = nn.Parameter(centers)
+            self.widths = nn.Parameter(widths)
+        else:
+            self.register_buffer("centers", centers)
+            self.register_buffer("widths", widths)
+
+    def forward(self, distances: torch.Tensor) -> torch.Tensor:
+        distances = torch.clamp(distances, min=0.0)
+        diff = distances.unsqueeze(-1) - self.centers
+        return torch.exp(-0.5 * (diff / self.widths).pow(2))
+
+
+class ACERadialBasis(nn.Module):
+    """Cutoff-masked radial basis with Bessel or Gaussian options."""
+
+    def __init__(
+        self,
+        r_max: float,
+        num_radial: int,
+        envelope_exponent: int = 5,
+        basis_type: str = "bessel",
+        trainable: bool = False,
+        gaussian_width: float = 0.5,
+    ):
         super().__init__()
         self.cutoff = PolynomialCutoff(r_max, p=envelope_exponent)
-        self.bessel = BesselBasis(r_max, num_radial)
+
+        basis_type = basis_type.lower()
+        if basis_type == "bessel":
+            self.basis = BesselBasis(r_max, num_radial, trainable=trainable)
+        elif basis_type == "gaussian":
+            self.basis = GaussianBasis(r_max, num_radial, width_factor=gaussian_width, trainable=trainable)
+        else:
+            raise ValueError(f"Unsupported radial basis type: {basis_type}")
 
     def forward(self, distances: torch.Tensor) -> torch.Tensor:
         cutoff = self.cutoff(distances)
-        return cutoff.unsqueeze(-1) * self.bessel(distances)
+        return cutoff.unsqueeze(-1) * self.basis(distances)
 
 class ACE_Descriptor(nn.Module):
-    def __init__(self, r_max, l_max, num_radial, hidden_dim):
+    def __init__(
+        self,
+        r_max,
+        l_max,
+        num_radial,
+        hidden_dim,
+        radial_basis_type: str = "bessel",
+        radial_trainable: bool = False,
+        envelope_exponent: int = 5,
+        gaussian_width: float = 0.5,
+    ):
         super().__init__()
         self.r_max = r_max
         self.num_radial = num_radial
@@ -100,7 +165,14 @@ class ACE_Descriptor(nn.Module):
         # ------------------------------------------------------------------
 
         # 2. A-Basis Components
-        self.radial_basis = ACERadialBasis(r_max, num_radial)
+        self.radial_basis = ACERadialBasis(
+            r_max,
+            num_radial,
+            envelope_exponent=envelope_exponent,
+            basis_type=radial_basis_type,
+            trainable=radial_trainable,
+            gaussian_width=gaussian_width,
+        )
         self.sh = o3.SphericalHarmonics(self.irreps_sh, normalize=True, normalization="component")
 
         # In MACE, the radial network provides the weights for the tensor

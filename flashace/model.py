@@ -4,14 +4,34 @@ from .physics import ACE_Descriptor
 from .attention import DenseFlashAttention
 
 class FlashACE(nn.Module):
-    def __init__(self, r_max=5.0, l_max=2, num_radial=8, hidden_dim=128, num_layers=2):
+    def __init__(
+        self,
+        r_max=5.0,
+        l_max=2,
+        num_radial=8,
+        hidden_dim=128,
+        num_layers=2,
+        radial_basis_type: str = "bessel",
+        radial_trainable: bool = False,
+        envelope_exponent: int = 5,
+        gaussian_width: float = 0.5,
+    ):
         super().__init__()
-        self.hidden_dim = hidden_dim  
+        self.hidden_dim = hidden_dim
         self.r_max = r_max
         self.l_max = l_max
-        
+
         self.emb = nn.Embedding(118, hidden_dim)
-        self.ace = ACE_Descriptor(r_max, l_max, num_radial, hidden_dim)
+        self.ace = ACE_Descriptor(
+            r_max,
+            l_max,
+            num_radial,
+            hidden_dim,
+            radial_basis_type=radial_basis_type,
+            radial_trainable=radial_trainable,
+            envelope_exponent=envelope_exponent,
+            gaussian_width=gaussian_width,
+        )
         
         self.layers = nn.ModuleList([
             DenseFlashAttention(self.ace.irreps_out, hidden_dim) for _ in range(num_layers)
@@ -33,9 +53,25 @@ class FlashACE(nn.Module):
         pos.requires_grad_(True)
 
         if training and cell_volume is not None:
-            epsilon = torch.zeros(3, 3, device=pos.device, requires_grad=True)
-            pos = pos @ (torch.eye(3, device=pos.device) + epsilon)
+            # Parameterize the small-strain tensor symmetrically so the stress
+            # we backpropagate through corresponds to the symmetric Cauchy
+            # stress and does not pick up spurious rotational components. This
+            # matches how ACE/MACE form stresses by differentiating with
+            # respect to symmetric lattice strains.
+            strain_params = torch.zeros(6, device=pos.device, requires_grad=True)
+
+            epsilon = torch.zeros(3, 3, device=pos.device)
+            epsilon[0, 0] = strain_params[0]
+            epsilon[1, 1] = strain_params[1]
+            epsilon[2, 2] = strain_params[2]
+            epsilon[0, 1] = epsilon[1, 0] = strain_params[3]
+            epsilon[0, 2] = epsilon[2, 0] = strain_params[4]
+            epsilon[1, 2] = epsilon[2, 1] = strain_params[5]
+
+            deformation = torch.eye(3, device=pos.device) + epsilon
+            pos = pos @ deformation
         else:
+            strain_params = None
             epsilon = None
 
         edge_vec = pos[edge_index[0]] - pos[edge_index[1]]
@@ -72,11 +108,24 @@ class FlashACE(nn.Module):
             # the computation graph built when taking the strain derivative.
             g_eps = torch.autograd.grad(
                 E,
-                epsilon,
+                strain_params,
                 create_graph=True,
                 retain_graph=True,
                 allow_unused=True,
             )[0]
-            if g_eps is not None: S = -g_eps / cell_volume
-                
+            if g_eps is not None:
+                # Map the 6 unique components back to a symmetric stress tensor
+                # and normalize by the deformed volume to avoid overestimating
+                # stress under volumetric strain.
+                stress = torch.zeros(3, 3, device=pos.device)
+                stress[0, 0] = g_eps[0]
+                stress[1, 1] = g_eps[1]
+                stress[2, 2] = g_eps[2]
+                stress[0, 1] = stress[1, 0] = g_eps[3]
+                stress[0, 2] = stress[2, 0] = g_eps[4]
+                stress[1, 2] = stress[2, 1] = g_eps[5]
+
+                volume = cell_volume * torch.det(deformation)
+                S = -stress / volume
+
         return E, F, S
