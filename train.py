@@ -1,9 +1,13 @@
+import argparse
 import yaml
+import os
+from typing import Optional
 import torch
 import torch.optim as optim
 import numpy as np
 import time
 from ase.io import read
+from e3nn import o3
 from flashace.model import FlashACE
 from flashace.plotting import plot_training_results
 from ase.neighborlist import neighbor_list
@@ -14,10 +18,71 @@ from torch.utils.data import DataLoader, Dataset, random_split
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
+
+def _load_config(config_arg: Optional[str]):
+    """Load a YAML config, falling back to training/config.yaml if needed."""
+    candidates = []
+    if config_arg:
+        candidates.append(config_arg)
+    candidates.extend([
+        "config.yaml",
+        os.path.join("training", "config.yaml"),
+    ])
+
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            with open(candidate, "r") as f:
+                return yaml.safe_load(f), candidate
+
+    raise FileNotFoundError(
+        "No configuration file found. Provide --config or place config.yaml in the repo root or training/config.yaml."
+    )
+
+
+def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, energy_shift_per_atom):
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+        'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+        'config': {
+            'r_max': config['r_max'],
+            'l_max': config['l_max'],
+            'num_radial': config['num_radial'],
+            'hidden_dim': config['hidden_dim'],
+            'num_layers': config['num_layers'],
+            'radial_basis_type': config.get('radial_basis_type', 'bessel'),
+            'radial_trainable': config.get('radial_trainable', False),
+            'envelope_exponent': config.get('envelope_exponent', 5),
+            'gaussian_width': config.get('gaussian_width', 0.5),
+            'energy_shift_per_atom': energy_shift_per_atom,
+            'amp_dtype': config.get('amp_dtype', 'float16'),
+            'use_amp': config.get('use_amp', False),
+            'grad_accum_steps': max(1, int(config.get('grad_accum_steps', 1))),
+            'precompute_neighbors': config.get('precompute_neighbors', False),
+        }
+    }
+    torch.save(checkpoint, path)
+    print(f"Saved checkpoint to {path}")
+
 class AtomisticDataset(Dataset):
-    def __init__(self, atoms_list, r_max):
+    def __init__(self, atoms_list, r_max, random_rotation=False, precompute_neighbors=False):
         self.atoms_list = atoms_list
         self.r_max = r_max
+        self.random_rotation = random_rotation
+        self.precompute_neighbors = precompute_neighbors
+
+        self._edge_cache = None
+        if precompute_neighbors:
+            self._edge_cache = []
+            for atoms in atoms_list:
+                i, j = neighbor_list('ij', atoms, self.r_max)
+                edge_index = torch.stack(
+                    [torch.tensor(i, dtype=torch.long), torch.tensor(j, dtype=torch.long)], dim=0
+                )
+                self._edge_cache.append(edge_index)
         
     def __len__(self): return len(self.atoms_list)
     
@@ -57,9 +122,23 @@ class AtomisticDataset(Dataset):
             if len(t_S.shape) == 1: t_S = t_S.view(3,3)
         
         # Neighbors
-        i, j = neighbor_list('ij', atoms, self.r_max)
-        edge_index = torch.stack([torch.tensor(i), torch.tensor(j)], dim=0)
-        
+        if self.random_rotation:
+            # Random SO(3) rotation applied via Wigner matrices to encourage rotationally
+            # equivariant learning even on small datasets. Energies remain invariant
+            # while forces/stresses are rotated consistently.
+            rot = o3.rand_matrix().to(dtype=pos.dtype)
+            pos = pos @ rot.T
+            t_F = t_F @ rot.T
+            t_S = rot @ t_S @ rot.T
+
+        if self._edge_cache is not None:
+            edge_index = self._edge_cache[idx]
+        else:
+            i, j = neighbor_list('ij', atoms, self.r_max)
+            edge_index = torch.stack(
+                [torch.tensor(i, dtype=torch.long), torch.tensor(j, dtype=torch.long)], dim=0
+            )
+
         return {'z':z, 'pos':pos, 'edge_index':edge_index, 'volume':vol, 't_E':t_E, 't_F':t_F, 't_S':t_S}
     
     @staticmethod
@@ -94,13 +173,22 @@ def compute_mean_energy_per_atom(atoms_seq):
     return (total_energy / total_atoms) if total_atoms > 0 else 0.0
 
 def main():
-    print("--- Loading config.yaml ---")
-    with open("config.yaml", "r") as f: config = yaml.safe_load(f)
+    parser = argparse.ArgumentParser(description="Train Flash-ACE")
+    parser.add_argument("--config", "-c", default=None, help="Path to YAML config file")
+    args = parser.parse_args()
+
+    config, config_path = _load_config(args.config)
+    print(f"--- Loading {config_path} ---")
     device = config['device']
-    
+    device_type = device.split(":")[0]
+
+    use_amp = config.get('use_amp', False) and device_type == 'cuda'
+    amp_dtype = torch.float16 if config.get('amp_dtype', 'float16') == 'float16' else torch.bfloat16
+    grad_accum_steps = max(1, int(config.get('grad_accum_steps', 1)))
+
     print(f"Reading data from {config['train_file']}...")
     all_atoms = read(config['train_file'], index=":")
-    
+
     if config['valid_file']:
         val_atoms = read(config['valid_file'], index=":")
         train_atoms = all_atoms
@@ -108,7 +196,7 @@ def main():
         val_len = max(1, int(len(all_atoms) * config.get('val_split', 0.1)))
         train_len = len(all_atoms) - val_len
         train_atoms, val_atoms = random_split(
-            all_atoms, [train_len, val_len], 
+            all_atoms, [train_len, val_len],
             generator=torch.Generator().manual_seed(42)
         )
         print(f"Random Split: {train_len} Training | {val_len} Validation")
@@ -120,11 +208,19 @@ def main():
         energy_shift_per_atom = compute_mean_energy_per_atom(train_atoms)
         print(f"Computed mean energy per atom for normalization: {energy_shift_per_atom:.6f} eV")
 
-    energy_shift = torch.tensor(energy_shift_per_atom, dtype=torch.float32, device=device)
-
     # DATALOADERS
-    train_ds = AtomisticDataset(train_atoms, config['r_max'])
-    val_ds = AtomisticDataset(val_atoms, config['r_max'])
+    train_ds = AtomisticDataset(
+        train_atoms,
+        config['r_max'],
+        random_rotation=config.get('random_rotation', False),
+        precompute_neighbors=config.get('precompute_neighbors', False),
+    )
+    val_ds = AtomisticDataset(
+        val_atoms,
+        config['r_max'],
+        random_rotation=False,
+        precompute_neighbors=config.get('precompute_neighbors', False),
+    )
 
     # Reduced workers to prevent CPU overhead issues
     train_loader = DataLoader(train_ds, batch_size=config['batch_size'], 
@@ -136,51 +232,97 @@ def main():
 
     print("--- Initializing FlashACE ---")
     model = FlashACE(
-        r_max=config['r_max'], l_max=config['l_max'], num_radial=config['num_radial'], 
-        hidden_dim=config['hidden_dim'], num_layers=config['num_layers']
+        r_max=config['r_max'], l_max=config['l_max'], num_radial=config['num_radial'],
+        hidden_dim=config['hidden_dim'], num_layers=config['num_layers'],
+        radial_basis_type=config.get('radial_basis_type', 'bessel'),
+        radial_trainable=config.get('radial_trainable', False),
+        envelope_exponent=config.get('envelope_exponent', 5),
+        gaussian_width=config.get('gaussian_width', 0.5),
     ).to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], amsgrad=True)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=15, verbose=True)
+    optimizer = optim.Adam(
+        model.parameters(), lr=config['learning_rate'], amsgrad=True,
+        weight_decay=config.get('weight_decay', 0.0)
+    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=config.get('lr_scheduler_factor', 0.8),
+        patience=config.get('lr_scheduler_patience', 15),
+        min_lr=config.get('lr_min', 0.0),
+        verbose=True
+    )
+
+    resume_path = config.get('resume_from')
+    start_epoch = 0
+
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    if resume_path:
+        print(f"--- Loading checkpoint from {resume_path} ---")
+        checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+        if config.get('resume_load_optimizer', False) and checkpoint.get('optimizer_state_dict'):
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if config.get('resume_load_scheduler', False) and checkpoint.get('scheduler_state_dict'):
+            if checkpoint['scheduler_state_dict'] is not None:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if config.get('resume_load_scaler', False) and checkpoint.get('scaler_state_dict') and scaler.is_enabled():
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+        if config.get('use_checkpoint_energy_shift', True):
+            ckpt_shift = checkpoint.get('config', {}).get('energy_shift_per_atom')
+            if ckpt_shift is not None:
+                energy_shift_per_atom = ckpt_shift
+                print(f"Using checkpoint energy shift per atom: {energy_shift_per_atom:.6f} eV")
+
+        start_epoch = int(checkpoint.get('epoch', 0))
+        print(f"Resuming training from epoch {start_epoch}")
+
+    energy_shift = torch.tensor(energy_shift_per_atom, dtype=torch.float32, device=device)
 
     history = {'train_loss':[], 'val_loss':[]}
     
     print(f"{'Epoch':>5} | {'Loss':>8} | {'E (meV)':>8} | {'F (eV/A)':>8} | {'S (eV/A³)':>8} || {'Val Loss':>8} | {'Val E':>8} | {'Val F':>8}")
     print("-" * 95)
     
-    for epoch in range(config['epochs']):
+    for epoch in range(start_epoch, config['epochs']):
         model.train()
         train_metrics = MetricTracker()
         total_loss = 0.0
-        
-        for batch in train_loader:
-            optimizer.zero_grad(set_to_none=True)
+
+        batch_idx = -1
+        optimizer.zero_grad(set_to_none=True)
+
+        for batch_idx, batch in enumerate(train_loader):
             batch_loss = 0.0
-            
-            # --- GRADIENT ACCUMULATION (FP32) ---
+
+            # --- GRADIENT ACCUMULATION (FP32/AMP) ---
             for item in batch:
                 for k, v in item.items():
                     if isinstance(v, torch.Tensor):
                         item[k] = v.to(device, non_blocking=True)
 
-                # Standard Forward (No AMP)
-                p_E, p_F, p_S = model(item, training=True)
-                n_ats = len(item['z'])
+                # Standard Forward with optional AMP
+                with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
+                    p_E, p_F, p_S = model(item, training=True)
+                    n_ats = len(item['z'])
 
-                target_E = item['t_E'] - energy_shift * n_ats
-                loss_e = ((p_E - target_E) / n_ats)**2
-                loss_f = torch.mean((p_F - item['t_F'])**2)
-                loss_s = torch.tensor(0.0, device=device)
-                if torch.norm(item['t_S']) > 1e-6:
-                    loss_s = torch.mean((p_S - item['t_S'])**2)
-                
-                loss_item = (config['energy_weight']*loss_e) + \
-                            (config['forces_weight']*loss_f) + \
-                            (config['stress_weight']*loss_s)
-                
+                    target_E = item['t_E'] - energy_shift * n_ats
+                    loss_e = ((p_E - target_E) / n_ats)**2
+                    loss_f = torch.mean((p_F - item['t_F'])**2)
+                    loss_s = torch.tensor(0.0, device=device)
+                    if torch.norm(item['t_S']) > 1e-6:
+                        loss_s = torch.mean((p_S - item['t_S'])**2)
+
+                    loss_item = (config['energy_weight']*loss_e) + \
+                                (config['forces_weight']*loss_f) + \
+                                (config['stress_weight']*loss_s)
+
                 # Normalize and Backward
-                loss_batch = loss_item / len(batch)
-                loss_batch.backward()
+                loss_batch = loss_item / (len(batch) * grad_accum_steps)
+                scaler.scale(loss_batch).backward()
 
                 batch_loss += loss_item.item()
 
@@ -188,8 +330,27 @@ def main():
                     pred_E_abs = p_E + energy_shift * n_ats
                     train_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
 
-            optimizer.step()
+            if (batch_idx + 1) % grad_accum_steps == 0:
+                if config.get('clip_grad_norm', None):
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), config['clip_grad_norm']
+                    )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
             total_loss += batch_loss
+
+        # Flush any residual gradients if the last batch didn't trigger a step
+        if batch_idx >= 0 and (batch_idx + 1) % grad_accum_steps != 0:
+            if config.get('clip_grad_norm', None):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), config['clip_grad_norm']
+                )
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         avg_train_loss = total_loss / len(train_atoms)
         tr_e, tr_f, tr_s = train_metrics.get_metrics()
@@ -199,44 +360,43 @@ def main():
         model.eval()
         val_metrics = MetricTracker()
         val_loss_accum = 0.0
-        
+
         for batch in valid_loader:
             for item in batch:
                 for k, v in item.items():
                     if isinstance(v, torch.Tensor):
                         item[k] = v.to(device, non_blocking=True)
 
-                p_E, p_F, p_S = model(item, training=False)
-                n_ats = len(item['z'])
-                target_E = item['t_E'] - energy_shift * n_ats
-                loss_e = ((p_E - target_E) / n_ats)**2
-                loss_f = torch.mean((p_F - item['t_F'])**2)
-                val_loss_accum += (config['energy_weight']*loss_e) + (config['forces_weight']*loss_f)
+                # Keep grad tracking on so autograd can form forces/stresses; we
+                # still avoid higher-order graphs with ``create_graph=False``
+                # inside the model during validation.
+                with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
+                    p_E, p_F, p_S = model(item, training=False)
+                    n_ats = len(item['z'])
+                    target_E = item['t_E'] - energy_shift * n_ats
+                    loss_e = ((p_E - target_E) / n_ats)**2
+                    loss_f = torch.mean((p_F - item['t_F'])**2)
+                    val_loss_accum += (config['energy_weight']*loss_e) + (config['forces_weight']*loss_f)
 
-                with torch.no_grad():
-                    pred_E_abs = p_E + energy_shift * n_ats
-                    val_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
+                pred_E_abs = p_E + energy_shift * n_ats
+                val_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
 
         avg_val_loss = val_loss_accum / len(val_atoms)
         val_e, val_f, val_s = val_metrics.get_metrics()
         history['val_loss'].append(avg_val_loss)
         scheduler.step(avg_val_loss)
-        
+
         print(f"{epoch+1:5d} | {avg_train_loss:8.4f} | {tr_e:8.2f} | {tr_f:8.4f} | {tr_s:8.4f} || {avg_val_loss:8.4f} | {val_e:8.2f} | {val_f:8.4f}")
 
-    # SAVE
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'config': {
-            'r_max': config['r_max'],
-            'l_max': config['l_max'],
-            'num_radial': config['num_radial'],
-            'hidden_dim': config['hidden_dim'],
-            'num_layers': config['num_layers'],
-            'energy_shift_per_atom': energy_shift_per_atom
-        }
-    }
-    torch.save(checkpoint, config['model_save_path'])
+        ckpt_interval = int(config.get('checkpoint_interval', 0) or 0)
+        if ckpt_interval > 0 and (epoch + 1) % ckpt_interval == 0:
+            ckpt_dir = config.get('checkpoint_dir', 'checkpoints')
+            ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch+1}.pt")
+            save_checkpoint(ckpt_path, epoch + 1, model, optimizer, scheduler, scaler,
+                            config, energy_shift_per_atom)
+
+    save_checkpoint(config['model_save_path'], config['epochs'], model, optimizer, scheduler, scaler,
+                    config, energy_shift_per_atom)
     print(f"Training Finished. Saved to {config['model_save_path']}")
 
 if __name__ == "__main__": main()
