@@ -22,7 +22,14 @@ num_layers: 2
 # ------------------------------------------------------------------------------
 epochs: 300
 batch_size: 8
-learning_rate: 0.01
+# Lower start LR for stability; scheduler will reduce further on plateaus
+learning_rate: 0.001
+# Optional optimizer and scheduler tweaks
+weight_decay: 0.0
+lr_scheduler_factor: 0.5
+lr_scheduler_patience: 8
+lr_min: 0.00001
+clip_grad_norm: 5.0
 device: "cuda"
 
 # ------------------------------------------------------------------------------

@@ -140,8 +140,18 @@ def main():
         hidden_dim=config['hidden_dim'], num_layers=config['num_layers']
     ).to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], amsgrad=True)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=15, verbose=True)
+    optimizer = optim.Adam(
+        model.parameters(), lr=config['learning_rate'], amsgrad=True,
+        weight_decay=config.get('weight_decay', 0.0)
+    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=config.get('lr_scheduler_factor', 0.8),
+        patience=config.get('lr_scheduler_patience', 15),
+        min_lr=config.get('lr_min', 0.0),
+        verbose=True
+    )
 
     history = {'train_loss':[], 'val_loss':[]}
     
@@ -188,6 +198,10 @@ def main():
                     pred_E_abs = p_E + energy_shift * n_ats
                     train_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
 
+            if config.get('clip_grad_norm', None):
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), config['clip_grad_norm']
+                )
             optimizer.step()
             total_loss += batch_loss
 
