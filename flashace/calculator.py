@@ -32,7 +32,9 @@ class FlashACECalculator(Calculator):
             raise KeyError("Model file missing 'config'. Please retrain with updated train.py.")
 
         conf = checkpoint['config']
-        
+
+        self.energy_shift_per_atom = float(conf.get('energy_shift_per_atom', 0.0))
+
         # Ensure cutoff is float
         self.r_max = float(conf['r_max'])
 
@@ -75,12 +77,15 @@ class FlashACECalculator(Calculator):
         
         # 3. Run Model
         calc_stress = 'stress' in properties
-        
+
         # If calculating stress, enable gradients w.r.t cell (training=True)
         if calc_stress:
             pred_E, pred_F, pred_S = self.model(data, training=True)
         else:
             pred_E, pred_F, _ = self.model(data, training=False)
+
+        energy_shift = self.energy_shift_per_atom * len(atoms)
+        pred_E = pred_E + energy_shift
 
         # 4. Store Results
         self.results['energy'] = pred_E.item()
