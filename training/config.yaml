@@ -16,10 +16,16 @@ l_max: 1
 num_radial: 12
 hidden_dim: 128
 num_layers: 2
-radial_basis_type: "bessel"       # Options: bessel, gaussian
+radial_basis_type: "bessel"       # Options: bessel, gaussian, orthogonal
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)
 gaussian_width: 0.5              # Relative Gaussian width multiplier (only used if basis=gaussian)
+l1_taper: 0.5                     # Fraction of scalar channels kept for l=1 irreps
+high_l_taper: 0.25                # Fraction of scalar channels kept for l>=2 irreps
+soft_edge_margin: 0.0             # Soft ramp width below r_max to smooth force discontinuities
+learnable_b_contraction: false    # Learn Clebsch–Gordan contraction weights instead of fixing to ones
+gauge_mixing: false               # Insert learnable mixing inside each irrep before B-basis contraction
+factorized_gates: false           # Gate radial tensor-product weights with angular power (directional emphasis)
 
 # ------------------------------------------------------------------------------
 # 3. TRAINING PARAMETERS

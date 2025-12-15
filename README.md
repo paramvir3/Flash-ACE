@@ -59,6 +59,8 @@ Additional knobs: `envelope_exponent` controls how sharply the polynomial cutoff
 - **Gauge mixing layer.** `gauge_mixing: true` inserts a learnable unitary mix within each irreducible representation channel before the B-basis to explore alternative CG gauges automatically.
 - **Factorized radial/angle gate.** `factorized_gates: true` modulates the radial tensor-product weights with an angular-power gate, letting the descriptor emphasize sharply directional neighborhoods without changing the core ACE structure.
 
+The sample `training/config.yaml` exposes these knobs so you can toggle them per run without editing code.
+
 
 ## Stress computation hygiene
 
