@@ -34,6 +34,10 @@ lr_scheduler_factor: 0.5
 lr_scheduler_patience: 8
 lr_min: 0.00001
 clip_grad_norm: 5.0
+use_amp: true                    # Enable mixed precision on CUDA for speed
+amp_dtype: "float16"             # Options: float16, bfloat16
+grad_accum_steps: 1              # Gradient accumulation steps before optimizer step
+precompute_neighbors: true       # Cache neighbor lists to cut CPU overhead
 random_rotation: false           # Apply random SO(3) rotations per batch item
 device: "cuda"
 

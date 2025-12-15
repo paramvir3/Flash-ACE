@@ -14,6 +14,12 @@ The Flash-ACE blocks add self-attention on top of an ACE-style message passing b
 
 Attention helps when its optimization and capacity needs are matched to the dataset. Treat layer count, basis size, LR schedule, and loss weights as coupled knobs rather than increasing depth alone.
 
+## Throughput levers for faster, more scalable training
+
+- **Mixed precision on CUDA.** Set `use_amp: true` (default) to enable `torch.cuda.amp` with `amp_dtype` (`float16` or `bfloat16`). This typically halves memory traffic and speeds up matmuls/attention without hurting accuracy.
+- **Gradient accumulation.** When GPU memory is tight, raise `grad_accum_steps` to simulate larger batches while keeping per-step memory smaller. Losses are normalized automatically so learning dynamics stay stable.
+- **Cached neighbor lists.** Enable `precompute_neighbors: true` to build ASE neighbor lists once per structure and reuse them every epoch. This reduces Python/CPU overhead on large datasets where the geometry does not change during training.
+
 ## Rotational augmentation with Wigner matrices
 
 If your dataset is small or lacks diverse orientations, you can enable per-item SO(3) rotations during training (`random_rotation: true` in `config.yaml`). The loader samples a random Wigner rotation, applies it to atomic positions, and consistently rotates forces and stresses. Energies stay invariant, so this augmentation teaches the network the expected equivariant responses without changing the underlying physics. Disable the flag for validation/test splits to measure accuracy on unaugmented geometries.

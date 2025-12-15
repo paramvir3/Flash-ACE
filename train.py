@@ -16,10 +16,21 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 class AtomisticDataset(Dataset):
-    def __init__(self, atoms_list, r_max, random_rotation=False):
+    def __init__(self, atoms_list, r_max, random_rotation=False, precompute_neighbors=False):
         self.atoms_list = atoms_list
         self.r_max = r_max
         self.random_rotation = random_rotation
+        self.precompute_neighbors = precompute_neighbors
+
+        self._edge_cache = None
+        if precompute_neighbors:
+            self._edge_cache = []
+            for atoms in atoms_list:
+                i, j = neighbor_list('ij', atoms, self.r_max)
+                edge_index = torch.stack(
+                    [torch.tensor(i, dtype=torch.long), torch.tensor(j, dtype=torch.long)], dim=0
+                )
+                self._edge_cache.append(edge_index)
         
     def __len__(self): return len(self.atoms_list)
     
@@ -68,8 +79,13 @@ class AtomisticDataset(Dataset):
             t_F = t_F @ rot.T
             t_S = rot @ t_S @ rot.T
 
-        i, j = neighbor_list('ij', atoms, self.r_max)
-        edge_index = torch.stack([torch.tensor(i), torch.tensor(j)], dim=0)
+        if self._edge_cache is not None:
+            edge_index = self._edge_cache[idx]
+        else:
+            i, j = neighbor_list('ij', atoms, self.r_max)
+            edge_index = torch.stack(
+                [torch.tensor(i, dtype=torch.long), torch.tensor(j, dtype=torch.long)], dim=0
+            )
 
         return {'z':z, 'pos':pos, 'edge_index':edge_index, 'volume':vol, 't_E':t_E, 't_F':t_F, 't_S':t_S}
     
@@ -108,6 +124,11 @@ def main():
     print("--- Loading config.yaml ---")
     with open("config.yaml", "r") as f: config = yaml.safe_load(f)
     device = config['device']
+    device_type = device.split(":")[0]
+
+    use_amp = config.get('use_amp', False) and device_type == 'cuda'
+    amp_dtype = torch.float16 if config.get('amp_dtype', 'float16') == 'float16' else torch.bfloat16
+    grad_accum_steps = max(1, int(config.get('grad_accum_steps', 1)))
     
     print(f"Reading data from {config['train_file']}...")
     all_atoms = read(config['train_file'], index=":")
@@ -135,9 +156,17 @@ def main():
 
     # DATALOADERS
     train_ds = AtomisticDataset(
-        train_atoms, config['r_max'], random_rotation=config.get('random_rotation', False)
+        train_atoms,
+        config['r_max'],
+        random_rotation=config.get('random_rotation', False),
+        precompute_neighbors=config.get('precompute_neighbors', False),
     )
-    val_ds = AtomisticDataset(val_atoms, config['r_max'], random_rotation=False)
+    val_ds = AtomisticDataset(
+        val_atoms,
+        config['r_max'],
+        random_rotation=False,
+        precompute_neighbors=config.get('precompute_neighbors', False),
+    )
 
     # Reduced workers to prevent CPU overhead issues
     train_loader = DataLoader(train_ds, batch_size=config['batch_size'], 
@@ -171,6 +200,8 @@ def main():
     )
 
     history = {'train_loss':[], 'val_loss':[]}
+
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     
     print(f"{'Epoch':>5} | {'Loss':>8} | {'E (meV)':>8} | {'F (eV/A)':>8} | {'S (eV/A³)':>8} || {'Val Loss':>8} | {'Val E':>8} | {'Val F':>8}")
     print("-" * 95)
@@ -179,35 +210,38 @@ def main():
         model.train()
         train_metrics = MetricTracker()
         total_loss = 0.0
-        
-        for batch in train_loader:
-            optimizer.zero_grad(set_to_none=True)
+
+        batch_idx = -1
+        optimizer.zero_grad(set_to_none=True)
+
+        for batch_idx, batch in enumerate(train_loader):
             batch_loss = 0.0
-            
-            # --- GRADIENT ACCUMULATION (FP32) ---
+
+            # --- GRADIENT ACCUMULATION (FP32/AMP) ---
             for item in batch:
                 for k, v in item.items():
                     if isinstance(v, torch.Tensor):
                         item[k] = v.to(device, non_blocking=True)
 
-                # Standard Forward (No AMP)
-                p_E, p_F, p_S = model(item, training=True)
-                n_ats = len(item['z'])
+                # Standard Forward with optional AMP
+                with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
+                    p_E, p_F, p_S = model(item, training=True)
+                    n_ats = len(item['z'])
 
-                target_E = item['t_E'] - energy_shift * n_ats
-                loss_e = ((p_E - target_E) / n_ats)**2
-                loss_f = torch.mean((p_F - item['t_F'])**2)
-                loss_s = torch.tensor(0.0, device=device)
-                if torch.norm(item['t_S']) > 1e-6:
-                    loss_s = torch.mean((p_S - item['t_S'])**2)
-                
-                loss_item = (config['energy_weight']*loss_e) + \
-                            (config['forces_weight']*loss_f) + \
-                            (config['stress_weight']*loss_s)
-                
+                    target_E = item['t_E'] - energy_shift * n_ats
+                    loss_e = ((p_E - target_E) / n_ats)**2
+                    loss_f = torch.mean((p_F - item['t_F'])**2)
+                    loss_s = torch.tensor(0.0, device=device)
+                    if torch.norm(item['t_S']) > 1e-6:
+                        loss_s = torch.mean((p_S - item['t_S'])**2)
+
+                    loss_item = (config['energy_weight']*loss_e) + \
+                                (config['forces_weight']*loss_f) + \
+                                (config['stress_weight']*loss_s)
+
                 # Normalize and Backward
-                loss_batch = loss_item / len(batch)
-                loss_batch.backward()
+                loss_batch = loss_item / (len(batch) * grad_accum_steps)
+                scaler.scale(loss_batch).backward()
 
                 batch_loss += loss_item.item()
 
@@ -215,12 +249,27 @@ def main():
                     pred_E_abs = p_E + energy_shift * n_ats
                     train_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
 
+            if (batch_idx + 1) % grad_accum_steps == 0:
+                if config.get('clip_grad_norm', None):
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), config['clip_grad_norm']
+                    )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            total_loss += batch_loss
+
+        # Flush any residual gradients if the last batch didn't trigger a step
+        if batch_idx >= 0 and (batch_idx + 1) % grad_accum_steps != 0:
             if config.get('clip_grad_norm', None):
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), config['clip_grad_norm']
                 )
-            optimizer.step()
-            total_loss += batch_loss
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         avg_train_loss = total_loss / len(train_atoms)
         tr_e, tr_f, tr_s = train_metrics.get_metrics()
@@ -230,21 +279,22 @@ def main():
         model.eval()
         val_metrics = MetricTracker()
         val_loss_accum = 0.0
-        
-        for batch in valid_loader:
-            for item in batch:
-                for k, v in item.items():
-                    if isinstance(v, torch.Tensor):
-                        item[k] = v.to(device, non_blocking=True)
 
-                p_E, p_F, p_S = model(item, training=False)
-                n_ats = len(item['z'])
-                target_E = item['t_E'] - energy_shift * n_ats
-                loss_e = ((p_E - target_E) / n_ats)**2
-                loss_f = torch.mean((p_F - item['t_F'])**2)
-                val_loss_accum += (config['energy_weight']*loss_e) + (config['forces_weight']*loss_f)
+        with torch.no_grad():
+            for batch in valid_loader:
+                for item in batch:
+                    for k, v in item.items():
+                        if isinstance(v, torch.Tensor):
+                            item[k] = v.to(device, non_blocking=True)
 
-                with torch.no_grad():
+                    with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
+                        p_E, p_F, p_S = model(item, training=False)
+                        n_ats = len(item['z'])
+                        target_E = item['t_E'] - energy_shift * n_ats
+                        loss_e = ((p_E - target_E) / n_ats)**2
+                        loss_f = torch.mean((p_F - item['t_F'])**2)
+                        val_loss_accum += (config['energy_weight']*loss_e) + (config['forces_weight']*loss_f)
+
                     pred_E_abs = p_E + energy_shift * n_ats
                     val_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
 
@@ -268,7 +318,11 @@ def main():
             'radial_trainable': config.get('radial_trainable', False),
             'envelope_exponent': config.get('envelope_exponent', 5),
             'gaussian_width': config.get('gaussian_width', 0.5),
-            'energy_shift_per_atom': energy_shift_per_atom
+            'energy_shift_per_atom': energy_shift_per_atom,
+            'amp_dtype': config.get('amp_dtype', 'float16'),
+            'use_amp': config.get('use_amp', False),
+            'grad_accum_steps': grad_accum_steps,
+            'precompute_neighbors': config.get('precompute_neighbors', False),
         }
     }
     torch.save(checkpoint, config['model_save_path'])
