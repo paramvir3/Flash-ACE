@@ -33,7 +33,15 @@ class FlashACECalculator(Calculator):
 
         conf = checkpoint['config']
 
-        self.energy_shift_per_atom = float(conf.get('energy_shift_per_atom', 0.0))
+        self.atomic_energy_map = {int(k): float(v) for k, v in (conf.get('atomic_energies') or {}).items()}
+        self.energy_shift_per_atom = float(conf.get('energy_shift_per_atom', 0.0)) if conf.get('energy_shift_per_atom') is not None else 0.0
+        self.atomic_energy_tensor = None
+        if self.atomic_energy_map:
+            max_z = max(self.atomic_energy_map)
+            tensor = torch.zeros(max_z + 1, dtype=torch.float32, device=self.device)
+            for z, val in self.atomic_energy_map.items():
+                tensor[z] = val
+            self.atomic_energy_tensor = tensor
 
         # Ensure cutoff is float
         self.r_max = float(conf['r_max'])
@@ -84,8 +92,14 @@ class FlashACECalculator(Calculator):
         else:
             pred_E, pred_F, _ = self.model(data, training=False)
 
-        energy_shift = self.energy_shift_per_atom * len(atoms)
-        pred_E = pred_E + energy_shift
+        if self.atomic_energy_tensor is not None:
+            if torch.max(z).item() >= self.atomic_energy_tensor.shape[0]:
+                raise ValueError("Encountered atomic number without reference energy in atomic_energies")
+            baseline = torch.sum(self.atomic_energy_tensor[z])
+        else:
+            baseline = torch.tensor(self.energy_shift_per_atom * len(atoms), device=self.device)
+
+        pred_E = pred_E + baseline
 
         # 4. Store Results
         self.results['energy'] = pred_E.item()

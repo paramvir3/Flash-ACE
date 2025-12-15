@@ -15,9 +15,9 @@ Example:
 python train.py --config training/config.yaml
 ```
 
-## Why attention may not always beat message passing
+## Why deeper attention stacks need extra care
 
-The Flash-ACE blocks add self-attention on top of an ACE-style message passing backbone, but deeper attention stacks are not guaranteed to outperform shallower message passing networks out of the box. In practice, energy errors can rise when simply increasing `num_layers` for several reasons:
+Flash-ACE relies on dense self-attention over equivariant descriptors rather than any message-passing layers, but deeper attention stacks are not guaranteed to outperform shallower ones out of the box. In practice, energy errors can rise when simply increasing `num_layers` for several reasons:
 
 - **Optimization sensitivity.** Attention layers introduce more parameters and sharper loss landscapes, so learning rates that were stable for 2 layers (e.g., `1e-2`) can become too aggressive at 4 layers. Start with a smaller LR (`1e-3`–`5e-4`), enable gradient clipping, and let the LR scheduler react faster.
 - **Loss balance.** With forces weighted 10× over energies, the model can overfit forces when capacity increases, hurting energy RMSE. Temporarily raise `energy_weight` or lower `forces_weight` while deeper attention trains, then restore the balance once energies improve.
@@ -36,7 +36,7 @@ Attention helps when its optimization and capacity needs are matched to the data
 
 - **Save as frequently as you like.** Set `checkpoint_interval: N` in `config.yaml` to dump checkpoints every `N` epochs into `checkpoint_dir` (default `checkpoints/`). A full checkpoint includes model weights plus optimizer, scheduler, and AMP scaler states for exact restarts.
 - **Resume while changing loss weights.** Point `resume_from` to a saved checkpoint. By default, only the model weights and the stored energy normalization shift are restored, so you can freely tweak `energy_weight`, `forces_weight`, `stress_weight`, or other training hyperparameters between runs. Flip on `resume_load_optimizer`, `resume_load_scheduler`, or `resume_load_scaler` if you want to continue with the same optimizer/scheduler/AMP state instead.
-- **Energy normalization consistency.** `use_checkpoint_energy_shift: true` keeps the per-atom energy shift from the checkpoint for consistent normalization across resumes. Set it to `false` to recompute a shift for a new dataset split.
+- **Energy normalization consistency.** You can remove composition trends either with a single `energy_shift_per_atom`, with explicit per-species references via `atomic_energies` (e.g., `{H: -0.5, O: -17.0}`), or by letting the trainer solve for `solve_atomic_energies: true` using a NequIP/MACE-style least-squares fit. `use_checkpoint_energy_shift: true` keeps whichever normalization you used in the checkpoint for consistent resumes; set it to `false` to recompute for a new dataset split.
 
 ## Rotational augmentation with Wigner matrices
 

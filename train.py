@@ -7,6 +7,7 @@ import torch.optim as optim
 import numpy as np
 import time
 from ase.io import read
+from ase.data import atomic_numbers, chemical_symbols
 from e3nn import o3
 from flashace.model import FlashACE
 from flashace.plotting import plot_training_results
@@ -39,7 +40,7 @@ def _load_config(config_arg: Optional[str]):
     )
 
 
-def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, energy_shift_per_atom):
+def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, energy_shift_per_atom, atomic_energies):
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     checkpoint = {
         'epoch': epoch,
@@ -58,6 +59,7 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, en
             'envelope_exponent': config.get('envelope_exponent', 5),
             'gaussian_width': config.get('gaussian_width', 0.5),
             'energy_shift_per_atom': energy_shift_per_atom,
+            'atomic_energies': atomic_energies or {},
             'amp_dtype': config.get('amp_dtype', 'float16'),
             'use_amp': config.get('use_amp', False),
             'grad_accum_steps': max(1, int(config.get('grad_accum_steps', 1))),
@@ -172,6 +174,64 @@ def compute_mean_energy_per_atom(atoms_seq):
         total_atoms += len(atoms)
     return (total_energy / total_atoms) if total_atoms > 0 else 0.0
 
+
+def compute_atomic_energies_from_dataset(atoms_seq):
+    """Solve for per-species reference energies via least squares.
+
+    Builds the standard NequIP/MACE-style linear system where each structure's
+    total energy is expressed as the sum of per-species reference energies plus
+    a residual. The least-squares solution provides offsets that remove most of
+    the composition-dependent baseline from the supervised loss.
+    """
+
+    species = sorted({int(z) for atoms in atoms_seq for z in atoms.numbers})
+    if not species:
+        return {}
+
+    counts = []
+    energies = []
+    for atoms in atoms_seq:
+        counts.append([np.count_nonzero(atoms.numbers == z) for z in species])
+        energies.append(atoms.get_potential_energy())
+
+    X = np.array(counts, dtype=float)
+    y = np.array(energies, dtype=float)
+
+    coeffs, *_ = np.linalg.lstsq(X, y, rcond=None)
+    return {z: float(e) for z, e in zip(species, coeffs)}
+
+
+def parse_atomic_energy_table(raw_table):
+    """Normalize an atomic energy mapping with atomic numbers as keys."""
+
+    table = {}
+    if raw_table is None:
+        return table
+
+    for key, value in raw_table.items():
+        if isinstance(key, str):
+            try:
+                z = atomic_numbers[key]
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"Unknown chemical symbol '{key}' in atomic_energies") from exc
+        else:
+            z = int(key)
+
+        table[z] = float(value)
+
+    return table
+
+
+def atomic_energy_tensor(energy_table, device):
+    if not energy_table:
+        return None
+
+    max_z = max(energy_table)
+    tensor = torch.zeros(max_z + 1, dtype=torch.float32, device=device)
+    for z, val in energy_table.items():
+        tensor[z] = val
+    return tensor
+
 def main():
     parser = argparse.ArgumentParser(description="Train Flash-ACE")
     parser.add_argument("--config", "-c", default=None, help="Path to YAML config file")
@@ -202,7 +262,24 @@ def main():
         )
         print(f"Random Split: {train_len} Training | {val_len} Validation")
 
-    if config.get('energy_shift_per_atom') is not None:
+    atomic_energy_map = parse_atomic_energy_table(config.get('atomic_energies'))
+
+    if not atomic_energy_map and config.get('solve_atomic_energies', False):
+        atomic_energy_map = compute_atomic_energies_from_dataset(train_atoms)
+        if atomic_energy_map:
+            pretty = ", ".join(
+                f"{chemical_symbols[z]}: {e:.6f} eV" for z, e in sorted(atomic_energy_map.items())
+            )
+            print(f"Solved per-species reference energies from training set -> {pretty}")
+
+    if atomic_energy_map:
+        energy_shift_per_atom = None
+        config['atomic_energies'] = atomic_energy_map
+        pretty = ", ".join(
+            f"{chemical_symbols[z]}: {e:.6f} eV" for z, e in sorted(atomic_energy_map.items())
+        )
+        print(f"Using per-species reference energies for normalization: {pretty}")
+    elif config.get('energy_shift_per_atom') is not None:
         energy_shift_per_atom = float(config['energy_shift_per_atom'])
         print(f"Using user-provided energy shift per atom: {energy_shift_per_atom:.6f} eV")
     else:
@@ -273,17 +350,43 @@ def main():
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
         if config.get('use_checkpoint_energy_shift', True):
-            ckpt_shift = checkpoint.get('config', {}).get('energy_shift_per_atom')
-            if ckpt_shift is not None:
-                energy_shift_per_atom = ckpt_shift
-                print(f"Using checkpoint energy shift per atom: {energy_shift_per_atom:.6f} eV")
+            ckpt_atomic = checkpoint.get('config', {}).get('atomic_energies') or {}
+            if ckpt_atomic:
+                atomic_energy_map = {int(k): float(v) for k, v in ckpt_atomic.items()}
+                energy_shift_per_atom = None
+                config['atomic_energies'] = atomic_energy_map
+                pretty = ", ".join(
+                    f"{chemical_symbols[z]}: {e:.6f} eV" for z, e in sorted(atomic_energy_map.items())
+                )
+                print(f"Using checkpoint atomic energy references: {pretty}")
+            else:
+                ckpt_shift = checkpoint.get('config', {}).get('energy_shift_per_atom')
+                if ckpt_shift is not None:
+                    energy_shift_per_atom = ckpt_shift
+                    print(f"Using checkpoint energy shift per atom: {energy_shift_per_atom:.6f} eV")
 
         start_epoch = int(checkpoint.get('epoch', 0))
         print(f"Resuming training from epoch {start_epoch}")
 
-    energy_shift = torch.tensor(energy_shift_per_atom, dtype=torch.float32, device=device)
+    energy_shift = None
+    if energy_shift_per_atom is not None:
+        energy_shift = torch.tensor(energy_shift_per_atom, dtype=torch.float32, device=device)
+
+    atomic_energy_vec = atomic_energy_tensor(atomic_energy_map, device)
+
+    def baseline_energy(z_tensor):
+        if atomic_energy_vec is not None:
+            if torch.max(z_tensor).item() >= atomic_energy_vec.shape[0]:
+                raise ValueError("Encountered atomic number without reference energy")
+            return torch.sum(atomic_energy_vec[z_tensor])
+        elif energy_shift is not None:
+            return energy_shift * len(z_tensor)
+        else:
+            return torch.tensor(0.0, device=device)
 
     history = {'train_loss':[], 'val_loss':[]}
+
+    ckpt_interval = int(config.get('checkpoint_interval', 0) or 0)
 
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     
@@ -312,7 +415,7 @@ def main():
                     p_E, p_F, p_S = model(item, training=True)
                     n_ats = len(item['z'])
 
-                    target_E = item['t_E'] - energy_shift * n_ats
+                    target_E = item['t_E'] - baseline_energy(item['z'])
                     loss_e = ((p_E - target_E) / n_ats)**2
                     loss_f = torch.mean((p_F - item['t_F'])**2)
                     loss_s = torch.tensor(0.0, device=device)
@@ -330,7 +433,7 @@ def main():
                 batch_loss += loss_item.item()
 
                 with torch.no_grad():
-                    pred_E_abs = p_E + energy_shift * n_ats
+                    pred_E_abs = p_E + baseline_energy(item['z'])
                     train_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
 
             if (batch_idx + 1) % grad_accum_steps == 0:
@@ -376,12 +479,12 @@ def main():
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
                     p_E, p_F, p_S = model(item, training=False)
                     n_ats = len(item['z'])
-                    target_E = item['t_E'] - energy_shift * n_ats
+                    target_E = item['t_E'] - baseline_energy(item['z'])
                     loss_e = ((p_E - target_E) / n_ats)**2
                     loss_f = torch.mean((p_F - item['t_F'])**2)
                     val_loss_accum += (config['energy_weight']*loss_e) + (config['forces_weight']*loss_f)
 
-                pred_E_abs = p_E + energy_shift * n_ats
+                pred_E_abs = p_E + baseline_energy(item['z'])
                 val_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
 
         avg_val_loss = val_loss_accum / len(val_atoms)
@@ -391,36 +494,32 @@ def main():
 
         print(f"{epoch+1:5d} | {avg_train_loss:8.4f} | {tr_e:8.2f} | {tr_f:8.4f} | {tr_s:8.4f} || {avg_val_loss:8.4f} | {val_e:8.2f} | {val_f:8.4f}")
 
-    # SAVE
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'config': {
-            'r_max': config['r_max'],
-            'l_max': config['l_max'],
-            'num_radial': config['num_radial'],
-            'hidden_dim': config['hidden_dim'],
-            'num_layers': config['num_layers'],
-            'radial_basis_type': config.get('radial_basis_type', 'bessel'),
-            'radial_trainable': config.get('radial_trainable', False),
-            'envelope_exponent': config.get('envelope_exponent', 5),
-            'gaussian_width': config.get('gaussian_width', 0.5),
-            'energy_shift_per_atom': energy_shift_per_atom,
-            'amp_dtype': config.get('amp_dtype', 'float16'),
-            'use_amp': config.get('use_amp', False),
-            'grad_accum_steps': grad_accum_steps,
-            'precompute_neighbors': config.get('precompute_neighbors', False),
-        }
-    }
-    torch.save(checkpoint, config['model_save_path'])
-        ckpt_interval = int(config.get('checkpoint_interval', 0) or 0)
         if ckpt_interval > 0 and (epoch + 1) % ckpt_interval == 0:
             ckpt_dir = config.get('checkpoint_dir', 'checkpoints')
             ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch+1}.pt")
-            save_checkpoint(ckpt_path, epoch + 1, model, optimizer, scheduler, scaler,
-                            config, energy_shift_per_atom)
+            save_checkpoint(
+                ckpt_path,
+                epoch + 1,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                config,
+                energy_shift_per_atom,
+                atomic_energy_map,
+            )
 
-    save_checkpoint(config['model_save_path'], config['epochs'], model, optimizer, scheduler, scaler,
-                    config, energy_shift_per_atom)
+    save_checkpoint(
+        config['model_save_path'],
+        config['epochs'],
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        config,
+        energy_shift_per_atom,
+        atomic_energy_map,
+    )
     print(f"Training Finished. Saved to {config['model_save_path']}")
 
 if __name__ == "__main__": main()
