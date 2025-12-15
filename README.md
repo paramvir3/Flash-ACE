@@ -15,9 +15,9 @@ Example:
 python train.py --config training/config.yaml
 ```
 
-## Why attention may not always beat message passing
+## Why deeper attention stacks need extra care
 
-The Flash-ACE blocks add self-attention on top of an ACE-style message passing backbone, but deeper attention stacks are not guaranteed to outperform shallower message passing networks out of the box. In practice, energy errors can rise when simply increasing `num_layers` for several reasons:
+Flash-ACE relies on dense self-attention over equivariant descriptors rather than any message-passing layers, but deeper attention stacks are not guaranteed to outperform shallower ones out of the box. In practice, energy errors can rise when simply increasing `num_layers` for several reasons:
 
 - **Optimization sensitivity.** Attention layers introduce more parameters and sharper loss landscapes, so learning rates that were stable for 2 layers (e.g., `1e-2`) can become too aggressive at 4 layers. Start with a smaller LR (`1e-3`–`5e-4`), enable gradient clipping, and let the LR scheduler react faster.
 - **Loss balance.** With forces weighted 10× over energies, the model can overfit forces when capacity increases, hurting energy RMSE. Temporarily raise `energy_weight` or lower `forces_weight` while deeper attention trains, then restore the balance once energies improve.
