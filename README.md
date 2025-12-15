@@ -18,4 +18,13 @@ Attention helps when its optimization and capacity needs are matched to the data
 
 If your dataset is small or lacks diverse orientations, you can enable per-item SO(3) rotations during training (`random_rotation: true` in `config.yaml`). The loader samples a random Wigner rotation, applies it to atomic positions, and consistently rotates forces and stresses. Energies stay invariant, so this augmentation teaches the network the expected equivariant responses without changing the underlying physics. Disable the flag for validation/test splits to measure accuracy on unaugmented geometries.
 
+## Descriptor tweaks inspired by GRACE and other ML potentials
+
+You can now switch the ACE radial basis between two families to probe descriptor bias/variance trade-offs without rewriting the model:
+
+- **Bessel (default).** Matches MACE/ACE with a smooth polynomial cutoff. Set `radial_trainable: true` to learn the Bessel frequencies, similar to adaptive grids explored in GRACE.
+- **Gaussian.** Smooth, localized Gaussians akin to PaiNN/SpookyNet descriptors. Use `radial_basis_type: gaussian` and tune `gaussian_width` to widen or narrow shells; combine with `radial_trainable: true` to let centers/widths shift toward chemically relevant distances.
+
+Additional knobs: `envelope_exponent` controls how sharply the polynomial cutoff decays near `r_max` (higher exponents emulate the steep envelopes used in some tensored ACE variants). These levers let you test whether your system benefits more from oscillatory (Bessel) or localized (Gaussian) radial support without touching the architecture.
+
 

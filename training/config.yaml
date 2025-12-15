@@ -16,6 +16,10 @@ l_max: 1
 num_radial: 12
 hidden_dim: 128
 num_layers: 2
+radial_basis_type: "bessel"       # Options: bessel, gaussian
+radial_trainable: false           # Make radial frequencies/centers learnable
+envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)
+gaussian_width: 0.5              # Relative Gaussian width multiplier (only used if basis=gaussian)
 
 # ------------------------------------------------------------------------------
 # 3. TRAINING PARAMETERS

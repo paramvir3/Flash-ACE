@@ -149,8 +149,12 @@ def main():
 
     print("--- Initializing FlashACE ---")
     model = FlashACE(
-        r_max=config['r_max'], l_max=config['l_max'], num_radial=config['num_radial'], 
-        hidden_dim=config['hidden_dim'], num_layers=config['num_layers']
+        r_max=config['r_max'], l_max=config['l_max'], num_radial=config['num_radial'],
+        hidden_dim=config['hidden_dim'], num_layers=config['num_layers'],
+        radial_basis_type=config.get('radial_basis_type', 'bessel'),
+        radial_trainable=config.get('radial_trainable', False),
+        envelope_exponent=config.get('envelope_exponent', 5),
+        gaussian_width=config.get('gaussian_width', 0.5),
     ).to(device)
     
     optimizer = optim.Adam(
@@ -260,6 +264,10 @@ def main():
             'num_radial': config['num_radial'],
             'hidden_dim': config['hidden_dim'],
             'num_layers': config['num_layers'],
+            'radial_basis_type': config.get('radial_basis_type', 'bessel'),
+            'radial_trainable': config.get('radial_trainable', False),
+            'envelope_exponent': config.get('envelope_exponent', 5),
+            'gaussian_width': config.get('gaussian_width', 0.5),
             'energy_shift_per_atom': energy_shift_per_atom
         }
     }

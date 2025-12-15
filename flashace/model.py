@@ -4,14 +4,34 @@ from .physics import ACE_Descriptor
 from .attention import DenseFlashAttention
 
 class FlashACE(nn.Module):
-    def __init__(self, r_max=5.0, l_max=2, num_radial=8, hidden_dim=128, num_layers=2):
+    def __init__(
+        self,
+        r_max=5.0,
+        l_max=2,
+        num_radial=8,
+        hidden_dim=128,
+        num_layers=2,
+        radial_basis_type: str = "bessel",
+        radial_trainable: bool = False,
+        envelope_exponent: int = 5,
+        gaussian_width: float = 0.5,
+    ):
         super().__init__()
-        self.hidden_dim = hidden_dim  
+        self.hidden_dim = hidden_dim
         self.r_max = r_max
         self.l_max = l_max
-        
+
         self.emb = nn.Embedding(118, hidden_dim)
-        self.ace = ACE_Descriptor(r_max, l_max, num_radial, hidden_dim)
+        self.ace = ACE_Descriptor(
+            r_max,
+            l_max,
+            num_radial,
+            hidden_dim,
+            radial_basis_type=radial_basis_type,
+            radial_trainable=radial_trainable,
+            envelope_exponent=envelope_exponent,
+            gaussian_width=gaussian_width,
+        )
         
         self.layers = nn.ModuleList([
             DenseFlashAttention(self.ace.irreps_out, hidden_dim) for _ in range(num_layers)
