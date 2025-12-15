@@ -174,7 +174,12 @@ class ACE_Descriptor(nn.Module):
         
         # Stage 2: Contraction (Linear scaling with N)
         # B = A ⊗ A with learned Clebsch–Gordan mixing
-        B_basis = self.tp_b(A_basis, A_basis, self.tp_b_weights)
+        # ``FullyConnectedTensorProduct`` expects a batch dimension on the
+        # weights when ``shared_weights`` is False. We want the same fixed
+        # Clebsch–Gordan contraction for every atom, so broadcast a single
+        # vector of ones across the batch dimension of ``A_basis``.
+        tp_b_weights = self.tp_b_weights.expand(A_basis.shape[0], -1)
+        B_basis = self.tp_b(A_basis, A_basis, tp_b_weights)
 
         # Mix and Add Residual
         return self.mix(B_basis) + A_basis
