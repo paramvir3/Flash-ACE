@@ -40,6 +40,13 @@ grad_accum_steps: 1              # Gradient accumulation steps before optimizer 
 precompute_neighbors: true       # Cache neighbor lists to cut CPU overhead
 random_rotation: false           # Apply random SO(3) rotations per batch item
 device: "cuda"
+checkpoint_dir: "checkpoints"     # Directory to stash periodic checkpoints
+checkpoint_interval: 0           # Save a checkpoint every N epochs (0 disables)
+resume_from: null                # Path to a checkpoint to resume from
+resume_load_optimizer: false     # Load optimizer state when resuming
+resume_load_scheduler: false     # Load LR scheduler state when resuming
+resume_load_scaler: false        # Load AMP GradScaler state when resuming
+use_checkpoint_energy_shift: true # Use the energy shift stored in the checkpoint when resuming
 
 # ------------------------------------------------------------------------------
 # 4. LOSS WEIGHTS

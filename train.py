@@ -1,4 +1,7 @@
+import argparse
 import yaml
+import os
+from typing import Optional
 import torch
 import torch.optim as optim
 import numpy as np
@@ -14,6 +17,55 @@ from torch.utils.data import DataLoader, Dataset, random_split
 # Disable TF32 to prevent potential TensorCore precision crashes in e3nn
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
+
+
+def _load_config(config_arg: Optional[str]):
+    """Load a YAML config, falling back to training/config.yaml if needed."""
+    candidates = []
+    if config_arg:
+        candidates.append(config_arg)
+    candidates.extend([
+        "config.yaml",
+        os.path.join("training", "config.yaml"),
+    ])
+
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            with open(candidate, "r") as f:
+                return yaml.safe_load(f), candidate
+
+    raise FileNotFoundError(
+        "No configuration file found. Provide --config or place config.yaml in the repo root or training/config.yaml."
+    )
+
+
+def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, energy_shift_per_atom):
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+        'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+        'config': {
+            'r_max': config['r_max'],
+            'l_max': config['l_max'],
+            'num_radial': config['num_radial'],
+            'hidden_dim': config['hidden_dim'],
+            'num_layers': config['num_layers'],
+            'radial_basis_type': config.get('radial_basis_type', 'bessel'),
+            'radial_trainable': config.get('radial_trainable', False),
+            'envelope_exponent': config.get('envelope_exponent', 5),
+            'gaussian_width': config.get('gaussian_width', 0.5),
+            'energy_shift_per_atom': energy_shift_per_atom,
+            'amp_dtype': config.get('amp_dtype', 'float16'),
+            'use_amp': config.get('use_amp', False),
+            'grad_accum_steps': max(1, int(config.get('grad_accum_steps', 1))),
+            'precompute_neighbors': config.get('precompute_neighbors', False),
+        }
+    }
+    torch.save(checkpoint, path)
+    print(f"Saved checkpoint to {path}")
 
 class AtomisticDataset(Dataset):
     def __init__(self, atoms_list, r_max, random_rotation=False, precompute_neighbors=False):
@@ -121,8 +173,12 @@ def compute_mean_energy_per_atom(atoms_seq):
     return (total_energy / total_atoms) if total_atoms > 0 else 0.0
 
 def main():
-    print("--- Loading config.yaml ---")
-    with open("config.yaml", "r") as f: config = yaml.safe_load(f)
+    parser = argparse.ArgumentParser(description="Train Flash-ACE")
+    parser.add_argument("--config", "-c", default=None, help="Path to YAML config file")
+    args = parser.parse_args()
+
+    config, config_path = _load_config(args.config)
+    print(f"--- Loading {config_path} ---")
     device = config['device']
     device_type = device.split(":")[0]
 
@@ -130,9 +186,10 @@ def main():
     amp_dtype = torch.float16 if config.get('amp_dtype', 'float16') == 'float16' else torch.bfloat16
     grad_accum_steps = max(1, int(config.get('grad_accum_steps', 1)))
     
+
     print(f"Reading data from {config['train_file']}...")
     all_atoms = read(config['train_file'], index=":")
-    
+
     if config['valid_file']:
         val_atoms = read(config['valid_file'], index=":")
         train_atoms = all_atoms
@@ -140,7 +197,7 @@ def main():
         val_len = max(1, int(len(all_atoms) * config.get('val_split', 0.1)))
         train_len = len(all_atoms) - val_len
         train_atoms, val_atoms = random_split(
-            all_atoms, [train_len, val_len], 
+            all_atoms, [train_len, val_len],
             generator=torch.Generator().manual_seed(42)
         )
         print(f"Random Split: {train_len} Training | {val_len} Validation")
@@ -151,8 +208,6 @@ def main():
     else:
         energy_shift_per_atom = compute_mean_energy_per_atom(train_atoms)
         print(f"Computed mean energy per atom for normalization: {energy_shift_per_atom:.6f} eV")
-
-    energy_shift = torch.tensor(energy_shift_per_atom, dtype=torch.float32, device=device)
 
     # DATALOADERS
     train_ds = AtomisticDataset(
@@ -199,6 +254,35 @@ def main():
         verbose=True
     )
 
+    resume_path = config.get('resume_from')
+    start_epoch = 0
+
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    if resume_path:
+        print(f"--- Loading checkpoint from {resume_path} ---")
+        checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+        if config.get('resume_load_optimizer', False) and checkpoint.get('optimizer_state_dict'):
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if config.get('resume_load_scheduler', False) and checkpoint.get('scheduler_state_dict'):
+            if checkpoint['scheduler_state_dict'] is not None:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if config.get('resume_load_scaler', False) and checkpoint.get('scaler_state_dict') and scaler.is_enabled():
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+        if config.get('use_checkpoint_energy_shift', True):
+            ckpt_shift = checkpoint.get('config', {}).get('energy_shift_per_atom')
+            if ckpt_shift is not None:
+                energy_shift_per_atom = ckpt_shift
+                print(f"Using checkpoint energy shift per atom: {energy_shift_per_atom:.6f} eV")
+
+        start_epoch = int(checkpoint.get('epoch', 0))
+        print(f"Resuming training from epoch {start_epoch}")
+
+    energy_shift = torch.tensor(energy_shift_per_atom, dtype=torch.float32, device=device)
+
     history = {'train_loss':[], 'val_loss':[]}
 
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -206,7 +290,7 @@ def main():
     print(f"{'Epoch':>5} | {'Loss':>8} | {'E (meV)':>8} | {'F (eV/A)':>8} | {'S (eV/A³)':>8} || {'Val Loss':>8} | {'Val E':>8} | {'Val F':>8}")
     print("-" * 95)
     
-    for epoch in range(config['epochs']):
+    for epoch in range(start_epoch, config['epochs']):
         model.train()
         train_metrics = MetricTracker()
         total_loss = 0.0
@@ -304,7 +388,7 @@ def main():
         val_e, val_f, val_s = val_metrics.get_metrics()
         history['val_loss'].append(avg_val_loss)
         scheduler.step(avg_val_loss)
-        
+
         print(f"{epoch+1:5d} | {avg_train_loss:8.4f} | {tr_e:8.2f} | {tr_f:8.4f} | {tr_s:8.4f} || {avg_val_loss:8.4f} | {val_e:8.2f} | {val_f:8.4f}")
 
     # SAVE
@@ -328,6 +412,15 @@ def main():
         }
     }
     torch.save(checkpoint, config['model_save_path'])
+        ckpt_interval = int(config.get('checkpoint_interval', 0) or 0)
+        if ckpt_interval > 0 and (epoch + 1) % ckpt_interval == 0:
+            ckpt_dir = config.get('checkpoint_dir', 'checkpoints')
+            ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch+1}.pt")
+            save_checkpoint(ckpt_path, epoch + 1, model, optimizer, scheduler, scaler,
+                            config, energy_shift_per_atom)
+
+    save_checkpoint(config['model_save_path'], config['epochs'], model, optimizer, scheduler, scaler,
+                    config, energy_shift_per_atom)
     print(f"Training Finished. Saved to {config['model_save_path']}")
 
 if __name__ == "__main__": main()

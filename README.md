@@ -3,6 +3,18 @@ This repository is an attempt to make use attention mechanism on Atomic Cluster 
 
 Please DO NOT USE as this is purely for research purposes
 
+## Running training
+
+`train.py` accepts `--config / -c` to point at any YAML file. If you omit the
+flag, it will search for `config.yaml` in the repository root and then fall
+back to `training/config.yaml`.
+
+Example:
+
+```bash
+python train.py --config training/config.yaml
+```
+
 ## Why attention may not always beat message passing
 
 The Flash-ACE blocks add self-attention on top of an ACE-style message passing backbone, but deeper attention stacks are not guaranteed to outperform shallower message passing networks out of the box. In practice, energy errors can rise when simply increasing `num_layers` for several reasons:
@@ -19,6 +31,12 @@ Attention helps when its optimization and capacity needs are matched to the data
 - **Mixed precision on CUDA.** Set `use_amp: true` (default) to enable `torch.cuda.amp` with `amp_dtype` (`float16` or `bfloat16`). This typically halves memory traffic and speeds up matmuls/attention without hurting accuracy.
 - **Gradient accumulation.** When GPU memory is tight, raise `grad_accum_steps` to simulate larger batches while keeping per-step memory smaller. Losses are normalized automatically so learning dynamics stay stable.
 - **Cached neighbor lists.** Enable `precompute_neighbors: true` to build ASE neighbor lists once per structure and reuse them every epoch. This reduces Python/CPU overhead on large datasets where the geometry does not change during training.
+
+## Checkpointing and flexible resumes
+
+- **Save as frequently as you like.** Set `checkpoint_interval: N` in `config.yaml` to dump checkpoints every `N` epochs into `checkpoint_dir` (default `checkpoints/`). A full checkpoint includes model weights plus optimizer, scheduler, and AMP scaler states for exact restarts.
+- **Resume while changing loss weights.** Point `resume_from` to a saved checkpoint. By default, only the model weights and the stored energy normalization shift are restored, so you can freely tweak `energy_weight`, `forces_weight`, `stress_weight`, or other training hyperparameters between runs. Flip on `resume_load_optimizer`, `resume_load_scheduler`, or `resume_load_scaler` if you want to continue with the same optimizer/scheduler/AMP state instead.
+- **Energy normalization consistency.** `use_checkpoint_energy_shift: true` keeps the per-atom energy shift from the checkpoint for consistent normalization across resumes. Set it to `false` to recompute a shift for a new dataset split.
 
 ## Rotational augmentation with Wigner matrices
 
