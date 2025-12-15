@@ -54,12 +54,22 @@ class FlashACE(nn.Module):
         E = torch.sum(self.readout(scalars))
         
         # 3. Derivatives
-        grads = torch.autograd.grad(E, pos, create_graph=True, retain_graph=True, allow_unused=True)[0]
-        F = -grads if grads is not None else torch.zeros_like(pos)
-        
+        # Avoid building second-order graphs during evaluation to reduce memory.
+        grad_targets = [pos] if epsilon is None else [pos, epsilon]
+        grads = torch.autograd.grad(
+            E,
+            grad_targets,
+            create_graph=training,  # only keep graph for higher-order grads when training
+            retain_graph=False,
+            allow_unused=True,
+        )
+
+        pos_grad = grads[0]
+        F = -pos_grad if pos_grad is not None else torch.zeros_like(pos)
+
         S = torch.zeros(3, 3, device=pos.device)
         if training and epsilon is not None:
-            g_eps = torch.autograd.grad(E, epsilon, create_graph=True, retain_graph=True, allow_unused=True)[0]
+            g_eps = grads[1]
             if g_eps is not None: S = -g_eps / cell_volume
-                
+
         return E, F, S
