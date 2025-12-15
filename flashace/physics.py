@@ -133,6 +133,12 @@ class ACE_Descriptor(nn.Module):
             shared_weights=False,
         )
 
+        # The B-basis in ACE is a pure Clebsch–Gordan contraction without
+        # learnable weights. ``FullyConnectedTensorProduct`` requires explicit
+        # weights when ``internal_weights=False``, so we register a fixed buffer
+        # of ones to recover the unweighted contraction behavior.
+        self.register_buffer("tp_b_weights", torch.ones(self.tp_b.weight_numel))
+
         # Linear Mixing to recover full feature interactions
         self.mix = o3.Linear(self.tp_b.irreps_out, self.irreps_out)
 
@@ -168,7 +174,7 @@ class ACE_Descriptor(nn.Module):
         
         # Stage 2: Contraction (Linear scaling with N)
         # B = A ⊗ A with learned Clebsch–Gordan mixing
-        B_basis = self.tp_b(A_basis, A_basis)
+        B_basis = self.tp_b(A_basis, A_basis, self.tp_b_weights)
 
         # Mix and Add Residual
         return self.mix(B_basis) + A_basis
