@@ -15,6 +15,12 @@ class FlashACE(nn.Module):
         radial_trainable: bool = False,
         envelope_exponent: int = 5,
         gaussian_width: float = 0.5,
+        l1_taper: float = 0.5,
+        high_l_taper: float = 0.25,
+        soft_edge_margin: float = 0.0,
+        learnable_b_contraction: bool = False,
+        gauge_mixing: bool = False,
+        factorized_gates: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -31,6 +37,12 @@ class FlashACE(nn.Module):
             radial_trainable=radial_trainable,
             envelope_exponent=envelope_exponent,
             gaussian_width=gaussian_width,
+            l1_taper=l1_taper,
+            high_l_taper=high_l_taper,
+            soft_edge_margin=soft_edge_margin,
+            learnable_b_contraction=learnable_b_contraction,
+            gauge_mixing=gauge_mixing,
+            factorized_gates=factorized_gates,
         )
         
         self.layers = nn.ModuleList([

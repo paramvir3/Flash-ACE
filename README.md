@@ -44,12 +44,20 @@ If your dataset is small or lacks diverse orientations, you can enable per-item 
 
 ## Descriptor tweaks inspired by GRACE and other ML potentials
 
-You can now switch the ACE radial basis between two families to probe descriptor bias/variance trade-offs without rewriting the model:
+You can now switch the ACE radial basis between multiple families to probe descriptor bias/variance trade-offs without rewriting the model:
 
 - **Bessel (default).** Matches MACE/ACE with a smooth polynomial cutoff. Set `radial_trainable: true` to learn the Bessel frequencies, similar to adaptive grids explored in GRACE.
 - **Gaussian.** Smooth, localized Gaussians akin to PaiNN/SpookyNet descriptors. Use `radial_basis_type: gaussian` and tune `gaussian_width` to widen or narrow shells; combine with `radial_trainable: true` to let centers/widths shift toward chemically relevant distances.
+- **Orthogonal Laguerre.** An orthogonal, exponentially weighted Laguerre family on `[0, r_max]` (`radial_basis_type: orthogonal`) to improve gradient conditioning when Bessel/Gaussian bases correlate strongly.
 
 Additional knobs: `envelope_exponent` controls how sharply the polynomial cutoff decays near `r_max` (higher exponents emulate the steep envelopes used in some tensored ACE variants). These levers let you test whether your system benefits more from oscillatory (Bessel) or localized (Gaussian) radial support without touching the architecture.
+
+### Angular and contraction controls
+- **Gentler tapering.** `l1_taper` and `high_l_taper` let you keep more channels in higher-order irreps (e.g., set `l1_taper: 0.75`, `high_l_taper: 0.5`) when forces need richer directional detail.
+- **Soft cutoff mask.** `soft_edge_margin` applies a smooth ramp to interactions within a small window below `r_max`, reducing force spikes as neighbors cross the cutoff.
+- **Learnable Clebsch–Gordan gauge.** `learnable_b_contraction: true` promotes the B-basis weights from fixed ones to learnable parameters so the model can adapt its contraction strength instead of relying on a single unweighted CG mix.
+- **Gauge mixing layer.** `gauge_mixing: true` inserts a learnable unitary mix within each irreducible representation channel before the B-basis to explore alternative CG gauges automatically.
+- **Factorized radial/angle gate.** `factorized_gates: true` modulates the radial tensor-product weights with an angular-power gate, letting the descriptor emphasize sharply directional neighborhoods without changing the core ACE structure.
 
 
 ## Stress computation hygiene
