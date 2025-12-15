@@ -53,9 +53,25 @@ class FlashACE(nn.Module):
         pos.requires_grad_(True)
 
         if training and cell_volume is not None:
-            epsilon = torch.zeros(3, 3, device=pos.device, requires_grad=True)
-            pos = pos @ (torch.eye(3, device=pos.device) + epsilon)
+            # Parameterize the small-strain tensor symmetrically so the stress
+            # we backpropagate through corresponds to the symmetric Cauchy
+            # stress and does not pick up spurious rotational components. This
+            # matches how ACE/MACE form stresses by differentiating with
+            # respect to symmetric lattice strains.
+            strain_params = torch.zeros(6, device=pos.device, requires_grad=True)
+
+            epsilon = torch.zeros(3, 3, device=pos.device)
+            epsilon[0, 0] = strain_params[0]
+            epsilon[1, 1] = strain_params[1]
+            epsilon[2, 2] = strain_params[2]
+            epsilon[0, 1] = epsilon[1, 0] = strain_params[3]
+            epsilon[0, 2] = epsilon[2, 0] = strain_params[4]
+            epsilon[1, 2] = epsilon[2, 1] = strain_params[5]
+
+            deformation = torch.eye(3, device=pos.device) + epsilon
+            pos = pos @ deformation
         else:
+            strain_params = None
             epsilon = None
 
         edge_vec = pos[edge_index[0]] - pos[edge_index[1]]
@@ -92,11 +108,24 @@ class FlashACE(nn.Module):
             # the computation graph built when taking the strain derivative.
             g_eps = torch.autograd.grad(
                 E,
-                epsilon,
+                strain_params,
                 create_graph=True,
                 retain_graph=True,
                 allow_unused=True,
             )[0]
-            if g_eps is not None: S = -g_eps / cell_volume
-                
+            if g_eps is not None:
+                # Map the 6 unique components back to a symmetric stress tensor
+                # and normalize by the deformed volume to avoid overestimating
+                # stress under volumetric strain.
+                stress = torch.zeros(3, 3, device=pos.device)
+                stress[0, 0] = g_eps[0]
+                stress[1, 1] = g_eps[1]
+                stress[2, 2] = g_eps[2]
+                stress[0, 1] = stress[1, 0] = g_eps[3]
+                stress[0, 2] = stress[2, 0] = g_eps[4]
+                stress[1, 2] = stress[2, 1] = g_eps[5]
+
+                volume = cell_volume * torch.det(deformation)
+                S = -stress / volume
+
         return E, F, S

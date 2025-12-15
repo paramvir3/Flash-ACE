@@ -34,3 +34,8 @@ You can now switch the ACE radial basis between two families to probe descriptor
 Additional knobs: `envelope_exponent` controls how sharply the polynomial cutoff decays near `r_max` (higher exponents emulate the steep envelopes used in some tensored ACE variants). These levers let you test whether your system benefits more from oscillatory (Bessel) or localized (Gaussian) radial support without touching the architecture.
 
 
+## Stress computation hygiene
+
+Stresses are now derived from a symmetric small-strain parameterization (six unique components) and normalized by the *deformed* cell volume. This mirrors the Cauchy stress definition used in ACE/MACE and avoids antisymmetric rotational artifacts or inflated stresses under volumetric deformation.
+
+
