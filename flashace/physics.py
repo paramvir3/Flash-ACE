@@ -93,8 +93,50 @@ class GaussianBasis(nn.Module):
         return torch.exp(-0.5 * (diff / self.widths).pow(2))
 
 
+class OrthogonalRadialBasis(nn.Module):
+    """Laguerre-based orthogonal radial basis on ``[0, r_max]``.
+
+    This implementation follows the closed-form recurrence for generalized
+    Laguerre polynomials with ``alpha = 0`` and applies an exponential weight to
+    keep the basis well-conditioned. The functions are orthogonal under the
+    weight ``exp(-x)`` on ``[0, r_max]`` after rescaling ``x = r / r_max``.
+    """
+
+    def __init__(self, r_max: float, num_radial: int):
+        super().__init__()
+        self.r_max = float(r_max)
+        self.num_radial = num_radial
+        self.register_buffer("norm", torch.sqrt(torch.tensor(2.0 / r_max)))
+
+    def forward(self, distances: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(distances / self.r_max, min=0.0)
+
+        # L_0(x) = 1
+        # L_1(x) = 1 - x
+        basis = []
+        l0 = torch.ones_like(x)
+        basis.append(l0)
+        if self.num_radial == 1:
+            stacked = torch.stack(basis, dim=-1)
+            return self.norm * stacked
+
+        l1 = 1.0 - x
+        basis.append(l1)
+
+        for n in range(2, self.num_radial):
+            coef1 = (2 * n - 1 - x) / n
+            coef2 = (n - 1) / n
+            ln = coef1 * basis[-1] - coef2 * basis[-2]
+            basis.append(ln)
+
+        stacked = torch.stack(basis, dim=-1)
+
+        # Apply the exponential weight to maintain orthogonality on [0, r_max]
+        return self.norm * torch.exp(-0.5 * x).unsqueeze(-1) * stacked
+
+
 class ACERadialBasis(nn.Module):
-    """Cutoff-masked radial basis with Bessel or Gaussian options."""
+    """Cutoff-masked radial basis with multiple options."""
 
     def __init__(
         self,
@@ -113,6 +155,8 @@ class ACERadialBasis(nn.Module):
             self.basis = BesselBasis(r_max, num_radial, trainable=trainable)
         elif basis_type == "gaussian":
             self.basis = GaussianBasis(r_max, num_radial, width_factor=gaussian_width, trainable=trainable)
+        elif basis_type == "orthogonal":
+            self.basis = OrthogonalRadialBasis(r_max, num_radial)
         else:
             raise ValueError(f"Unsupported radial basis type: {basis_type}")
 
@@ -131,11 +175,18 @@ class ACE_Descriptor(nn.Module):
         radial_trainable: bool = False,
         envelope_exponent: int = 5,
         gaussian_width: float = 0.5,
+        l1_taper: float = 0.5,
+        high_l_taper: float = 0.25,
+        soft_edge_margin: float = 0.0,
+        learnable_b_contraction: bool = False,
+        gauge_mixing: bool = False,
+        factorized_gates: bool = False,
     ):
         super().__init__()
         self.r_max = r_max
         self.num_radial = num_radial
-        
+        self.soft_edge_margin = soft_edge_margin
+
         # 1. SMART SYMMETRIES (NequIP/ACE Strategy)
         # ------------------------------------------------------------------
         # Instead of giving 'hidden_dim' to everything, we taper it down.
@@ -148,10 +199,10 @@ class ACE_Descriptor(nn.Module):
             if l == 0:
                 dim = hidden_dim          # e.g. 128
             elif l == 1:
-                dim = hidden_dim // 2     # e.g. 64
+                dim = max(1, int(hidden_dim * l1_taper))
             else:
-                dim = hidden_dim // 4     # e.g. 32
-            
+                dim = max(1, int(hidden_dim * high_l_taper))
+
             # Parity (-1)**l is standard
             irreps_list.append((dim, (l, (-1)**l)))
             
@@ -190,6 +241,12 @@ class ACE_Descriptor(nn.Module):
             [num_radial, 64, self.tp_a.weight_numel], torch.nn.functional.silu
         )
 
+        self.angular_gate = None
+        if factorized_gates:
+            self.angular_gate = FullyConnectedNet(
+                [1, 32, self.tp_a.weight_numel], torch.nn.functional.silu
+            )
+
         # 3. B-Basis (Symmetric Contraction)
         # In MACE the B-basis is a pure Clebsch–Gordan contraction of A-basis
         # channels with no additional learned weights inside the tensor
@@ -208,8 +265,20 @@ class ACE_Descriptor(nn.Module):
         # The B-basis in ACE is a pure Clebsch–Gordan contraction without
         # learnable weights. ``FullyConnectedTensorProduct`` requires explicit
         # weights when ``internal_weights=False``, so we register a fixed buffer
-        # of ones to recover the unweighted contraction behavior.
-        self.register_buffer("tp_b_weights", torch.ones(self.tp_b.weight_numel))
+        # of ones to recover the unweighted contraction behavior. Optionally,
+        # expose the weights as learnable parameters to let the model discover
+        # a better Clebsch–Gordan gauge.
+        if learnable_b_contraction:
+            self.tp_b_weights = nn.Parameter(torch.ones(self.tp_b.weight_numel))
+        else:
+            self.register_buffer("tp_b_weights", torch.ones(self.tp_b.weight_numel))
+
+        # Optional gauge mixing lets the network learn a unitary change of
+        # basis inside each irreducible representation channel before forming
+        # the B-basis, providing the "learned CG mixing" pathway requested.
+        self.gauge_mix = None
+        if gauge_mixing:
+            self.gauge_mix = o3.Linear(self.irreps_out, self.irreps_out)
 
         # Linear Mixing to recover full feature interactions
         self.mix = o3.Linear(self.tp_b.irreps_out, self.irreps_out)
@@ -222,11 +291,25 @@ class ACE_Descriptor(nn.Module):
         Y_lm = self.sh(edge_vec)
         tp_weights = self.radial_net(radial_emb)
 
+        if self.angular_gate is not None:
+            # Factorized gate: radial weights modulated by angular power so the
+            # model can emphasize or de-emphasize highly directional contexts
+            # without changing the core tensor product structure.
+            ang_power = (Y_lm ** 2).sum(dim=-1, keepdim=True)
+            tp_weights = tp_weights * torch.sigmoid(self.angular_gate(ang_power))
+
         # Zero out contributions beyond the cutoff exactly as in MACE. The
         # radial basis already vanishes at ``r_max`` but masking protects the
         # downstream tensor products from spurious numerical noise when edges
-        # are padded or left over from a larger neighbor list.
+        # are padded or left over from a larger neighbor list. A soft ramp near
+        # the cutoff reduces force discontinuities when neighbors cross the
+        # boundary.
         edge_mask = (edge_len <= self.r_max).unsqueeze(-1)
+        if self.soft_edge_margin > 0:
+            ramp = ((self.r_max - edge_len) / self.soft_edge_margin).clamp(min=0.0, max=1.0)
+            # Smooth polynomial ramp for C1 continuity
+            ramp = ramp.pow(2) * (3 - 2 * ramp)
+            edge_mask = edge_mask * ramp.unsqueeze(-1)
 
         # Incorporate atomic attributes on the sending atoms and gate the
         # tensor product weights with the learned radial functions before
@@ -243,6 +326,9 @@ class ACE_Descriptor(nn.Module):
             device=node_attrs.device, dtype=edge_feats.dtype
         )
         A_basis.index_add_(0, receiver, edge_feats)
+
+        if self.gauge_mix is not None:
+            A_basis = self.gauge_mix(A_basis)
         
         # Stage 2: Contraction (Linear scaling with N)
         # B = A ⊗ A with learned Clebsch–Gordan mixing

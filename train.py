@@ -58,6 +58,12 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, en
             'radial_trainable': config.get('radial_trainable', False),
             'envelope_exponent': config.get('envelope_exponent', 5),
             'gaussian_width': config.get('gaussian_width', 0.5),
+            'l1_taper': config.get('l1_taper', 0.5),
+            'high_l_taper': config.get('high_l_taper', 0.25),
+            'soft_edge_margin': config.get('soft_edge_margin', 0.0),
+            'learnable_b_contraction': config.get('learnable_b_contraction', False),
+            'gauge_mixing': config.get('gauge_mixing', False),
+            'factorized_gates': config.get('factorized_gates', False),
             'energy_shift_per_atom': energy_shift_per_atom,
             'atomic_energies': atomic_energies or {},
             'amp_dtype': config.get('amp_dtype', 'float16'),
@@ -316,6 +322,12 @@ def main():
         radial_trainable=config.get('radial_trainable', False),
         envelope_exponent=config.get('envelope_exponent', 5),
         gaussian_width=config.get('gaussian_width', 0.5),
+        l1_taper=config.get('l1_taper', 0.5),
+        high_l_taper=config.get('high_l_taper', 0.25),
+        soft_edge_margin=config.get('soft_edge_margin', 0.0),
+        learnable_b_contraction=config.get('learnable_b_contraction', False),
+        gauge_mixing=config.get('gauge_mixing', False),
+        factorized_gates=config.get('factorized_gates', False),
     ).to(device)
     
     optimizer = optim.Adam(
