@@ -59,19 +59,6 @@ class DenseFlashAttention(nn.Module):
         if sender.numel() == 0:
             return x
 
-        deg = torch.bincount(receiver, minlength=num_nodes)
-        # Vectorized sorting of edges by receiver so we can build per-degree
-        # buckets without a Python loop.
-        order = torch.argsort(receiver)
-        # Start index for each receiver in the sorted list of edges.
-        start_per_receiver = torch.cumsum(
-            torch.cat([
-                torch.zeros(1, device=x.device, dtype=deg.dtype),
-                deg.to(torch.long)
-            ]),
-            dim=0,
-        )[:-1]
-
         energy_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
         radial_proj = torch.stack([layer(x) for layer in self.radial_update], dim=0)
         tangential_proj = torch.stack([layer(x) for layer in self.tangential_update], dim=0)
@@ -80,11 +67,8 @@ class DenseFlashAttention(nn.Module):
             energy_proj,
             radial_proj,
             tangential_proj,
-            deg,
             sender,
             receiver,
-            order,
-            start_per_receiver,
             edge_len,
         )
 
@@ -96,11 +80,8 @@ class DenseFlashAttention(nn.Module):
         energy_proj,
         radial_proj,
         tangential_proj,
-        deg,
         sender,
         receiver,
-        order,
-        start_per_receiver,
         edge_len,
     ):
         # *_proj are shaped (num_heads, num_nodes, feature_dim)
@@ -126,81 +107,59 @@ class DenseFlashAttention(nn.Module):
             energy_delta * self.tangential_score[:, None, :]
         ).sum(dim=-1)
 
+        num_edges = sender.numel()
+        feature_dim = energy_proj.shape[-1]
         out = torch.zeros_like(energy_proj)
-        max_deg = int(deg.max().item())
-        if max_deg == 0:
+        if num_edges == 0:
             return out.mean(dim=0)
 
-        # Build a dense gather map of shape (num_nodes, max_deg) so the per-head
-        # attention computation can run as a single fused softmax/einsum instead
-        # of looping over degrees. Positions beyond a node's actual degree are
-        # masked out with -inf logits and zeroed messages.
-        gather_range = torch.arange(max_deg, device=order.device)
-        edge_ids = start_per_receiver[:, None] + gather_range
-        valid = gather_range[None, :] < deg[:, None]
+        expanded_receiver = receiver.unsqueeze(0).expand(num_heads, -1)
 
-        # Clamp invalid positions to a safe index and apply masks before
-        # softmax so no probability mass leaks into padded slots.
-        safe_edge_ids = torch.where(
-            valid, edge_ids, torch.zeros_like(edge_ids)
-        )
-        edge_ids = order[safe_edge_ids]
+        def _segment_softmax(logits):
+            # logits: (heads, num_edges)
+            max_init = torch.full(
+                (num_heads, num_nodes),
+                float("-inf"),
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            max_per_node = max_init.scatter_reduce(
+                1,
+                expanded_receiver,
+                logits,
+                reduce="amax",
+                include_self=True,
+            )
+            max_per_node = torch.where(
+                torch.isfinite(max_per_node), max_per_node, torch.zeros_like(max_per_node)
+            )
 
-        # (heads, num_nodes, max_deg)
-        valid_exp = valid.unsqueeze(0)
+            centered = logits - max_per_node.gather(1, expanded_receiver)
+            exp_logits = torch.exp(centered)
 
-        # Direct indexing avoids expanding logits to (heads, num_nodes, num_edges)
-        # which was a major memory/time bottleneck. Shape: (heads, num_nodes, max_deg).
-        radial_slice = radial_logits[:, edge_ids]
-        tangential_slice = tangential_logits[:, edge_ids]
+            denom = torch.zeros_like(max_per_node).scatter_add(
+                1, expanded_receiver, exp_logits
+            )
+            alpha = exp_logits / (denom.gather(1, expanded_receiver) + 1e-9)
+            return torch.nan_to_num(alpha)
 
-        radial_slice = torch.where(
-            valid_exp, radial_slice, torch.full_like(radial_slice, float("-inf"))
-        )
-        tangential_slice = torch.where(
-            valid_exp,
-            tangential_slice,
-            torch.full_like(tangential_slice, float("-inf")),
-        )
+        radial_alpha = _segment_softmax(radial_logits)
+        tangential_alpha = _segment_softmax(tangential_logits)
 
-        radial_alpha = torch.softmax(radial_slice, dim=2)
-        tangential_alpha = torch.softmax(tangential_slice, dim=2)
-        radial_alpha = torch.where(
-            valid_exp, radial_alpha, torch.zeros_like(radial_alpha)
-        )
-        tangential_alpha = torch.where(
-            valid_exp, tangential_alpha, torch.zeros_like(tangential_alpha)
-        )
-        radial_alpha = torch.nan_to_num(radial_alpha)
-        tangential_alpha = torch.nan_to_num(tangential_alpha)
-
-        radial_delta_slice = radial_delta[:, edge_ids]
-        tangential_delta_slice = tangential_delta[:, edge_ids]
-
-        radial_delta_slice = torch.where(
-            valid_exp[..., None], radial_delta_slice, torch.zeros_like(radial_delta_slice)
-        )
-        tangential_delta_slice = torch.where(
-            valid_exp[..., None],
-            tangential_delta_slice,
-            torch.zeros_like(tangential_delta_slice),
-        )
-
-        # Distance-gated mixture to reduce redundant aggregation while allowing
-        # the model to smoothly interpolate between radial and tangential
-        # behaviors. Close neighbors (small edge_len) can lean radial; distant
-        # neighbors can defer to tangential updates.
-        edge_len_slice = edge_len[edge_ids]
         mix_gate = torch.sigmoid(
-            self._mix_bias[:, None, None]
-            + self._mix_scale[:, None, None] * edge_len_slice[None, ...]
+            self._mix_bias[:, None]
+            + self._mix_scale[:, None] * edge_len[None, :]
         )
-        mix_gate = torch.where(valid_exp, mix_gate, torch.zeros_like(mix_gate))
 
         blended_alpha = mix_gate * radial_alpha + (1.0 - mix_gate) * tangential_alpha
-        blended_delta = mix_gate[..., None] * radial_delta_slice + (
-            1.0 - mix_gate[..., None]
-        ) * tangential_delta_slice
+        blended_delta = mix_gate[:, :, None] * radial_delta + (
+            1.0 - mix_gate[:, :, None]
+        ) * tangential_delta
 
-        out = torch.einsum("hnd,hndf->hnf", blended_alpha, blended_delta)
+        weighted_delta = blended_alpha[..., None] * blended_delta
+        out = out.scatter_add(
+            1,
+            expanded_receiver[:, :, None].expand(-1, -1, feature_dim),
+            weighted_delta,
+        )
         return out.mean(dim=0)
