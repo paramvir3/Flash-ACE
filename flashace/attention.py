@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from e3nn import o3
-from torch_scatter import scatter_sum, scatter_max
 
 class DenseFlashAttention(nn.Module):
     def __init__(self, irreps_in, hidden_dim):
@@ -17,18 +17,47 @@ class DenseFlashAttention(nn.Module):
         Q = self.w_q(x)
         K = self.w_k(x)
         V = self.w_v(x)
-        
-        # Invariant Dot Product (Scalar Score)
-        scores = torch.sum(Q[receiver] * K[sender], dim=1) * self.scale
-        
-        # Stable Softmax via Scatter
-        scores_max, _ = scatter_max(scores, receiver, dim=0, dim_size=x.shape[0])
-        alpha = torch.exp(scores - scores_max[receiver])
-        Z = scatter_sum(alpha, receiver, dim=0, dim_size=x.shape[0])
-        alpha = alpha / (Z[receiver] + 1e-6)
-        
-        # Aggregate
-        weighted_V = alpha.unsqueeze(-1) * V[sender]
-        out = scatter_sum(weighted_V, receiver, dim=0, dim_size=x.shape[0])
-        
+
+        num_nodes = x.shape[0]
+        if sender.numel() == 0:
+            return x
+
+        # Preallocate neighbor tensors (padded) so we can run a single fused
+        # scaled_dot_product_attention call that leverages Flash Attention
+        # kernels when available on the current device.
+        deg = torch.bincount(receiver, minlength=num_nodes)
+        max_deg = int(deg.max().item())
+        head_dim = Q.shape[-1]
+
+        k_buf = torch.zeros((num_nodes, max_deg, head_dim), device=x.device, dtype=K.dtype)
+        v_buf = torch.zeros_like(k_buf)
+        valid = torch.zeros((num_nodes, max_deg), device=x.device, dtype=torch.bool)
+
+        # Track the next free slot for each receiver node.
+        fill_ptr = torch.zeros(num_nodes, device=x.device, dtype=torch.long)
+        for s, r in zip(sender, receiver):
+            idx = fill_ptr[r]
+            k_buf[r, idx] = K[s]
+            v_buf[r, idx] = V[s]
+            valid[r, idx] = True
+            fill_ptr[r] = idx + 1
+
+        q = Q[:, None, None, :]
+        k = k_buf[:, None, :, :]
+        v = v_buf[:, None, :, :]
+        attn_mask = ~valid[:, None, None, :]
+
+        # Prefer Flash Attention kernels while allowing fallback to other
+        # implementations when unsupported (e.g., CPU execution).
+        with torch.backends.cuda.sdp_kernel(enable_flash=True):
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                is_causal=False,
+                scale=self.scale,
+            )
+
+        out = torch.nan_to_num(out.squeeze(2).squeeze(1))
         return x + self.w_out(out)
