@@ -143,9 +143,13 @@ class DenseFlashAttention(nn.Module):
         edge_ids_exp = edge_ids.unsqueeze(0).expand(num_heads, -1, -1)
         valid_exp = valid.unsqueeze(0)
 
-        radial_slice = torch.gather(radial_logits.unsqueeze(1), 2, edge_ids_exp)
+        # Expand logits over nodes so gather aligns with the (heads, num_nodes,
+        # max_deg) index layout.
+        radial_slice = torch.gather(
+            radial_logits.unsqueeze(1).expand(-1, num_nodes, -1), 2, edge_ids_exp
+        )
         tangential_slice = torch.gather(
-            tangential_logits.unsqueeze(1), 2, edge_ids_exp
+            tangential_logits.unsqueeze(1).expand(-1, num_nodes, -1), 2, edge_ids_exp
         )
 
         radial_slice = torch.where(
@@ -169,12 +173,12 @@ class DenseFlashAttention(nn.Module):
         tangential_alpha = torch.nan_to_num(tangential_alpha)
 
         radial_delta_slice = torch.gather(
-            radial_delta.unsqueeze(1),
+            radial_delta.unsqueeze(1).expand(-1, num_nodes, -1, -1),
             2,
             edge_ids_exp[..., None].expand(-1, -1, -1, radial_delta.shape[-1]),
         )
         tangential_delta_slice = torch.gather(
-            tangential_delta.unsqueeze(1),
+            tangential_delta.unsqueeze(1).expand(-1, num_nodes, -1, -1),
             2,
             edge_ids_exp[..., None].expand(
                 -1, -1, -1, tangential_delta.shape[-1]
