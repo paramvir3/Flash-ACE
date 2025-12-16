@@ -143,8 +143,10 @@ class DenseFlashAttention(nn.Module):
         edge_ids_exp = edge_ids.unsqueeze(0).expand(num_heads, -1, -1)
         valid_exp = valid.unsqueeze(0)
 
-        radial_slice = torch.gather(radial_logits, 1, edge_ids_exp)
-        tangential_slice = torch.gather(tangential_logits, 1, edge_ids_exp)
+        radial_slice = torch.gather(radial_logits.unsqueeze(1), 2, edge_ids_exp)
+        tangential_slice = torch.gather(
+            tangential_logits.unsqueeze(1), 2, edge_ids_exp
+        )
 
         radial_slice = torch.where(
             valid_exp, radial_slice, torch.full_like(radial_slice, float("-inf"))
@@ -167,13 +169,13 @@ class DenseFlashAttention(nn.Module):
         tangential_alpha = torch.nan_to_num(tangential_alpha)
 
         radial_delta_slice = torch.gather(
-            radial_delta,
-            1,
+            radial_delta.unsqueeze(1),
+            2,
             edge_ids_exp[..., None].expand(-1, -1, -1, radial_delta.shape[-1]),
         )
         tangential_delta_slice = torch.gather(
-            tangential_delta,
-            1,
+            tangential_delta.unsqueeze(1),
+            2,
             edge_ids_exp[..., None].expand(
                 -1, -1, -1, tangential_delta.shape[-1]
             ),
