@@ -35,6 +35,11 @@ class DenseFlashAttention(nn.Module):
         # neighbors while keeping gradients stable on far bonds.
         self._radial_temp_bias = nn.Parameter(torch.zeros(num_heads))
         self._radial_temp_weight = nn.Parameter(torch.zeros(num_heads))
+        # Distance-gated mixer that blends radial/tangential streams so
+        # short bonds can emphasize radial updates while long bonds lean on
+        # tangential cues without running separate aggregation passes.
+        self._mix_bias = nn.Parameter(torch.zeros(num_heads))
+        self._mix_scale = nn.Parameter(torch.zeros(num_heads))
 
         self.w_out = o3.Linear(irreps_in, irreps_in)
         self.reset_parameters()
@@ -45,6 +50,8 @@ class DenseFlashAttention(nn.Module):
         nn.init.zeros_(self._radial_distance_log_scale)
         nn.init.zeros_(self._radial_temp_bias)
         nn.init.zeros_(self._radial_temp_weight)
+        nn.init.zeros_(self._mix_bias)
+        nn.init.zeros_(self._mix_scale)
 
     def forward(self, x, edge_index, edge_vec, edge_len):
         sender, receiver = edge_index
@@ -179,10 +186,21 @@ class DenseFlashAttention(nn.Module):
             torch.zeros_like(tangential_delta_slice),
         )
 
-        radial_msg = torch.einsum("hnd,hndf->hnf", radial_alpha, radial_delta_slice)
-        tangential_msg = torch.einsum(
-            "hnd,hndf->hnf", tangential_alpha, tangential_delta_slice
+        # Distance-gated mixture to reduce redundant aggregation while allowing
+        # the model to smoothly interpolate between radial and tangential
+        # behaviors. Close neighbors (small edge_len) can lean radial; distant
+        # neighbors can defer to tangential updates.
+        edge_len_slice = edge_len[edge_ids]
+        mix_gate = torch.sigmoid(
+            self._mix_bias[:, None, None]
+            + self._mix_scale[:, None, None] * edge_len_slice[None, ...]
         )
+        mix_gate = torch.where(valid_exp, mix_gate, torch.zeros_like(mix_gate))
 
-        out = radial_msg + tangential_msg
+        blended_alpha = mix_gate * radial_alpha + (1.0 - mix_gate) * tangential_alpha
+        blended_delta = mix_gate[..., None] * radial_delta_slice + (
+            1.0 - mix_gate[..., None]
+        ) * tangential_delta_slice
+
+        out = torch.einsum("hnd,hndf->hnf", blended_alpha, blended_delta)
         return out.mean(dim=0)
