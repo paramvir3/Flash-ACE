@@ -120,41 +120,78 @@ class DenseFlashAttention(nn.Module):
         ).sum(dim=-1)
 
         out = torch.zeros_like(energy_proj)
-        unique_deg = torch.unique(deg)
+        max_deg = int(deg.max().item())
+        if max_deg == 0:
+            return out.mean(dim=0)
 
-        for d in unique_deg.tolist():
-            if d == 0:
-                continue
+        # Build a dense gather map of shape (num_nodes, max_deg) so the per-head
+        # attention computation can run as a single fused softmax/einsum instead
+        # of looping over degrees. Positions beyond a node's actual degree are
+        # masked out with -inf logits and zeroed messages.
+        gather_range = torch.arange(max_deg, device=order.device)
+        edge_ids = start_per_receiver[:, None] + gather_range
+        valid = gather_range[None, :] < deg[:, None]
 
-            idx = deg == d
-            if not torch.any(idx):
-                continue
+        # Clamp invalid positions to a safe index and apply masks before
+        # softmax so no probability mass leaks into padded slots.
+        safe_edge_ids = torch.where(
+            valid, edge_ids, torch.zeros_like(edge_ids)
+        )
+        edge_ids = order[safe_edge_ids]
 
-            # Gather contiguous edge blocks for this degree directly from the
-            # sorted edge list so we avoid constructing large zero-padded
-            # buffers when max_deg is much larger than the typical degree.
-            edge_offsets = start_per_receiver[idx]
-            gather_range = (
-                edge_offsets[:, None]
-                + torch.arange(d, device=edge_offsets.device)
-            )
-            edge_ids = order[gather_range]
+        # (heads, num_nodes, max_deg)
+        edge_ids_exp = edge_ids.unsqueeze(0).expand(num_heads, -1, -1)
+        valid_exp = valid.unsqueeze(0)
 
-            radial_slice = radial_logits[:, edge_ids]
-            tangential_slice = tangential_logits[:, edge_ids]
-            radial_delta_slice = radial_delta[:, edge_ids]
-            tangential_delta_slice = tangential_delta[:, edge_ids]
+        radial_slice = torch.gather(radial_logits, 1, edge_ids_exp)
+        tangential_slice = torch.gather(tangential_logits, 1, edge_ids_exp)
 
-            radial_alpha = torch.softmax(radial_slice, dim=2)
-            tangential_alpha = torch.softmax(tangential_slice, dim=2)
+        radial_slice = torch.where(
+            valid_exp, radial_slice, torch.full_like(radial_slice, float("-inf"))
+        )
+        tangential_slice = torch.where(
+            valid_exp,
+            tangential_slice,
+            torch.full_like(tangential_slice, float("-inf")),
+        )
 
-            radial_msg = torch.einsum(
-                "hnd,hndf->hnf", radial_alpha, radial_delta_slice
-            )
-            tangential_msg = torch.einsum(
-                "hnd,hndf->hnf", tangential_alpha, tangential_delta_slice
-            )
+        radial_alpha = torch.softmax(radial_slice, dim=2)
+        tangential_alpha = torch.softmax(tangential_slice, dim=2)
+        radial_alpha = torch.where(
+            valid_exp, radial_alpha, torch.zeros_like(radial_alpha)
+        )
+        tangential_alpha = torch.where(
+            valid_exp, tangential_alpha, torch.zeros_like(tangential_alpha)
+        )
+        radial_alpha = torch.nan_to_num(radial_alpha)
+        tangential_alpha = torch.nan_to_num(tangential_alpha)
 
-            out[:, idx, :] = (radial_msg + tangential_msg).to(out.dtype)
+        radial_delta_slice = torch.gather(
+            radial_delta,
+            1,
+            edge_ids_exp[..., None].expand(-1, -1, -1, radial_delta.shape[-1]),
+        )
+        tangential_delta_slice = torch.gather(
+            tangential_delta,
+            1,
+            edge_ids_exp[..., None].expand(
+                -1, -1, -1, tangential_delta.shape[-1]
+            ),
+        )
 
+        radial_delta_slice = torch.where(
+            valid_exp[..., None], radial_delta_slice, torch.zeros_like(radial_delta_slice)
+        )
+        tangential_delta_slice = torch.where(
+            valid_exp[..., None],
+            tangential_delta_slice,
+            torch.zeros_like(tangential_delta_slice),
+        )
+
+        radial_msg = torch.einsum("hnd,hndf->hnf", radial_alpha, radial_delta_slice)
+        tangential_msg = torch.einsum(
+            "hnd,hndf->hnf", tangential_alpha, tangential_delta_slice
+        )
+
+        out = radial_msg + tangential_msg
         return out.mean(dim=0)
