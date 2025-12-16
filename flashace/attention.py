@@ -53,13 +53,9 @@ class DenseFlashAttention(nn.Module):
             return x
 
         deg = torch.bincount(receiver, minlength=num_nodes)
-        max_deg = int(deg.max().item())
-
-        # Vectorized position within each receiver bucket so we avoid a Python
-        # loop over edges, which becomes a bottleneck on large graphs.
+        # Vectorized sorting of edges by receiver so we can build per-degree
+        # buckets without a Python loop.
         order = torch.argsort(receiver)
-        receiver_sorted = receiver[order]
-
         # Start index for each receiver in the sorted list of edges.
         start_per_receiver = torch.cumsum(
             torch.cat([
@@ -68,11 +64,6 @@ class DenseFlashAttention(nn.Module):
             ]),
             dim=0,
         )[:-1]
-
-        pos_sorted = torch.arange(sender.numel(), device=x.device) - start_per_receiver[receiver_sorted]
-
-        pos = torch.empty_like(order)
-        pos[order] = pos_sorted
 
         energy_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
         radial_proj = torch.stack([layer(x) for layer in self.radial_update], dim=0)
@@ -83,10 +74,10 @@ class DenseFlashAttention(nn.Module):
             radial_proj,
             tangential_proj,
             deg,
-            pos,
-            max_deg,
             sender,
             receiver,
+            order,
+            start_per_receiver,
             edge_len,
         )
 
@@ -99,10 +90,10 @@ class DenseFlashAttention(nn.Module):
         radial_proj,
         tangential_proj,
         deg,
-        pos,
-        max_deg,
         sender,
         receiver,
+        order,
+        start_per_receiver,
         edge_len,
     ):
         # *_proj are shaped (num_heads, num_nodes, feature_dim)
@@ -112,23 +103,6 @@ class DenseFlashAttention(nn.Module):
         energy_delta = energy_proj[:, sender] - energy_proj[:, receiver]
         radial_delta = radial_proj[:, sender] - radial_proj[:, receiver]
         tangential_delta = tangential_proj[:, sender] - tangential_proj[:, receiver]
-
-        radial_delta_buf = torch.zeros(
-            (num_heads, num_nodes, max_deg, self.feature_dim),
-            device=energy_proj.device,
-            dtype=energy_proj.dtype,
-        )
-        tangential_delta_buf = torch.zeros_like(radial_delta_buf)
-        radial_energy = torch.full(
-            (num_heads, num_nodes, max_deg),
-            fill_value=float("-inf"),
-            device=energy_proj.device,
-            dtype=energy_proj.dtype,
-        )
-        tangential_energy = torch.full_like(radial_energy, float("-inf"))
-
-        radial_delta_buf[:, receiver, pos] = radial_delta
-        tangential_delta_buf[:, receiver, pos] = tangential_delta
 
         # Radial energy penalizes long bonds, tangential is distance agnostic.
         radial_distance_scale = F.softplus(self._radial_distance_log_scale)
@@ -145,9 +119,6 @@ class DenseFlashAttention(nn.Module):
             energy_delta * self.tangential_score[:, None, :]
         ).sum(dim=-1)
 
-        radial_energy[:, receiver, pos] = radial_logits
-        tangential_energy[:, receiver, pos] = tangential_logits
-
         out = torch.zeros_like(energy_proj)
         unique_deg = torch.unique(deg)
 
@@ -156,10 +127,23 @@ class DenseFlashAttention(nn.Module):
                 continue
 
             idx = deg == d
-            radial_delta_slice = radial_delta_buf[:, idx, :d, :]
-            tangential_delta_slice = tangential_delta_buf[:, idx, :d, :]
-            radial_slice = radial_energy[:, idx, :d]
-            tangential_slice = tangential_energy[:, idx, :d]
+            if not torch.any(idx):
+                continue
+
+            # Gather contiguous edge blocks for this degree directly from the
+            # sorted edge list so we avoid constructing large zero-padded
+            # buffers when max_deg is much larger than the typical degree.
+            edge_offsets = start_per_receiver[idx]
+            gather_range = (
+                edge_offsets[:, None]
+                + torch.arange(d, device=edge_offsets.device)
+            )
+            edge_ids = order[gather_range]
+
+            radial_slice = radial_logits[:, edge_ids]
+            tangential_slice = tangential_logits[:, edge_ids]
+            radial_delta_slice = radial_delta[:, edge_ids]
+            tangential_delta_slice = tangential_delta[:, edge_ids]
 
             radial_alpha = torch.softmax(radial_slice, dim=2)
             tangential_alpha = torch.softmax(tangential_slice, dim=2)
