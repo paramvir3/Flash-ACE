@@ -9,8 +9,16 @@ class DenseFlashAttention(nn.Module):
         self.num_heads = num_heads
         self.feature_dim = o3.Irreps(irreps_in).dim
 
-        # Content projections
+        # Content projections for energy scores.
         self.w_proj = nn.ModuleList(
+            [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
+        )
+        # Separate update projections so radial/tangential channels can learn
+        # distinct filters rather than reusing the energy encoder.
+        self.radial_update = nn.ModuleList(
+            [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
+        )
+        self.tangential_update = nn.ModuleList(
             [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
         )
 
@@ -60,10 +68,14 @@ class DenseFlashAttention(nn.Module):
         pos = torch.empty_like(order)
         pos[order] = pos_sorted
 
-        stacked_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
+        energy_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
+        radial_proj = torch.stack([layer(x) for layer in self.radial_update], dim=0)
+        tangential_proj = torch.stack([layer(x) for layer in self.tangential_update], dim=0)
 
         out = self._geometric_decomposition_attention(
-            stacked_proj,
+            energy_proj,
+            radial_proj,
+            tangential_proj,
             deg,
             pos,
             max_deg,
@@ -77,7 +89,9 @@ class DenseFlashAttention(nn.Module):
 
     def _geometric_decomposition_attention(
         self,
-        proj,
+        energy_proj,
+        radial_proj,
+        tangential_proj,
         deg,
         pos,
         max_deg,
@@ -85,39 +99,45 @@ class DenseFlashAttention(nn.Module):
         receiver,
         edge_len,
     ):
-        # proj is shaped (num_heads, num_nodes, feature_dim)
-        num_heads = proj.shape[0]
-        num_nodes = proj.shape[1]
+        # *_proj are shaped (num_heads, num_nodes, feature_dim)
+        num_heads = energy_proj.shape[0]
+        num_nodes = energy_proj.shape[1]
 
-        delta = proj[:, sender] - proj[:, receiver]
+        energy_delta = energy_proj[:, sender] - energy_proj[:, receiver]
+        radial_delta = radial_proj[:, sender] - radial_proj[:, receiver]
+        tangential_delta = tangential_proj[:, sender] - tangential_proj[:, receiver]
 
-        delta_buf = torch.zeros(
+        radial_delta_buf = torch.zeros(
             (num_heads, num_nodes, max_deg, self.feature_dim),
-            device=proj.device,
-            dtype=proj.dtype,
+            device=energy_proj.device,
+            dtype=energy_proj.dtype,
         )
+        tangential_delta_buf = torch.zeros_like(radial_delta_buf)
         radial_energy = torch.full(
             (num_heads, num_nodes, max_deg),
             fill_value=float("-inf"),
-            device=proj.device,
-            dtype=proj.dtype,
+            device=energy_proj.device,
+            dtype=energy_proj.dtype,
         )
         tangential_energy = torch.full_like(radial_energy, float("-inf"))
 
-        delta_buf[:, receiver, pos] = delta
+        radial_delta_buf[:, receiver, pos] = radial_delta
+        tangential_delta_buf[:, receiver, pos] = tangential_delta
 
         # Radial energy penalizes long bonds, tangential is distance agnostic.
         radial_distance_scale = F.softplus(self._radial_distance_log_scale)
         radial_logits = (
-            (delta * self.radial_score[:, None, :]).sum(dim=-1)
+            (energy_delta * self.radial_score[:, None, :]).sum(dim=-1)
             - radial_distance_scale * edge_len
         )
-        tangential_logits = (delta * self.tangential_score[:, None, :]).sum(dim=-1)
+        tangential_logits = (
+            energy_delta * self.tangential_score[:, None, :]
+        ).sum(dim=-1)
 
         radial_energy[:, receiver, pos] = radial_logits
         tangential_energy[:, receiver, pos] = tangential_logits
 
-        out = torch.zeros_like(proj)
+        out = torch.zeros_like(energy_proj)
         unique_deg = torch.unique(deg)
 
         for d in unique_deg.tolist():
@@ -125,15 +145,20 @@ class DenseFlashAttention(nn.Module):
                 continue
 
             idx = deg == d
-            delta_slice = delta_buf[:, idx, :d, :]
+            radial_delta_slice = radial_delta_buf[:, idx, :d, :]
+            tangential_delta_slice = tangential_delta_buf[:, idx, :d, :]
             radial_slice = radial_energy[:, idx, :d]
             tangential_slice = tangential_energy[:, idx, :d]
 
             radial_alpha = torch.softmax(radial_slice, dim=2)
             tangential_alpha = torch.softmax(tangential_slice, dim=2)
 
-            radial_msg = torch.einsum("hnd,hndf->hnf", radial_alpha, delta_slice)
-            tangential_msg = torch.einsum("hnd,hndf->hnf", tangential_alpha, delta_slice)
+            radial_msg = torch.einsum(
+                "hnd,hndf->hnf", radial_alpha, radial_delta_slice
+            )
+            tangential_msg = torch.einsum(
+                "hnd,hndf->hnf", tangential_alpha, tangential_delta_slice
+            )
 
             out[:, idx, :] = (radial_msg + tangential_msg).to(out.dtype)
 
