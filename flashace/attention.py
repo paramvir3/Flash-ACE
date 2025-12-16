@@ -32,13 +32,27 @@ class DenseFlashAttention(nn.Module):
         k_buf = torch.zeros((num_nodes, max_deg, head_dim), device=x.device, dtype=K.dtype)
         v_buf = torch.zeros_like(k_buf)
 
-        # Track the next free slot for each receiver node.
-        fill_ptr = torch.zeros(num_nodes, device=x.device, dtype=torch.long)
-        for s, r in zip(sender, receiver):
-            idx = fill_ptr[r]
-            k_buf[r, idx] = K[s]
-            v_buf[r, idx] = V[s]
-            fill_ptr[r] = idx + 1
+        # Vectorized position within each receiver bucket so we avoid a Python
+        # loop over edges, which becomes a bottleneck on large graphs.
+        order = torch.argsort(receiver)
+        receiver_sorted = receiver[order]
+
+        # Start index for each receiver in the sorted list of edges.
+        start_per_receiver = torch.cumsum(
+            torch.cat([
+                torch.zeros(1, device=x.device, dtype=deg.dtype),
+                deg.to(torch.long)
+            ]),
+            dim=0,
+        )[:-1]
+
+        pos_sorted = torch.arange(sender.numel(), device=x.device) - start_per_receiver[receiver_sorted]
+
+        pos = torch.empty_like(order)
+        pos[order] = pos_sorted
+
+        k_buf[receiver, pos] = K[sender]
+        v_buf[receiver, pos] = V[sender]
 
         out = torch.zeros_like(Q)
         unique_deg = torch.unique(deg)
