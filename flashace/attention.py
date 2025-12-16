@@ -68,7 +68,7 @@ class DenseFlashAttention(nn.Module):
                     scale=self.scale,
                 )
 
-                out[idx] = out_bucket.squeeze(2).squeeze(1)
+                out[idx] = out_bucket.squeeze(2).squeeze(1).to(out.dtype)
 
         out = torch.nan_to_num(out)
         return x + self.w_out(out)
