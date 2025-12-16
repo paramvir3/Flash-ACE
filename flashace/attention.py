@@ -140,17 +140,12 @@ class DenseFlashAttention(nn.Module):
         edge_ids = order[safe_edge_ids]
 
         # (heads, num_nodes, max_deg)
-        edge_ids_exp = edge_ids.unsqueeze(0).expand(num_heads, -1, -1)
         valid_exp = valid.unsqueeze(0)
 
-        # Expand logits over nodes so gather aligns with the (heads, num_nodes,
-        # max_deg) index layout.
-        radial_slice = torch.gather(
-            radial_logits.unsqueeze(1).expand(-1, num_nodes, -1), 2, edge_ids_exp
-        )
-        tangential_slice = torch.gather(
-            tangential_logits.unsqueeze(1).expand(-1, num_nodes, -1), 2, edge_ids_exp
-        )
+        # Direct indexing avoids expanding logits to (heads, num_nodes, num_edges)
+        # which was a major memory/time bottleneck. Shape: (heads, num_nodes, max_deg).
+        radial_slice = radial_logits[:, edge_ids]
+        tangential_slice = tangential_logits[:, edge_ids]
 
         radial_slice = torch.where(
             valid_exp, radial_slice, torch.full_like(radial_slice, float("-inf"))
@@ -172,18 +167,8 @@ class DenseFlashAttention(nn.Module):
         radial_alpha = torch.nan_to_num(radial_alpha)
         tangential_alpha = torch.nan_to_num(tangential_alpha)
 
-        radial_delta_slice = torch.gather(
-            radial_delta.unsqueeze(1).expand(-1, num_nodes, -1, -1),
-            2,
-            edge_ids_exp[..., None].expand(-1, -1, -1, radial_delta.shape[-1]),
-        )
-        tangential_delta_slice = torch.gather(
-            tangential_delta.unsqueeze(1).expand(-1, num_nodes, -1, -1),
-            2,
-            edge_ids_exp[..., None].expand(
-                -1, -1, -1, tangential_delta.shape[-1]
-            ),
-        )
+        radial_delta_slice = radial_delta[:, edge_ids]
+        tangential_delta_slice = tangential_delta[:, edge_ids]
 
         radial_delta_slice = torch.where(
             valid_exp[..., None], radial_delta_slice, torch.zeros_like(radial_delta_slice)
