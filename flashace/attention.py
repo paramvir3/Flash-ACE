@@ -4,33 +4,29 @@ import torch.nn.functional as F
 from e3nn import o3
 
 class DenseFlashAttention(nn.Module):
-    def __init__(self, irreps_in, hidden_dim):
+    def __init__(self, irreps_in, hidden_dim, num_heads: int = 4):
         super().__init__()
-        self.scale = hidden_dim ** -0.5
-        self.w_q = o3.Linear(irreps_in, irreps_in)
-        self.w_k = o3.Linear(irreps_in, irreps_in)
-        self.w_v = o3.Linear(irreps_in, irreps_in)
+        self.num_heads = num_heads
+
+        self.w_q = nn.ModuleList(
+            [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
+        )
+        self.w_k = nn.ModuleList(
+            [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
+        )
+        self.w_v = nn.ModuleList(
+            [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
+        )
         self.w_out = o3.Linear(irreps_in, irreps_in)
 
     def forward(self, x, edge_index):
         sender, receiver = edge_index
-        Q = self.w_q(x)
-        K = self.w_k(x)
-        V = self.w_v(x)
-
         num_nodes = x.shape[0]
         if sender.numel() == 0:
             return x
 
-        # Preallocate neighbor tensors (padded) so we can run fused
-        # scaled_dot_product_attention calls that leverage Flash Attention
-        # kernels when available on the current device.
         deg = torch.bincount(receiver, minlength=num_nodes)
         max_deg = int(deg.max().item())
-        head_dim = Q.shape[-1]
-
-        k_buf = torch.zeros((num_nodes, max_deg, head_dim), device=x.device, dtype=K.dtype)
-        v_buf = torch.zeros_like(k_buf)
 
         # Vectorized position within each receiver bucket so we avoid a Python
         # loop over edges, which becomes a bottleneck on large graphs.
@@ -50,6 +46,37 @@ class DenseFlashAttention(nn.Module):
 
         pos = torch.empty_like(order)
         pos[order] = pos_sorted
+
+        head_outputs = []
+        for head in range(self.num_heads):
+            Q = self.w_q[head](x)
+            K = self.w_k[head](x)
+            V = self.w_v[head](x)
+
+            head_outputs.append(
+                self._flash_attention(
+                    Q,
+                    K,
+                    V,
+                    deg,
+                    pos,
+                    max_deg,
+                    sender,
+                    receiver,
+                )
+            )
+
+        out = torch.stack(head_outputs, dim=0).mean(dim=0)
+        out = torch.nan_to_num(out)
+        return x + self.w_out(out)
+
+    def _flash_attention(self, Q, K, V, deg, pos, max_deg, sender, receiver):
+        head_dim = K.shape[-1]
+        num_nodes = Q.shape[0]
+        head_scale = head_dim ** -0.5
+
+        k_buf = torch.zeros((num_nodes, max_deg, head_dim), device=K.device, dtype=K.dtype)
+        v_buf = torch.zeros_like(k_buf)
 
         k_buf[receiver, pos] = K[sender]
         v_buf[receiver, pos] = V[sender]
@@ -79,10 +106,9 @@ class DenseFlashAttention(nn.Module):
                     v,
                     attn_mask=None,
                     is_causal=False,
-                    scale=self.scale,
+                    scale=head_scale,
                 )
 
                 out[idx] = out_bucket.squeeze(2).squeeze(1).to(out.dtype)
 
-        out = torch.nan_to_num(out)
-        return x + self.w_out(out)
+        return out
