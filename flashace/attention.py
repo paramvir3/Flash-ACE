@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from e3nn import o3
 
 class DenseFlashAttention(nn.Module):
@@ -20,7 +21,8 @@ class DenseFlashAttention(nn.Module):
         self.tangential_score = nn.Parameter(
             torch.empty(num_heads, self.feature_dim)
         )
-        self.radial_distance_scale = nn.Parameter(torch.tensor(1.0))
+        # Use a positive scale so longer bonds are consistently penalized.
+        self._radial_distance_log_scale = nn.Parameter(torch.tensor(0.0))
 
         self.w_out = o3.Linear(irreps_in, irreps_in)
         self.reset_parameters()
@@ -28,7 +30,7 @@ class DenseFlashAttention(nn.Module):
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.radial_score)
         nn.init.xavier_uniform_(self.tangential_score)
-        nn.init.constant_(self.radial_distance_scale, 1.0)
+        nn.init.zeros_(self._radial_distance_log_scale)
 
     def forward(self, x, edge_index, edge_vec, edge_len):
         sender, receiver = edge_index
@@ -96,18 +98,19 @@ class DenseFlashAttention(nn.Module):
         )
         radial_energy = torch.full(
             (num_heads, num_nodes, max_deg),
-            fill_value=-torch.finfo(proj.dtype).max,
+            fill_value=float("-inf"),
             device=proj.device,
             dtype=proj.dtype,
         )
-        tangential_energy = torch.full_like(radial_energy, -torch.finfo(proj.dtype).max)
+        tangential_energy = torch.full_like(radial_energy, float("-inf"))
 
         delta_buf[:, receiver, pos] = delta
 
         # Radial energy penalizes long bonds, tangential is distance agnostic.
+        radial_distance_scale = F.softplus(self._radial_distance_log_scale)
         radial_logits = (
             (delta * self.radial_score[:, None, :]).sum(dim=-1)
-            - self.radial_distance_scale * edge_len
+            - radial_distance_scale * edge_len
         )
         tangential_logits = (delta * self.tangential_score[:, None, :]).sum(dim=-1)
 
