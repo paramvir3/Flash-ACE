@@ -80,8 +80,8 @@ class FlashACE(nn.Module):
         # 1. Pipeline (No checkpoints)
         h = self.emb(z)
         h = self.ace(h, edge_index, edge_vec, edge_len)
-        for layer in self.layers: 
-            h = layer(h, edge_index)
+        for layer in self.layers:
+            h = layer(h, edge_index, edge_vec, edge_len)
             
         # 2. Readout
         # Note: We extract only the scalar (L=0) features for energy

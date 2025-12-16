@@ -1,25 +1,36 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from e3nn import o3
 
 class DenseFlashAttention(nn.Module):
     def __init__(self, irreps_in, hidden_dim, num_heads: int = 4):
         super().__init__()
         self.num_heads = num_heads
+        self.feature_dim = o3.Irreps(irreps_in).dim
 
-        self.w_q = nn.ModuleList(
+        # Content projections
+        self.w_proj = nn.ModuleList(
             [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
         )
-        self.w_k = nn.ModuleList(
-            [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
+
+        # Geometry-aware scoring vectors
+        self.radial_score = nn.Parameter(
+            torch.empty(num_heads, self.feature_dim)
         )
-        self.w_v = nn.ModuleList(
-            [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
+        self.tangential_score = nn.Parameter(
+            torch.empty(num_heads, self.feature_dim)
         )
+        self.radial_distance_scale = nn.Parameter(torch.tensor(1.0))
+
         self.w_out = o3.Linear(irreps_in, irreps_in)
+        self.reset_parameters()
 
-    def forward(self, x, edge_index):
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.radial_score)
+        nn.init.xavier_uniform_(self.tangential_score)
+        nn.init.constant_(self.radial_distance_scale, 1.0)
+
+    def forward(self, x, edge_index, edge_vec, edge_len):
         sender, receiver = edge_index
         num_nodes = x.shape[0]
         if sender.numel() == 0:
@@ -47,71 +58,80 @@ class DenseFlashAttention(nn.Module):
         pos = torch.empty_like(order)
         pos[order] = pos_sorted
 
-        stacked_Q = torch.stack([layer(x) for layer in self.w_q], dim=0)
-        stacked_K = torch.stack([layer(x) for layer in self.w_k], dim=0)
-        stacked_V = torch.stack([layer(x) for layer in self.w_v], dim=0)
+        stacked_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
 
-        out = self._flash_attention(
-            stacked_Q,
-            stacked_K,
-            stacked_V,
+        out = self._geometric_decomposition_attention(
+            stacked_proj,
             deg,
             pos,
             max_deg,
             sender,
             receiver,
+            edge_len,
         )
 
         out = torch.nan_to_num(out)
         return x + self.w_out(out)
 
-    def _flash_attention(self, Q, K, V, deg, pos, max_deg, sender, receiver):
-        # Q, K, V are shaped (num_heads, num_nodes, feature_dim)
-        num_heads = Q.shape[0]
-        head_dim = K.shape[-1]
-        num_nodes = Q.shape[1]
-        head_scale = head_dim ** -0.5
+    def _geometric_decomposition_attention(
+        self,
+        proj,
+        deg,
+        pos,
+        max_deg,
+        sender,
+        receiver,
+        edge_len,
+    ):
+        # proj is shaped (num_heads, num_nodes, feature_dim)
+        num_heads = proj.shape[0]
+        num_nodes = proj.shape[1]
 
-        k_buf = torch.zeros(
-            (num_heads, num_nodes, max_deg, head_dim),
-            device=K.device,
-            dtype=K.dtype,
+        delta = proj[:, sender] - proj[:, receiver]
+
+        delta_buf = torch.zeros(
+            (num_heads, num_nodes, max_deg, self.feature_dim),
+            device=proj.device,
+            dtype=proj.dtype,
         )
-        v_buf = torch.zeros_like(k_buf)
+        radial_energy = torch.full(
+            (num_heads, num_nodes, max_deg),
+            fill_value=-torch.finfo(proj.dtype).max,
+            device=proj.device,
+            dtype=proj.dtype,
+        )
+        tangential_energy = torch.full_like(radial_energy, -torch.finfo(proj.dtype).max)
 
-        k_buf[:, receiver, pos] = K[:, sender]
-        v_buf[:, receiver, pos] = V[:, sender]
+        delta_buf[:, receiver, pos] = delta
 
-        out = torch.zeros_like(Q)
+        # Radial energy penalizes long bonds, tangential is distance agnostic.
+        radial_logits = (
+            (delta * self.radial_score[:, None, :]).sum(dim=-1)
+            - self.radial_distance_scale * edge_len
+        )
+        tangential_logits = (delta * self.tangential_score[:, None, :]).sum(dim=-1)
+
+        radial_energy[:, receiver, pos] = radial_logits
+        tangential_energy[:, receiver, pos] = tangential_logits
+
+        out = torch.zeros_like(proj)
         unique_deg = torch.unique(deg)
 
-        # Avoid passing an attention mask so Flash kernels can be selected; we
-        # instead slice each degree bucket to exclude padding entirely.
-        with torch.backends.cuda.sdp_kernel(
-            enable_flash=True,
-            enable_mem_efficient=False,
-            enable_math=True,
-        ):
-            for d in unique_deg.tolist():
-                if d == 0:
-                    continue
+        for d in unique_deg.tolist():
+            if d == 0:
+                continue
 
-                idx = deg == d
-                q = Q[:, idx].permute(1, 0, 2)[:, :, None, :]
-                k = k_buf[:, idx, :d, :].permute(1, 0, 2, 3)
-                v = v_buf[:, idx, :d, :].permute(1, 0, 2, 3)
+            idx = deg == d
+            delta_slice = delta_buf[:, idx, :d, :]
+            radial_slice = radial_energy[:, idx, :d]
+            tangential_slice = tangential_energy[:, idx, :d]
 
-                out_bucket = F.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    attn_mask=None,
-                    is_causal=False,
-                    scale=head_scale,
-                )
+            radial_alpha = torch.softmax(radial_slice, dim=2)
+            tangential_alpha = torch.softmax(tangential_slice, dim=2)
 
-                # (num_nodes_in_bucket, num_heads, 1, head_dim)
-                out_bucket = out_bucket.permute(1, 0, 2, 3).squeeze(2)
-                out[:, idx, :] = out_bucket.to(out.dtype)
+            radial_msg = torch.einsum("hnd,hndf->hnf", radial_alpha, delta_slice)
+            tangential_msg = torch.einsum("hnd,hndf->hnf", tangential_alpha, delta_slice)
+
+            out[:, idx, :] = (radial_msg + tangential_msg).to(out.dtype)
 
         return out.mean(dim=0)
