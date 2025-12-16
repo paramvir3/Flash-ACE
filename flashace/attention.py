@@ -47,39 +47,40 @@ class DenseFlashAttention(nn.Module):
         pos = torch.empty_like(order)
         pos[order] = pos_sorted
 
-        head_outputs = []
-        for head in range(self.num_heads):
-            Q = self.w_q[head](x)
-            K = self.w_k[head](x)
-            V = self.w_v[head](x)
+        stacked_Q = torch.stack([layer(x) for layer in self.w_q], dim=0)
+        stacked_K = torch.stack([layer(x) for layer in self.w_k], dim=0)
+        stacked_V = torch.stack([layer(x) for layer in self.w_v], dim=0)
 
-            head_outputs.append(
-                self._flash_attention(
-                    Q,
-                    K,
-                    V,
-                    deg,
-                    pos,
-                    max_deg,
-                    sender,
-                    receiver,
-                )
-            )
+        out = self._flash_attention(
+            stacked_Q,
+            stacked_K,
+            stacked_V,
+            deg,
+            pos,
+            max_deg,
+            sender,
+            receiver,
+        )
 
-        out = torch.stack(head_outputs, dim=0).mean(dim=0)
         out = torch.nan_to_num(out)
         return x + self.w_out(out)
 
     def _flash_attention(self, Q, K, V, deg, pos, max_deg, sender, receiver):
+        # Q, K, V are shaped (num_heads, num_nodes, feature_dim)
+        num_heads = Q.shape[0]
         head_dim = K.shape[-1]
-        num_nodes = Q.shape[0]
+        num_nodes = Q.shape[1]
         head_scale = head_dim ** -0.5
 
-        k_buf = torch.zeros((num_nodes, max_deg, head_dim), device=K.device, dtype=K.dtype)
+        k_buf = torch.zeros(
+            (num_heads, num_nodes, max_deg, head_dim),
+            device=K.device,
+            dtype=K.dtype,
+        )
         v_buf = torch.zeros_like(k_buf)
 
-        k_buf[receiver, pos] = K[sender]
-        v_buf[receiver, pos] = V[sender]
+        k_buf[:, receiver, pos] = K[:, sender]
+        v_buf[:, receiver, pos] = V[:, sender]
 
         out = torch.zeros_like(Q)
         unique_deg = torch.unique(deg)
@@ -96,9 +97,9 @@ class DenseFlashAttention(nn.Module):
                     continue
 
                 idx = deg == d
-                q = Q[idx][:, None, None, :]
-                k = k_buf[idx][:, None, :d, :]
-                v = v_buf[idx][:, None, :d, :]
+                q = Q[:, idx].permute(1, 0, 2)[:, :, None, :]
+                k = k_buf[:, idx, :d, :].permute(1, 0, 2, 3)
+                v = v_buf[:, idx, :d, :].permute(1, 0, 2, 3)
 
                 out_bucket = F.scaled_dot_product_attention(
                     q,
@@ -109,6 +110,8 @@ class DenseFlashAttention(nn.Module):
                     scale=head_scale,
                 )
 
-                out[idx] = out_bucket.squeeze(2).squeeze(1).to(out.dtype)
+                # (num_nodes_in_bucket, num_heads, 1, head_dim)
+                out_bucket = out_bucket.permute(1, 0, 2, 3).squeeze(2)
+                out[:, idx, :] = out_bucket.to(out.dtype)
 
-        return out
+        return out.mean(dim=0)
