@@ -22,8 +22,8 @@ class DenseFlashAttention(nn.Module):
         if sender.numel() == 0:
             return x
 
-        # Preallocate neighbor tensors (padded) so we can run a single fused
-        # scaled_dot_product_attention call that leverages Flash Attention
+        # Preallocate neighbor tensors (padded) so we can run fused
+        # scaled_dot_product_attention calls that leverage Flash Attention
         # kernels when available on the current device.
         deg = torch.bincount(receiver, minlength=num_nodes)
         max_deg = int(deg.max().item())
@@ -31,7 +31,6 @@ class DenseFlashAttention(nn.Module):
 
         k_buf = torch.zeros((num_nodes, max_deg, head_dim), device=x.device, dtype=K.dtype)
         v_buf = torch.zeros_like(k_buf)
-        valid = torch.zeros((num_nodes, max_deg), device=x.device, dtype=torch.bool)
 
         # Track the next free slot for each receiver node.
         fill_ptr = torch.zeros(num_nodes, device=x.device, dtype=torch.long)
@@ -39,30 +38,37 @@ class DenseFlashAttention(nn.Module):
             idx = fill_ptr[r]
             k_buf[r, idx] = K[s]
             v_buf[r, idx] = V[s]
-            valid[r, idx] = True
             fill_ptr[r] = idx + 1
 
-        q = Q[:, None, None, :]
-        k = k_buf[:, None, :, :]
-        v = v_buf[:, None, :, :]
-        attn_mask = ~valid[:, None, None, :]
+        out = torch.zeros_like(Q)
+        unique_deg = torch.unique(deg)
 
-        # Prefer Flash Attention kernels while avoiding the mem-efficient
-        # backward path (which lacks derivatives on some builds) and allowing
-        # math fallback when flash is unavailable (e.g., CPU execution).
+        # Avoid passing an attention mask so Flash kernels can be selected; we
+        # instead slice each degree bucket to exclude padding entirely.
         with torch.backends.cuda.sdp_kernel(
             enable_flash=True,
             enable_mem_efficient=False,
             enable_math=True,
         ):
-            out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                is_causal=False,
-                scale=self.scale,
-            )
+            for d in unique_deg.tolist():
+                if d == 0:
+                    continue
 
-        out = torch.nan_to_num(out.squeeze(2).squeeze(1))
+                idx = deg == d
+                q = Q[idx][:, None, None, :]
+                k = k_buf[idx][:, None, :d, :]
+                v = v_buf[idx][:, None, :d, :]
+
+                out_bucket = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=None,
+                    is_causal=False,
+                    scale=self.scale,
+                )
+
+                out[idx] = out_bucket.squeeze(2).squeeze(1)
+
+        out = torch.nan_to_num(out)
         return x + self.w_out(out)
