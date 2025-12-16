@@ -47,9 +47,14 @@ class DenseFlashAttention(nn.Module):
         v = v_buf[:, None, :, :]
         attn_mask = ~valid[:, None, None, :]
 
-        # Prefer Flash Attention kernels while allowing fallback to other
-        # implementations when unsupported (e.g., CPU execution).
-        with torch.backends.cuda.sdp_kernel(enable_flash=True):
+        # Prefer Flash Attention kernels while avoiding the mem-efficient
+        # backward path (which lacks derivatives on some builds) and allowing
+        # math fallback when flash is unavailable (e.g., CPU execution).
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=True,
+            enable_mem_efficient=False,
+            enable_math=True,
+        ):
             out = F.scaled_dot_product_attention(
                 q,
                 k,
