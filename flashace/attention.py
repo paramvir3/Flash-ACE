@@ -31,6 +31,10 @@ class DenseFlashAttention(nn.Module):
         )
         # Use a positive scale so longer bonds are consistently penalized.
         self._radial_distance_log_scale = nn.Parameter(torch.tensor(0.0))
+        # Distance-dependent temperature sharpens radial logits for close
+        # neighbors while keeping gradients stable on far bonds.
+        self._radial_temp_bias = nn.Parameter(torch.zeros(num_heads))
+        self._radial_temp_weight = nn.Parameter(torch.zeros(num_heads))
 
         self.w_out = o3.Linear(irreps_in, irreps_in)
         self.reset_parameters()
@@ -39,6 +43,8 @@ class DenseFlashAttention(nn.Module):
         nn.init.xavier_uniform_(self.radial_score)
         nn.init.xavier_uniform_(self.tangential_score)
         nn.init.zeros_(self._radial_distance_log_scale)
+        nn.init.zeros_(self._radial_temp_bias)
+        nn.init.zeros_(self._radial_temp_weight)
 
     def forward(self, x, edge_index, edge_vec, edge_len):
         sender, receiver = edge_index
@@ -130,6 +136,11 @@ class DenseFlashAttention(nn.Module):
             (energy_delta * self.radial_score[:, None, :]).sum(dim=-1)
             - radial_distance_scale * edge_len
         )
+        radial_temp = F.softplus(
+            self._radial_temp_bias[:, None]
+            + self._radial_temp_weight[:, None] * edge_len
+        )
+        radial_logits = radial_logits / (radial_temp + 1e-4)
         tangential_logits = (
             energy_delta * self.tangential_score[:, None, :]
         ).sum(dim=-1)
