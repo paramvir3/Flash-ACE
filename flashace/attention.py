@@ -104,22 +104,27 @@ class DenseFlashAttention(nn.Module):
         nn.init.zeros_(self._radial_temp_weight)
         nn.init.zeros_(self._mix_bias)
         nn.init.zeros_(self._mix_scale)
+        def _maybe_reset(layer):
+            reset_fn = getattr(layer, "reset_parameters", None)
+            if callable(reset_fn):
+                reset_fn()
+
         if self.share_qkv_mode == "all":
             for layer in [
                 self.w_proj_shared,
                 self.radial_update_shared,
                 self.tangential_update_shared,
             ]:
-                layer.reset_parameters()
+                _maybe_reset(layer)
         elif self.share_qkv_mode == "kv":
             for layer in list(self.w_proj) + [
                 self.radial_update_shared,
                 self.tangential_update_shared,
             ]:
-                layer.reset_parameters()
+                _maybe_reset(layer)
         else:
             for layer in list(self.w_proj) + list(self.radial_update) + list(self.tangential_update):
-                layer.reset_parameters()
+                _maybe_reset(layer)
         for mlp in list(self.radial_decay_mlp) + list(self.radial_temp_mlp):
             for m in mlp.modules():
                 if isinstance(m, nn.Linear):
