@@ -577,7 +577,7 @@ def main():
                 # still avoid higher-order graphs with ``create_graph=False``
                 # inside the model during validation.
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-                    p_E, p_F, p_S = model(item, training=False)
+                    p_E, p_F, p_S, _ = model(item, training=False)
                     n_ats = len(item['z'])
                     target_E = item['t_E'] - baseline_energy(item['z'])
                     loss_e = ((p_E - target_E) / n_ats)**2
