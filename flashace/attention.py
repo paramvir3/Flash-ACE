@@ -1,7 +1,13 @@
+import importlib.util
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from e3nn import o3
+
+_torch_scatter_available = importlib.util.find_spec("torch_scatter") is not None
+if _torch_scatter_available:
+    from torch_scatter import scatter_add, scatter_softmax
 
 class DenseFlashAttention(nn.Module):
     def __init__(self, irreps_in, hidden_dim, num_heads: int = 4):
@@ -117,6 +123,11 @@ class DenseFlashAttention(nn.Module):
 
         def _segment_softmax(logits):
             # logits: (heads, num_edges)
+            if _torch_scatter_available:
+                return scatter_softmax(
+                    logits, expanded_receiver, dim=1, dim_size=num_nodes
+                )
+
             max_init = torch.full(
                 (num_heads, num_nodes),
                 float("-inf"),
@@ -143,8 +154,8 @@ class DenseFlashAttention(nn.Module):
             alpha = exp_logits / (denom.gather(1, expanded_receiver) + 1e-9)
             return torch.nan_to_num(alpha)
 
-        radial_alpha = _segment_softmax(radial_logits)
-        tangential_alpha = _segment_softmax(tangential_logits)
+        radial_alpha = torch.nan_to_num(_segment_softmax(radial_logits))
+        tangential_alpha = torch.nan_to_num(_segment_softmax(tangential_logits))
 
         mix_gate = torch.sigmoid(
             self._mix_bias[:, None]
@@ -157,9 +168,17 @@ class DenseFlashAttention(nn.Module):
         ) * tangential_delta
 
         weighted_delta = blended_alpha[..., None] * blended_delta
-        out = out.scatter_add(
-            1,
-            expanded_receiver[:, :, None].expand(-1, -1, feature_dim),
-            weighted_delta,
-        )
+        if _torch_scatter_available:
+            out = scatter_add(
+                weighted_delta,
+                expanded_receiver[:, :, None].expand(-1, -1, feature_dim),
+                dim=1,
+                dim_size=num_nodes,
+            )
+        else:
+            out = out.scatter_add(
+                1,
+                expanded_receiver[:, :, None].expand(-1, -1, feature_dim),
+                weighted_delta,
+            )
         return out.mean(dim=0)
