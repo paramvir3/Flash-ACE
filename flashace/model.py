@@ -18,6 +18,8 @@ class FlashACE(nn.Module):
         attention_message_clip: float | None = None,
         attention_conditioned_decay: bool = True,
         attention_share_qkv: str | bool = "none",
+        use_aux_force_head: bool = True,
+        use_aux_stress_head: bool = True,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -26,6 +28,8 @@ class FlashACE(nn.Module):
         self.attention_message_clip = attention_message_clip
         self.attention_conditioned_decay = attention_conditioned_decay
         self.attention_share_qkv = attention_share_qkv
+        self.use_aux_force_head = use_aux_force_head
+        self.use_aux_stress_head = use_aux_stress_head
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -55,6 +59,20 @@ class FlashACE(nn.Module):
             nn.SiLU(), 
             nn.Linear(64, 1)
         )
+        self.aux_force_head = None
+        self.aux_stress_head = None
+        if self.use_aux_force_head:
+            self.aux_force_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 3),
+            )
+        if self.use_aux_stress_head:
+            self.aux_stress_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 6),
+            )
 
     def forward(self, data, training=False, temperature_scale: float = 1.0, detach_pos: bool = True):
         z, pos, edge_index = data['z'], data['pos'], data['edge_index']
@@ -102,7 +120,15 @@ class FlashACE(nn.Module):
         # The optimized physics.py puts scalars first, so this slice is correct.
         scalars = h[:, :self.hidden_dim] 
         E = torch.sum(self.readout(scalars))
-        
+
+        aux = {}
+        if self.use_aux_force_head and self.aux_force_head is not None:
+            aux['force'] = self.aux_force_head(scalars)
+        if self.use_aux_stress_head and self.aux_stress_head is not None:
+            pooled = scalars.mean(dim=0, keepdim=True)
+            stress_voigt = self.aux_stress_head(pooled).view(-1)
+            aux['stress'] = stress_voigt
+
         # 3. Derivatives
         # Avoid building second-order graphs during evaluation to reduce memory.
         grad_opts = {
@@ -142,4 +168,4 @@ class FlashACE(nn.Module):
                 volume = cell_volume * torch.det(deformation)
                 S = -stress / volume
 
-        return E, F, S
+        return E, F, S, aux

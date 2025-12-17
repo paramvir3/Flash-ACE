@@ -319,6 +319,8 @@ def main():
         attention_message_clip=config.get('attention_message_clip', None),
         attention_conditioned_decay=config.get('attention_conditioned_decay', True),
         attention_share_qkv=config.get('attention_share_qkv', "none"),
+        use_aux_force_head=config.get('use_aux_force_head', True),
+        use_aux_stress_head=config.get('use_aux_stress_head', True),
     ).to(device)
     
     optimizer = optim.Adam(
@@ -398,19 +400,30 @@ def main():
     temp_scale_end = float(config.get('temperature_scale_end', temp_scale_start))
     temp_scale_epochs = int(config.get('temperature_scale_epochs', 0) or 0)
 
-    def _temperature_scale(epoch_idx: int):
-        if temp_scale_epochs <= 0:
-            return temp_scale_start
-        frac = min(1.0, epoch_idx / float(temp_scale_epochs))
-        return temp_scale_start + frac * (temp_scale_end - temp_scale_start)
+    def _temperature_scale(epoch_idx: int, force_ema: float | None = None):
+        base = temp_scale_start
+        if temp_scale_epochs > 0:
+            frac = min(1.0, epoch_idx / float(temp_scale_epochs))
+            base = temp_scale_start + frac * (temp_scale_end - temp_scale_start)
+        ref = float(config.get('temperature_force_ref', 0.0))
+        gamma = float(config.get('temperature_force_exponent', 0.0))
+        if force_ema is not None and ref > 0.0 and gamma != 0.0:
+            scale = (force_ema / ref) ** gamma
+            base = base * torch.tensor(scale, device=device, dtype=amp_dtype if use_amp else torch.float32).item()
+        return base
 
     force_consistency_weight = float(config.get('force_consistency_weight', 0.0))
     displacement_prob = float(config.get('displacement_prob', 0.0))
     displacement_sigma = float(config.get('displacement_sigma', 0.0))
+    aux_force_weight = float(config.get('aux_force_weight', 0.0))
+    aux_stress_weight = float(config.get('aux_stress_weight', 0.0))
+    sobolev_weight = float(config.get('sobolev_weight', 0.0))
+    sobolev_sigma = float(config.get('sobolev_sigma', 0.0))
     
     print(f"{'Epoch':>5} | {'Loss':>8} | {'E (meV)':>8} | {'F (eV/A)':>8} | {'S (eV/A³)':>8} || {'Val Loss':>8} | {'Val E':>8} | {'Val F':>8}")
     print("-" * 95)
     
+    force_loss_ema = None
     for epoch in range(start_epoch, config['epochs']):
         model.train()
         train_metrics = MetricTracker()
@@ -448,8 +461,8 @@ def main():
 
                 # Standard Forward with optional AMP
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-                    temp_scale = _temperature_scale(epoch)
-                    p_E, p_F, p_S = model(
+                    temp_scale = _temperature_scale(epoch, force_loss_ema)
+                    p_E, p_F, p_S, aux = model(
                         item,
                         training=True,
                         temperature_scale=temp_scale,
@@ -467,6 +480,30 @@ def main():
                     loss_item = (config['energy_weight']*loss_e) + \
                                 (config['forces_weight']*loss_f) + \
                                 (config['stress_weight']*loss_s)
+
+                    if aux_force_weight > 0.0 and 'force' in aux:
+                        loss_item = loss_item + aux_force_weight * torch.mean((aux['force'] - item['t_F'])**2)
+                    if aux_stress_weight > 0.0 and 'stress' in aux:
+                        target_stress = item['t_S']
+                        loss_item = loss_item + aux_stress_weight * torch.mean(
+                            (aux['stress'] - torch.stack([
+                                target_stress[0,0], target_stress[1,1], target_stress[2,2],
+                                target_stress[0,1], target_stress[0,2], target_stress[1,2]
+                            ]))**2
+                        )
+
+                    if sobolev_weight > 0.0 and sobolev_sigma > 0.0:
+                        delta = torch.randn_like(item['pos']) * sobolev_sigma
+                        pos_pert = item['pos'] + delta
+                        perturbed = {**item, 'pos': pos_pert}
+                        p_E_pert, _, _, _ = model(
+                            perturbed,
+                            training=True,
+                            temperature_scale=temp_scale,
+                            detach_pos=True,
+                        )
+                        fd = (p_E_pert - p_E) + (p_F.detach() * delta).sum()
+                        loss_item = loss_item + sobolev_weight * fd.pow(2)
 
                     if force_consistency_weight > 0.0:
                         energy_grad = torch.autograd.grad(
@@ -489,6 +526,10 @@ def main():
                 with torch.no_grad():
                     pred_E_abs = p_E + baseline_energy(item['z'])
                     train_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
+                    if force_loss_ema is None:
+                        force_loss_ema = loss_f.detach()
+                    else:
+                        force_loss_ema = 0.9 * force_loss_ema + 0.1 * loss_f.detach()
                 total_items_seen += 1
 
             if (batch_idx + 1) % grad_accum_steps == 0:
