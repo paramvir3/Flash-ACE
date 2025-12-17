@@ -150,11 +150,13 @@ class MetricTracker:
     def __init__(self): self.reset()
     def reset(self):
         self.sse_e = 0.0; self.sse_f = 0.0; self.sse_s = 0.0
+        self.sae_f = 0.0
         self.n_atoms = 0; self.n_force_comp = 0; self.n_stress_comp = 0
     def update(self, p_E, p_F, p_S, t_E, t_F, t_S, n_ats):
         err_e = (p_E - t_E).item() / n_ats
         self.sse_e += err_e**2 * n_ats
         self.sse_f += (p_F - t_F).pow(2).sum().item()
+        self.sae_f += torch.abs(p_F - t_F).sum().item()
         if torch.norm(t_S) > 1e-6:
              self.sse_s += (p_S - t_S).pow(2).sum().item()
              self.n_stress_comp += 9
@@ -164,7 +166,9 @@ class MetricTracker:
         rmse_e = np.sqrt(self.sse_e / self.n_atoms) if self.n_atoms > 0 else 0.0
         rmse_f = np.sqrt(self.sse_f / self.n_force_comp) if self.n_force_comp > 0 else 0.0
         rmse_s = np.sqrt(self.sse_s / self.n_stress_comp) if self.n_stress_comp > 0 else 0.0
-        return rmse_e * 1000, rmse_f, rmse_s
+        mse_f = (self.sse_f / self.n_force_comp) if self.n_force_comp > 0 else 0.0
+        mae_f = (self.sae_f / self.n_force_comp) if self.n_force_comp > 0 else 0.0
+        return rmse_e * 1000, rmse_f, rmse_s, mse_f, mae_f
 
 def compute_mean_energy_per_atom(atoms_seq):
     total_energy = 0.0
@@ -420,8 +424,8 @@ def main():
     sobolev_weight = float(config.get('sobolev_weight', 0.0))
     sobolev_sigma = float(config.get('sobolev_sigma', 0.0))
     
-    print(f"{'Epoch':>5} | {'Loss':>8} | {'E (meV)':>8} | {'F (eV/A)':>8} | {'S (eV/A³)':>8} || {'Val Loss':>8} | {'Val E':>8} | {'Val F':>8}")
-    print("-" * 95)
+    print(f"{'Epoch':>5} | {'Loss':>10} | {'E (meV)':>10} | {'F_RMSE':>10} | {'F_MSE':>10} | {'F_MAE':>10} | {'S_RMSE':>10} || {'Val Loss':>10} | {'Val E':>10} | {'Val F_RMSE':>12} | {'Val F_MSE':>12}")
+    print("-" * 140)
     
     force_loss_ema = None
     for epoch in range(start_epoch, config['epochs']):
@@ -555,7 +559,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
         avg_train_loss = total_loss / max(1, total_items_seen)
-        tr_e, tr_f, tr_s = train_metrics.get_metrics()
+        tr_e, tr_f, tr_s, tr_f_mse, tr_f_mae = train_metrics.get_metrics()
         history['train_loss'].append(avg_train_loss)
 
         # Validation
@@ -584,11 +588,15 @@ def main():
                 val_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
 
         avg_val_loss = val_loss_accum / len(val_atoms)
-        val_e, val_f, val_s = val_metrics.get_metrics()
+        val_e, val_f, val_s, val_f_mse, val_f_mae = val_metrics.get_metrics()
         history['val_loss'].append(avg_val_loss)
         scheduler.step(avg_val_loss)
 
-        print(f"{epoch+1:5d} | {avg_train_loss:8.4f} | {tr_e:8.2f} | {tr_f:8.4f} | {tr_s:8.4f} || {avg_val_loss:8.4f} | {val_e:8.2f} | {val_f:8.4f}")
+        print(
+            f"{epoch+1:5d} | "
+            f"{avg_train_loss:10.4f} | {tr_e:10.2f} | {tr_f:10.4f} | {tr_f_mse:10.4f} | {tr_f_mae:10.4f} | {tr_s:10.4f} || "
+            f"{avg_val_loss:10.4f} | {val_e:10.2f} | {val_f:12.4f} | {val_f_mse:12.4f}"
+        )
 
         if ckpt_interval > 0 and (epoch + 1) % ckpt_interval == 0:
             ckpt_dir = config.get('checkpoint_dir', 'checkpoints')
