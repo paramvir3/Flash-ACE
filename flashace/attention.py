@@ -17,26 +17,33 @@ class DenseFlashAttention(nn.Module):
         num_heads: int = 4,
         message_clip: float | None = None,
         use_conditioned_decay: bool = True,
-        share_qkv: bool = False,
+        share_qkv_mode: str | bool = "none",
     ):
         super().__init__()
         self.num_heads = num_heads
         self.feature_dim = o3.Irreps(irreps_in).dim
         self.message_clip = message_clip
         self.use_conditioned_decay = use_conditioned_decay
-        self.share_qkv = share_qkv
+        if isinstance(share_qkv_mode, bool):
+            share_qkv_mode = "all" if share_qkv_mode else "none"
+        if share_qkv_mode not in {"none", "kv", "all"}:
+            raise ValueError("share_qkv_mode must be one of {'none', 'kv', 'all'} or a boolean")
+        self.share_qkv_mode = share_qkv_mode
 
-        if self.share_qkv:
+        if self.share_qkv_mode == "all":
             self.w_proj_shared = o3.Linear(irreps_in, irreps_in)
             self.radial_update_shared = o3.Linear(irreps_in, irreps_in)
             self.tangential_update_shared = o3.Linear(irreps_in, irreps_in)
-        else:
-            # Content projections for energy scores.
+        elif self.share_qkv_mode == "kv":
             self.w_proj = nn.ModuleList(
                 [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
             )
-            # Separate update projections so radial/tangential channels can learn
-            # distinct filters rather than reusing the energy encoder.
+            self.radial_update_shared = o3.Linear(irreps_in, irreps_in)
+            self.tangential_update_shared = o3.Linear(irreps_in, irreps_in)
+        else:
+            self.w_proj = nn.ModuleList(
+                [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
+            )
             self.radial_update = nn.ModuleList(
                 [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
             )
@@ -97,9 +104,15 @@ class DenseFlashAttention(nn.Module):
         nn.init.zeros_(self._radial_temp_weight)
         nn.init.zeros_(self._mix_bias)
         nn.init.zeros_(self._mix_scale)
-        if self.share_qkv:
+        if self.share_qkv_mode == "all":
             for layer in [
                 self.w_proj_shared,
+                self.radial_update_shared,
+                self.tangential_update_shared,
+            ]:
+                layer.reset_parameters()
+        elif self.share_qkv_mode == "kv":
+            for layer in list(self.w_proj) + [
                 self.radial_update_shared,
                 self.tangential_update_shared,
             ]:
@@ -119,11 +132,17 @@ class DenseFlashAttention(nn.Module):
         if sender.numel() == 0:
             return x
 
-        if self.share_qkv:
+        if self.share_qkv_mode == "all":
             energy_base = self.w_proj_shared(x)
             radial_base = self.radial_update_shared(x)
             tangential_base = self.tangential_update_shared(x)
             energy_proj = energy_base.unsqueeze(0).expand(self.num_heads, -1, -1)
+            radial_proj = radial_base.unsqueeze(0).expand(self.num_heads, -1, -1)
+            tangential_proj = tangential_base.unsqueeze(0).expand(self.num_heads, -1, -1)
+        elif self.share_qkv_mode == "kv":
+            energy_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
+            radial_base = self.radial_update_shared(x)
+            tangential_base = self.tangential_update_shared(x)
             radial_proj = radial_base.unsqueeze(0).expand(self.num_heads, -1, -1)
             tangential_proj = tangential_base.unsqueeze(0).expand(self.num_heads, -1, -1)
         else:

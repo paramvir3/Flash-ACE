@@ -17,7 +17,7 @@ class FlashACE(nn.Module):
         gaussian_width: float = 0.5,
         attention_message_clip: float | None = None,
         attention_conditioned_decay: bool = True,
-        attention_share_qkv: bool = False,
+        attention_share_qkv: str | bool = "none",
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -45,7 +45,7 @@ class FlashACE(nn.Module):
                 hidden_dim,
                 message_clip=attention_message_clip,
                 use_conditioned_decay=attention_conditioned_decay,
-                share_qkv=attention_share_qkv,
+                share_qkv_mode=attention_share_qkv,
             )
             for _ in range(num_layers)
         ])

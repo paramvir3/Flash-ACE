@@ -318,7 +318,7 @@ def main():
         gaussian_width=config.get('gaussian_width', 0.5),
         attention_message_clip=config.get('attention_message_clip', None),
         attention_conditioned_decay=config.get('attention_conditioned_decay', True),
-        attention_share_qkv=config.get('attention_share_qkv', False),
+        attention_share_qkv=config.get('attention_share_qkv', "none"),
     ).to(device)
     
     optimizer = optim.Adam(
