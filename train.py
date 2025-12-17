@@ -429,8 +429,11 @@ def main():
     sobolev_weight = float(config.get('sobolev_weight', 0.0))
     sobolev_sigma = float(config.get('sobolev_sigma', 0.0))
     
-    print(f"{'Epoch':>5} | {'Loss':>10} | {'E (meV)':>10} | {'F_RMSE':>10} | {'F_MSE':>10} | {'F_MAE':>10} | {'S_RMSE':>10} || {'Val Loss':>10} | {'Val E':>10} | {'Val F_RMSE':>12} | {'Val F_MSE':>12}")
-    print("-" * 140)
+    print(
+        f"{'Epoch':>5} | {'Loss':>10} | {'E (meV)':>10} | {'force_RMSE':>12} | {'force_MSE':>12} | {'force_MAE':>12} | {'S_RMSE':>10} || "
+        f"{'Val Loss':>10} | {'Val E':>10} | {'Val force_RMSE':>16} | {'Val force_MSE':>16}"
+    )
+    print("-" * 170)
     
     force_loss_ema = None
     for epoch in range(start_epoch, config['epochs']):
@@ -599,8 +602,8 @@ def main():
 
         print(
             f"{epoch+1:5d} | "
-            f"{avg_train_loss:10.4f} | {tr_e:10.2f} | {tr_f:10.4f} | {tr_f_mse:10.4f} | {tr_f_mae:10.4f} | {tr_s:10.4f} || "
-            f"{avg_val_loss:10.4f} | {val_e:10.2f} | {val_f:12.4f} | {val_f_mse:12.4f}"
+            f"{avg_train_loss:10.4f} | {tr_e:10.2f} | {tr_f:12.6f} | {tr_f_mse:12.6f} | {tr_f_mae:12.6f} | {tr_s:10.4f} || "
+            f"{avg_val_loss:10.4f} | {val_e:10.2f} | {val_f:16.6f} | {val_f_mse:16.6f}"
         )
 
         if ckpt_interval > 0 and (epoch + 1) % ckpt_interval == 0:
