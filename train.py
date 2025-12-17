@@ -316,6 +316,8 @@ def main():
         radial_trainable=config.get('radial_trainable', False),
         envelope_exponent=config.get('envelope_exponent', 5),
         gaussian_width=config.get('gaussian_width', 0.5),
+        attention_message_clip=config.get('attention_message_clip', None),
+        attention_conditioned_decay=config.get('attention_conditioned_decay', True),
     ).to(device)
     
     optimizer = optim.Adam(
@@ -389,6 +391,21 @@ def main():
     ckpt_interval = int(config.get('checkpoint_interval', 0) or 0)
 
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    # Temperature curriculum for attention sharpness.
+    temp_scale_start = float(config.get('temperature_scale_start', 1.0))
+    temp_scale_end = float(config.get('temperature_scale_end', temp_scale_start))
+    temp_scale_epochs = int(config.get('temperature_scale_epochs', 0) or 0)
+
+    def _temperature_scale(epoch_idx: int):
+        if temp_scale_epochs <= 0:
+            return temp_scale_start
+        frac = min(1.0, epoch_idx / float(temp_scale_epochs))
+        return temp_scale_start + frac * (temp_scale_end - temp_scale_start)
+
+    force_consistency_weight = float(config.get('force_consistency_weight', 0.0))
+    displacement_prob = float(config.get('displacement_prob', 0.0))
+    displacement_sigma = float(config.get('displacement_sigma', 0.0))
     
     print(f"{'Epoch':>5} | {'Loss':>8} | {'E (meV)':>8} | {'F (eV/A)':>8} | {'S (eV/A³)':>8} || {'Val Loss':>8} | {'Val E':>8} | {'Val F':>8}")
     print("-" * 95)
@@ -397,6 +414,7 @@ def main():
         model.train()
         train_metrics = MetricTracker()
         total_loss = 0.0
+        total_items_seen = 0
 
         batch_idx = -1
         optimizer.zero_grad(set_to_none=True)
@@ -405,14 +423,37 @@ def main():
             batch_loss = 0.0
 
             # --- GRADIENT ACCUMULATION (FP32/AMP) ---
-            for item in batch:
+            # Optional small-displacement augmentation
+            items = list(batch)
+            if displacement_prob > 0.0 and displacement_sigma > 0.0:
+                augmented = []
+                for item in items:
+                    if torch.rand(1).item() < displacement_prob:
+                        perturbed = {
+                            k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                            for k, v in item.items()
+                        }
+                        noise = torch.randn_like(perturbed['pos']) * displacement_sigma
+                        perturbed['pos'] = perturbed['pos'] + noise
+                        augmented.append(perturbed)
+                items.extend(augmented)
+
+            for item in items:
                 for k, v in item.items():
                     if isinstance(v, torch.Tensor):
                         item[k] = v.to(device, non_blocking=True)
+                if force_consistency_weight > 0.0:
+                    item['pos'] = item['pos'].clone().detach().requires_grad_(True)
 
                 # Standard Forward with optional AMP
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-                    p_E, p_F, p_S = model(item, training=True)
+                    temp_scale = _temperature_scale(epoch)
+                    p_E, p_F, p_S = model(
+                        item,
+                        training=True,
+                        temperature_scale=temp_scale,
+                        detach_pos=force_consistency_weight <= 0.0,
+                    )
                     n_ats = len(item['z'])
 
                     target_E = item['t_E'] - baseline_energy(item['z'])
@@ -426,8 +467,20 @@ def main():
                                 (config['forces_weight']*loss_f) + \
                                 (config['stress_weight']*loss_s)
 
+                    if force_consistency_weight > 0.0:
+                        energy_grad = torch.autograd.grad(
+                            p_E,
+                            item['pos'],
+                            create_graph=True,
+                            retain_graph=True,
+                            allow_unused=True,
+                        )[0]
+                        if energy_grad is not None:
+                            consistency = (p_F + energy_grad).pow(2).mean()
+                            loss_item = loss_item + force_consistency_weight * consistency
+
                 # Normalize and Backward
-                loss_batch = loss_item / (len(batch) * grad_accum_steps)
+                loss_batch = loss_item / (len(items) * grad_accum_steps)
                 scaler.scale(loss_batch).backward()
 
                 batch_loss += loss_item.item()
@@ -435,6 +488,7 @@ def main():
                 with torch.no_grad():
                     pred_E_abs = p_E + baseline_energy(item['z'])
                     train_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
+                total_items_seen += 1
 
             if (batch_idx + 1) % grad_accum_steps == 0:
                 if config.get('clip_grad_norm', None):
@@ -458,7 +512,7 @@ def main():
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        avg_train_loss = total_loss / len(train_atoms)
+        avg_train_loss = total_loss / max(1, total_items_seen)
         tr_e, tr_f, tr_s = train_metrics.get_metrics()
         history['train_loss'].append(avg_train_loss)
 

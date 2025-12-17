@@ -10,10 +10,19 @@ if _torch_scatter_available:
     from torch_scatter import scatter_add, scatter_softmax
 
 class DenseFlashAttention(nn.Module):
-    def __init__(self, irreps_in, hidden_dim, num_heads: int = 4):
+    def __init__(
+        self,
+        irreps_in,
+        hidden_dim,
+        num_heads: int = 4,
+        message_clip: float | None = None,
+        use_conditioned_decay: bool = True,
+    ):
         super().__init__()
         self.num_heads = num_heads
         self.feature_dim = o3.Irreps(irreps_in).dim
+        self.message_clip = message_clip
+        self.use_conditioned_decay = use_conditioned_decay
 
         # Content projections for energy scores.
         self.w_proj = nn.ModuleList(
@@ -47,6 +56,29 @@ class DenseFlashAttention(nn.Module):
         self._mix_bias = nn.Parameter(torch.zeros(num_heads))
         self._mix_scale = nn.Parameter(torch.zeros(num_heads))
 
+        # Environment-conditioned decay/temperature to sharpen locality per site.
+        hidden_mid = max(1, self.feature_dim // 2)
+        self.radial_decay_mlp = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.feature_dim, hidden_mid),
+                    nn.SiLU(),
+                    nn.Linear(hidden_mid, 1),
+                )
+                for _ in range(num_heads)
+            ]
+        )
+        self.radial_temp_mlp = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.feature_dim, hidden_mid),
+                    nn.SiLU(),
+                    nn.Linear(hidden_mid, 1),
+                )
+                for _ in range(num_heads)
+            ]
+        )
+
         self.w_out = o3.Linear(irreps_in, irreps_in)
         self.reset_parameters()
 
@@ -58,8 +90,13 @@ class DenseFlashAttention(nn.Module):
         nn.init.zeros_(self._radial_temp_weight)
         nn.init.zeros_(self._mix_bias)
         nn.init.zeros_(self._mix_scale)
+        for mlp in list(self.radial_decay_mlp) + list(self.radial_temp_mlp):
+            for m in mlp.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.zeros_(m.bias)
 
-    def forward(self, x, edge_index, edge_vec, edge_len):
+    def forward(self, x, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0):
         sender, receiver = edge_index
         num_nodes = x.shape[0]
         if sender.numel() == 0:
@@ -76,6 +113,7 @@ class DenseFlashAttention(nn.Module):
             sender,
             receiver,
             edge_len,
+            temperature_scale=temperature_scale,
         )
 
         out = torch.nan_to_num(out)
@@ -89,6 +127,7 @@ class DenseFlashAttention(nn.Module):
         sender,
         receiver,
         edge_len,
+        temperature_scale: float,
     ):
         # *_proj are shaped (num_heads, num_nodes, feature_dim)
         num_heads = energy_proj.shape[0]
@@ -99,19 +138,36 @@ class DenseFlashAttention(nn.Module):
         tangential_delta = tangential_proj[:, sender] - tangential_proj[:, receiver]
 
         # Radial energy penalizes long bonds, tangential is distance agnostic.
-        radial_distance_scale = F.softplus(self._radial_distance_log_scale)
+        radial_distance_scale = F.softplus(self._radial_distance_log_scale).to(edge_len.dtype)
+
+        receiver_feat = energy_proj[:, receiver]  # (heads, edges, feature_dim)
+        if self.use_conditioned_decay:
+            decay_offset = torch.stack(
+                [mlp(receiver_feat[h]).squeeze(-1) for h, mlp in enumerate(self.radial_decay_mlp)],
+                dim=0,
+            )
+            temp_offset = torch.stack(
+                [mlp(receiver_feat[h]).squeeze(-1) for h, mlp in enumerate(self.radial_temp_mlp)],
+                dim=0,
+            )
+        else:
+            decay_offset = torch.zeros_like(energy_delta[..., 0])
+            temp_offset = torch.zeros_like(energy_delta[..., 0])
+
         radial_logits = (
-            (energy_delta * self.radial_score[:, None, :]).sum(dim=-1)
-            - radial_distance_scale * edge_len
+            (energy_delta * self.radial_score[:, None, :]).sum(dim=-1).float()
+            - (radial_distance_scale + decay_offset).float() * edge_len.float()
         )
         radial_temp = F.softplus(
             self._radial_temp_bias[:, None]
             + self._radial_temp_weight[:, None] * edge_len
+            + temp_offset
         )
+        radial_temp = (radial_temp * temperature_scale).float()
         radial_logits = radial_logits / (radial_temp + 1e-4)
         tangential_logits = (
             energy_delta * self.tangential_score[:, None, :]
-        ).sum(dim=-1)
+        ).sum(dim=-1).float()
 
         num_edges = sender.numel()
         feature_dim = energy_proj.shape[-1]
@@ -167,7 +223,13 @@ class DenseFlashAttention(nn.Module):
             1.0 - mix_gate[:, :, None]
         ) * tangential_delta
 
-        weighted_delta = blended_alpha[..., None] * blended_delta
+        weighted_delta = blended_alpha[..., None].to(blended_delta.dtype) * blended_delta
+        if self.message_clip is not None:
+            clip = torch.tensor(self.message_clip, device=weighted_delta.device, dtype=weighted_delta.dtype)
+            norms = weighted_delta.norm(dim=-1, keepdim=True)
+            safe = norms + 1e-8
+            scale = torch.tanh(norms / clip) * (clip / safe)
+            weighted_delta = weighted_delta * scale
         if _torch_scatter_available:
             out = scatter_add(
                 weighted_delta,
