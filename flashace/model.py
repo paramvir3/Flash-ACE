@@ -17,6 +17,7 @@ class FlashACE(nn.Module):
         gaussian_width: float = 0.5,
         attention_message_clip: float | None = None,
         attention_conditioned_decay: bool = True,
+        attention_share_qkv: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -24,6 +25,7 @@ class FlashACE(nn.Module):
         self.l_max = l_max
         self.attention_message_clip = attention_message_clip
         self.attention_conditioned_decay = attention_conditioned_decay
+        self.attention_share_qkv = attention_share_qkv
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -43,6 +45,7 @@ class FlashACE(nn.Module):
                 hidden_dim,
                 message_clip=attention_message_clip,
                 use_conditioned_decay=attention_conditioned_decay,
+                share_qkv=attention_share_qkv,
             )
             for _ in range(num_layers)
         ])
