@@ -45,7 +45,7 @@ class DenseFlashAttention(nn.Module):
             torch.empty(num_heads, self.feature_dim)
         )
         # Use a positive scale so longer bonds are consistently penalized.
-        self._radial_distance_log_scale = nn.Parameter(torch.tensor(0.0))
+        self._radial_distance_log_scale = nn.Parameter(torch.zeros(num_heads))
         # Distance-dependent temperature sharpens radial logits for close
         # neighbors while keeping gradients stable on far bonds.
         self._radial_temp_bias = nn.Parameter(torch.zeros(num_heads))
@@ -138,7 +138,7 @@ class DenseFlashAttention(nn.Module):
         tangential_delta = tangential_proj[:, sender] - tangential_proj[:, receiver]
 
         # Radial energy penalizes long bonds, tangential is distance agnostic.
-        radial_distance_scale = F.softplus(self._radial_distance_log_scale).to(edge_len.dtype)
+        radial_distance_scale = F.softplus(self._radial_distance_log_scale).to(edge_len.dtype)[:, None]
 
         receiver_feat = energy_proj[:, receiver]  # (heads, edges, feature_dim)
         if self.use_conditioned_decay:
