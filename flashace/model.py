@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from .physics import ACE_Descriptor
-from .attention import DenseFlashAttention
+from .attention import DenseFlashAttention, LocalMessagePassing
 
 class FlashACE(nn.Module):
     def __init__(
@@ -20,6 +20,8 @@ class FlashACE(nn.Module):
         attention_share_qkv: str | bool = "none",
         use_aux_force_head: bool = True,
         use_aux_stress_head: bool = True,
+        local_message_passing: bool = True,
+        local_mp_sharpness: float = 6.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -30,6 +32,7 @@ class FlashACE(nn.Module):
         self.attention_share_qkv = attention_share_qkv
         self.use_aux_force_head = use_aux_force_head
         self.use_aux_stress_head = use_aux_stress_head
+        self.use_local_mp = local_message_passing
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -53,6 +56,10 @@ class FlashACE(nn.Module):
             )
             for _ in range(num_layers)
         ])
+        self.local_mp = nn.ModuleList([
+            LocalMessagePassing(self.ace.irreps_out, sharpness=local_mp_sharpness)
+            for _ in range(num_layers)
+        ]) if self.use_local_mp else None
         
         self.readout = nn.Sequential(
             nn.Linear(hidden_dim, 64), 
@@ -112,7 +119,9 @@ class FlashACE(nn.Module):
         # 1. Pipeline (No checkpoints)
         h = self.emb(z)
         h = self.ace(h, edge_index, edge_vec, edge_len)
-        for layer in self.layers:
+        for idx, layer in enumerate(self.layers):
+            if self.use_local_mp and self.local_mp is not None:
+                h = self.local_mp[idx](h, edge_index, edge_len)
             h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
             
         # 2. Readout

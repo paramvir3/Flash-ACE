@@ -330,6 +330,8 @@ def main():
         attention_share_qkv=config.get('attention_share_qkv', "none"),
         use_aux_force_head=config.get('use_aux_force_head', True),
         use_aux_stress_head=config.get('use_aux_stress_head', True),
+        local_message_passing=config.get('local_message_passing', True),
+        local_mp_sharpness=config.get('local_mp_sharpness', 6.0),
     ).to(device)
     
     optimizer = optim.Adam(

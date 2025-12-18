@@ -9,6 +9,54 @@ _torch_scatter_available = importlib.util.find_spec("torch_scatter") is not None
 if _torch_scatter_available:
     from torch_scatter import scatter_add, scatter_softmax
 
+
+class LocalMessagePassing(nn.Module):
+    """Lightweight locality-preserving block to sharpen force learning.
+
+    This module aggregates neighbor features with a distance-decaying scalar
+    kernel, then mixes them back into the node representation with an equivariant
+    linear map. Because the weights depend only on distances (scalars), the
+    operation preserves the irreps structure while reinforcing short-range
+    correlations.
+    """
+
+    def __init__(self, irreps_in, sharpness: float = 6.0):
+        super().__init__()
+        self.feature_dim = o3.Irreps(irreps_in).dim
+        self.irreps_in = o3.Irreps(irreps_in)
+        self.mix = o3.Linear(self.irreps_in, self.irreps_in)
+        self.distance_log_scale = nn.Parameter(torch.tensor(sharpness).log())
+        self.filter = nn.Sequential(
+            nn.Linear(1, max(1, self.feature_dim // 4)),
+            nn.SiLU(),
+            nn.Linear(max(1, self.feature_dim // 4), 1),
+        )
+
+    def forward(self, x, edge_index, edge_len):
+        if edge_index.numel() == 0:
+            return x
+
+        sender, receiver = edge_index
+        scale = torch.exp(self.distance_log_scale).to(edge_len.dtype)
+        decay = torch.exp(-torch.clamp(edge_len / (scale + 1e-6), min=0.0) ** 2)
+        gate = torch.sigmoid(self.filter(edge_len[:, None]).squeeze(-1))
+        weights = torch.nan_to_num(decay * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+        messages = weights[:, None].to(x.dtype) * x[sender]
+
+        if _torch_scatter_available:
+            agg = scatter_add(messages, receiver, dim=0, dim_size=x.size(0))
+            degree = scatter_add(torch.ones_like(edge_len), receiver, dim=0, dim_size=x.size(0))
+        else:
+            agg = torch.zeros_like(x)
+            agg = agg.index_add(0, receiver, messages)
+            degree = torch.zeros(x.size(0), device=x.device, dtype=edge_len.dtype)
+            degree = degree.index_add(0, receiver, torch.ones_like(edge_len))
+
+        norm = torch.clamp(degree, min=1.0).unsqueeze(-1)
+        agg = agg / norm
+        return x + self.mix(agg)
+
 class DenseFlashAttention(nn.Module):
     def __init__(
         self,
