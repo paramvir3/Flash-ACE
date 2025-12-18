@@ -429,6 +429,17 @@ def main():
     sobolev_weight = float(config.get('sobolev_weight', 0.0))
     sobolev_sigma = float(config.get('sobolev_sigma', 0.0))
     
+    def _scheduled_value(base_value, schedule, epoch_idx):
+        if not schedule:
+            return base_value
+        value = base_value
+        for entry in sorted(schedule, key=lambda x: int(x.get('epoch', 0))):
+            if epoch_idx + 1 >= int(entry.get('epoch', 0)):
+                value = float(entry['value'])
+            else:
+                break
+        return value
+
     print(
         f"{'Epoch':>5} | {'Loss':>10} | {'E (meV)':>10} | {'force_RMSE':>12} | {'force_MSE':>12} | {'force_MAE':>12} | {'S_RMSE':>10} || "
         f"{'Val Loss':>10} | {'Val E':>10} | {'Val force_RMSE':>16} | {'Val force_MSE':>16}"
@@ -438,6 +449,18 @@ def main():
     force_loss_ema = None
     for epoch in range(start_epoch, config['epochs']):
         model.train()
+        energy_weight = _scheduled_value(
+            float(config['energy_weight']), config.get('energy_weight_schedule'), epoch
+        )
+        forces_weight = _scheduled_value(
+            float(config['forces_weight']), config.get('forces_weight_schedule'), epoch
+        )
+        aux_force_weight = _scheduled_value(
+            float(config.get('aux_force_weight', 0.0)), config.get('aux_force_weight_schedule'), epoch
+        )
+        sobolev_weight = _scheduled_value(
+            float(config.get('sobolev_weight', 0.0)), config.get('sobolev_weight_schedule'), epoch
+        )
         train_metrics = MetricTracker()
         total_loss = 0.0
         total_items_seen = 0
@@ -489,12 +512,12 @@ def main():
                     if torch.norm(item['t_S']) > 1e-6:
                         loss_s = torch.mean((p_S - item['t_S'])**2)
 
-                    loss_item = (config['energy_weight']*loss_e) + \
-                                (config['forces_weight']*loss_f) + \
-                                (config['stress_weight']*loss_s)
+                        loss_item = (energy_weight*loss_e) + \
+                                    (forces_weight*loss_f) + \
+                                    (config['stress_weight']*loss_s)
 
-                    if aux_force_weight > 0.0 and 'force' in aux:
-                        loss_item = loss_item + aux_force_weight * torch.mean((aux['force'] - item['t_F'])**2)
+                        if aux_force_weight > 0.0 and 'force' in aux:
+                            loss_item = loss_item + aux_force_weight * torch.mean((aux['force'] - item['t_F'])**2)
                     if aux_stress_weight > 0.0 and 'stress' in aux:
                         target_stress = item['t_S']
                         loss_item = loss_item + aux_stress_weight * torch.mean(
@@ -590,7 +613,7 @@ def main():
                     target_E = item['t_E'] - baseline_energy(item['z'])
                     loss_e = ((p_E - target_E) / n_ats)**2
                     loss_f = torch.mean((p_F - item['t_F'])**2)
-                    val_loss_accum += (config['energy_weight']*loss_e) + (config['forces_weight']*loss_f)
+                    val_loss_accum += (energy_weight*loss_e) + (forces_weight*loss_f)
 
                 pred_E_abs = p_E + baseline_energy(item['z'])
                 val_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)

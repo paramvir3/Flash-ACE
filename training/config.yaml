@@ -13,9 +13,9 @@ model_save_path: "model.pt"
 # ------------------------------------------------------------------------------
 r_max: 5
 l_max: 1
-num_radial: 12
+num_radial: 16             # Wider radial basis for higher force fidelity
 hidden_dim: 128
-num_layers: 2
+num_layers: 4              # Deeper attention stack (keep LR lower and clip gradients)
 radial_basis_type: "bessel"       # Options: bessel, gaussian
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)
@@ -27,7 +27,7 @@ gaussian_width: 0.5              # Relative Gaussian width multiplier (only used
 epochs: 300
 batch_size: 8
 # Higher force focus with stable LR schedule
-learning_rate: 0.002             # Slightly higher to emphasize force updates
+learning_rate: 0.001             # Lower LR for deeper attention stability
 # Optional optimizer and scheduler tweaks
 weight_decay: 0.0
 lr_scheduler_factor: 0.5
@@ -36,9 +36,9 @@ lr_min: 0.00005
 clip_grad_norm: 1.0
 use_amp: true                    # Enable mixed precision on CUDA for speed
 amp_dtype: "bfloat16"            # Prefer bf16 for stability; use float16 if unavailable
-grad_accum_steps: 1              # Gradient accumulation steps before optimizer step
+grad_accum_steps: 2              # Higher effective batch for steadier forces
 precompute_neighbors: true       # Cache neighbor lists to cut CPU overhead
-random_rotation: false           # Apply random SO(3) rotations per batch item
+random_rotation: true            # Apply random SO(3) rotations per batch item
 device: "cuda"
 checkpoint_dir: "checkpoints"     # Directory to stash periodic checkpoints
 checkpoint_interval: 0           # Save a checkpoint every N epochs (0 disables)
@@ -55,15 +55,33 @@ solve_atomic_energies: false      # Fit species reference energies from the trai
 # 4. LOSS WEIGHTS
 # ------------------------------------------------------------------------------
 energy_weight: 1.0
-forces_weight: 10.0              # Emphasize forces early
+forces_weight: 12.0              # Start higher, then anneal via schedule
 stress_weight: 0.0               # Disable unless stresses are critical
 
 # Auxiliary and regularization weights
-aux_force_weight: 0.1            # Small multi-task force head weight
+aux_force_weight: 0.2            # Stronger auxiliary force supervision
 aux_stress_weight: 0.0           # Disable aux stress by default
-force_consistency_weight: 0.02   # Conservative force consistency
-sobolev_weight: 0.001            # Very light perturbation regularization
-sobolev_sigma: 0.02
+force_consistency_weight: 0.05   # Sharper tie between energy gradient and force head
+sobolev_weight: 0.003            # Slightly stronger perturbation regularization
+sobolev_sigma: 0.03
+
+# Loss/regularization schedules (epoch numbers are 1-indexed)
+energy_weight_schedule:
+  - epoch: 30
+    value: 1.5
+  - epoch: 80
+    value: 2.0
+forces_weight_schedule:
+  - epoch: 80
+    value: 8.0
+aux_force_weight_schedule:
+  - epoch: 60
+    value: 0.1
+sobolev_weight_schedule:
+  - epoch: 1
+    value: 0.003
+  - epoch: 60
+    value: 0.0
 
 # Small-displacement augmentation
 displacement_prob: 0.1
@@ -73,8 +91,8 @@ displacement_sigma: 0.02
 attention_message_clip: 8.0
 attention_conditioned_decay: true
 attention_share_qkv: "kv"        # Share KV across heads for stability
-temperature_scale_start: 1.3
-temperature_scale_end: 1.0
-temperature_scale_epochs: 15
+temperature_scale_start: 1.4      # Sharper early attention
+temperature_scale_end: 0.9
+temperature_scale_epochs: 25
 temperature_force_ref: 0.5
 temperature_force_exponent: -0.25
