@@ -15,11 +15,21 @@ class FlashACE(nn.Module):
         radial_trainable: bool = False,
         envelope_exponent: int = 5,
         gaussian_width: float = 0.5,
+        attention_message_clip: float | None = None,
+        attention_conditioned_decay: bool = True,
+        attention_share_qkv: str | bool = "none",
+        use_aux_force_head: bool = True,
+        use_aux_stress_head: bool = True,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.r_max = r_max
         self.l_max = l_max
+        self.attention_message_clip = attention_message_clip
+        self.attention_conditioned_decay = attention_conditioned_decay
+        self.attention_share_qkv = attention_share_qkv
+        self.use_aux_force_head = use_aux_force_head
+        self.use_aux_stress_head = use_aux_stress_head
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -34,7 +44,14 @@ class FlashACE(nn.Module):
         )
         
         self.layers = nn.ModuleList([
-            DenseFlashAttention(self.ace.irreps_out, hidden_dim) for _ in range(num_layers)
+            DenseFlashAttention(
+                self.ace.irreps_out,
+                hidden_dim,
+                message_clip=attention_message_clip,
+                use_conditioned_decay=attention_conditioned_decay,
+                share_qkv_mode=attention_share_qkv,
+            )
+            for _ in range(num_layers)
         ])
         
         self.readout = nn.Sequential(
@@ -42,14 +59,29 @@ class FlashACE(nn.Module):
             nn.SiLU(), 
             nn.Linear(64, 1)
         )
+        self.aux_force_head = None
+        self.aux_stress_head = None
+        if self.use_aux_force_head:
+            self.aux_force_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 3),
+            )
+        if self.use_aux_stress_head:
+            self.aux_stress_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 6),
+            )
 
-    def forward(self, data, training=False):
+    def forward(self, data, training=False, temperature_scale: float = 1.0, detach_pos: bool = True):
         z, pos, edge_index = data['z'], data['pos'], data['edge_index']
         cell_volume = data.get('volume', None)
 
         # We always need gradients w.r.t. atomic positions to compute forces.
         # Detach to ensure we work with a leaf tensor before enabling grads.
-        pos = pos.detach()
+        if detach_pos:
+            pos = pos.detach()
         pos.requires_grad_(True)
 
         if training and cell_volume is not None:
@@ -80,15 +112,23 @@ class FlashACE(nn.Module):
         # 1. Pipeline (No checkpoints)
         h = self.emb(z)
         h = self.ace(h, edge_index, edge_vec, edge_len)
-        for layer in self.layers: 
-            h = layer(h, edge_index)
+        for layer in self.layers:
+            h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
             
         # 2. Readout
         # Note: We extract only the scalar (L=0) features for energy
         # The optimized physics.py puts scalars first, so this slice is correct.
         scalars = h[:, :self.hidden_dim] 
         E = torch.sum(self.readout(scalars))
-        
+
+        aux = {}
+        if self.use_aux_force_head and self.aux_force_head is not None:
+            aux['force'] = self.aux_force_head(scalars)
+        if self.use_aux_stress_head and self.aux_stress_head is not None:
+            pooled = scalars.mean(dim=0, keepdim=True)
+            stress_voigt = self.aux_stress_head(pooled).view(-1)
+            aux['stress'] = stress_voigt
+
         # 3. Derivatives
         # Avoid building second-order graphs during evaluation to reduce memory.
         grad_opts = {
@@ -128,4 +168,4 @@ class FlashACE(nn.Module):
                 volume = cell_volume * torch.det(deformation)
                 S = -stress / volume
 
-        return E, F, S
+        return E, F, S, aux

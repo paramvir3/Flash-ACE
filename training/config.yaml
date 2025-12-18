@@ -26,16 +26,16 @@ gaussian_width: 0.5              # Relative Gaussian width multiplier (only used
 # ------------------------------------------------------------------------------
 epochs: 300
 batch_size: 8
-# Lower start LR for stability; scheduler will reduce further on plateaus
-learning_rate: 0.001
+# Higher force focus with stable LR schedule
+learning_rate: 0.002             # Slightly higher to emphasize force updates
 # Optional optimizer and scheduler tweaks
 weight_decay: 0.0
 lr_scheduler_factor: 0.5
-lr_scheduler_patience: 8
-lr_min: 0.00001
-clip_grad_norm: 5.0
+lr_scheduler_patience: 6         # Faster LR reductions if plateaus
+lr_min: 0.00005
+clip_grad_norm: 1.0
 use_amp: true                    # Enable mixed precision on CUDA for speed
-amp_dtype: "float16"             # Options: float16, bfloat16
+amp_dtype: "bfloat16"            # Prefer bf16 for stability; use float16 if unavailable
 grad_accum_steps: 1              # Gradient accumulation steps before optimizer step
 precompute_neighbors: true       # Cache neighbor lists to cut CPU overhead
 random_rotation: false           # Apply random SO(3) rotations per batch item
@@ -55,5 +55,26 @@ solve_atomic_energies: false      # Fit species reference energies from the trai
 # 4. LOSS WEIGHTS
 # ------------------------------------------------------------------------------
 energy_weight: 1.0
-forces_weight: 10.0
-stress_weight: 0.1
+forces_weight: 10.0              # Emphasize forces early
+stress_weight: 0.0               # Disable unless stresses are critical
+
+# Auxiliary and regularization weights
+aux_force_weight: 0.1            # Small multi-task force head weight
+aux_stress_weight: 0.0           # Disable aux stress by default
+force_consistency_weight: 0.02   # Conservative force consistency
+sobolev_weight: 0.001            # Very light perturbation regularization
+sobolev_sigma: 0.02
+
+# Small-displacement augmentation
+displacement_prob: 0.1
+displacement_sigma: 0.02
+
+# Attention controls
+attention_message_clip: 8.0
+attention_conditioned_decay: true
+attention_share_qkv: "kv"        # Share KV across heads for stability
+temperature_scale_start: 1.3
+temperature_scale_end: 1.0
+temperature_scale_epochs: 15
+temperature_force_ref: 0.5
+temperature_force_exponent: -0.25

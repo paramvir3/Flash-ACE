@@ -149,22 +149,31 @@ class AtomisticDataset(Dataset):
 class MetricTracker:
     def __init__(self): self.reset()
     def reset(self):
-        self.sse_e = 0.0; self.sse_f = 0.0; self.sse_s = 0.0
-        self.n_atoms = 0; self.n_force_comp = 0; self.n_stress_comp = 0
+        self.sse_e = 0.0; self.sse_s = 0.0
+        self.sum_force_mse = 0.0
+        self.sum_force_mae = 0.0
+        self.n_atoms = 0; self.n_stress_comp = 0; self.n_struct = 0
     def update(self, p_E, p_F, p_S, t_E, t_F, t_S, n_ats):
         err_e = (p_E - t_E).item() / n_ats
         self.sse_e += err_e**2 * n_ats
-        self.sse_f += (p_F - t_F).pow(2).sum().item()
+        diff_f = p_F - t_F
+        # Per-structure force MSE/MAE averaged over 3N components (NequIP-style).
+        force_mse = diff_f.pow(2).mean().item()
+        force_mae = diff_f.abs().mean().item()
+        self.sum_force_mse += force_mse
+        self.sum_force_mae += force_mae
+        self.n_struct += 1
         if torch.norm(t_S) > 1e-6:
              self.sse_s += (p_S - t_S).pow(2).sum().item()
              self.n_stress_comp += 9
         self.n_atoms += n_ats
-        self.n_force_comp += n_ats * 3
     def get_metrics(self):
         rmse_e = np.sqrt(self.sse_e / self.n_atoms) if self.n_atoms > 0 else 0.0
-        rmse_f = np.sqrt(self.sse_f / self.n_force_comp) if self.n_force_comp > 0 else 0.0
         rmse_s = np.sqrt(self.sse_s / self.n_stress_comp) if self.n_stress_comp > 0 else 0.0
-        return rmse_e * 1000, rmse_f, rmse_s
+        force_mse = (self.sum_force_mse / self.n_struct) if self.n_struct > 0 else 0.0
+        force_mae = (self.sum_force_mae / self.n_struct) if self.n_struct > 0 else 0.0
+        force_rmse = np.sqrt(force_mse)
+        return rmse_e * 1000, force_rmse, rmse_s, force_mse, force_mae
 
 def compute_mean_energy_per_atom(atoms_seq):
     total_energy = 0.0
@@ -316,6 +325,11 @@ def main():
         radial_trainable=config.get('radial_trainable', False),
         envelope_exponent=config.get('envelope_exponent', 5),
         gaussian_width=config.get('gaussian_width', 0.5),
+        attention_message_clip=config.get('attention_message_clip', None),
+        attention_conditioned_decay=config.get('attention_conditioned_decay', True),
+        attention_share_qkv=config.get('attention_share_qkv', "none"),
+        use_aux_force_head=config.get('use_aux_force_head', True),
+        use_aux_stress_head=config.get('use_aux_stress_head', True),
     ).to(device)
     
     optimizer = optim.Adam(
@@ -389,14 +403,44 @@ def main():
     ckpt_interval = int(config.get('checkpoint_interval', 0) or 0)
 
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    # Temperature curriculum for attention sharpness.
+    temp_scale_start = float(config.get('temperature_scale_start', 1.0))
+    temp_scale_end = float(config.get('temperature_scale_end', temp_scale_start))
+    temp_scale_epochs = int(config.get('temperature_scale_epochs', 0) or 0)
+
+    def _temperature_scale(epoch_idx: int, force_ema: float | None = None):
+        base = temp_scale_start
+        if temp_scale_epochs > 0:
+            frac = min(1.0, epoch_idx / float(temp_scale_epochs))
+            base = temp_scale_start + frac * (temp_scale_end - temp_scale_start)
+        ref = float(config.get('temperature_force_ref', 0.0))
+        gamma = float(config.get('temperature_force_exponent', 0.0))
+        if force_ema is not None and ref > 0.0 and gamma != 0.0:
+            scale = (force_ema / ref) ** gamma
+            base = base * torch.tensor(scale, device=device, dtype=amp_dtype if use_amp else torch.float32).item()
+        return base
+
+    force_consistency_weight = float(config.get('force_consistency_weight', 0.0))
+    displacement_prob = float(config.get('displacement_prob', 0.0))
+    displacement_sigma = float(config.get('displacement_sigma', 0.0))
+    aux_force_weight = float(config.get('aux_force_weight', 0.0))
+    aux_stress_weight = float(config.get('aux_stress_weight', 0.0))
+    sobolev_weight = float(config.get('sobolev_weight', 0.0))
+    sobolev_sigma = float(config.get('sobolev_sigma', 0.0))
     
-    print(f"{'Epoch':>5} | {'Loss':>8} | {'E (meV)':>8} | {'F (eV/A)':>8} | {'S (eV/A³)':>8} || {'Val Loss':>8} | {'Val E':>8} | {'Val F':>8}")
-    print("-" * 95)
+    print(
+        f"{'Epoch':>5} | {'Loss':>10} | {'E (meV)':>10} | {'force_RMSE':>12} | {'force_MSE':>12} | {'force_MAE':>12} | {'S_RMSE':>10} || "
+        f"{'Val Loss':>10} | {'Val E':>10} | {'Val force_RMSE':>16} | {'Val force_MSE':>16}"
+    )
+    print("-" * 170)
     
+    force_loss_ema = None
     for epoch in range(start_epoch, config['epochs']):
         model.train()
         train_metrics = MetricTracker()
         total_loss = 0.0
+        total_items_seen = 0
 
         batch_idx = -1
         optimizer.zero_grad(set_to_none=True)
@@ -405,14 +449,37 @@ def main():
             batch_loss = 0.0
 
             # --- GRADIENT ACCUMULATION (FP32/AMP) ---
-            for item in batch:
+            # Optional small-displacement augmentation
+            items = list(batch)
+            if displacement_prob > 0.0 and displacement_sigma > 0.0:
+                augmented = []
+                for item in items:
+                    if torch.rand(1).item() < displacement_prob:
+                        perturbed = {
+                            k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                            for k, v in item.items()
+                        }
+                        noise = torch.randn_like(perturbed['pos']) * displacement_sigma
+                        perturbed['pos'] = perturbed['pos'] + noise
+                        augmented.append(perturbed)
+                items.extend(augmented)
+
+            for item in items:
                 for k, v in item.items():
                     if isinstance(v, torch.Tensor):
                         item[k] = v.to(device, non_blocking=True)
+                if force_consistency_weight > 0.0:
+                    item['pos'] = item['pos'].clone().detach().requires_grad_(True)
 
                 # Standard Forward with optional AMP
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-                    p_E, p_F, p_S = model(item, training=True)
+                    temp_scale = _temperature_scale(epoch, force_loss_ema)
+                    p_E, p_F, p_S, aux = model(
+                        item,
+                        training=True,
+                        temperature_scale=temp_scale,
+                        detach_pos=force_consistency_weight <= 0.0,
+                    )
                     n_ats = len(item['z'])
 
                     target_E = item['t_E'] - baseline_energy(item['z'])
@@ -426,8 +493,44 @@ def main():
                                 (config['forces_weight']*loss_f) + \
                                 (config['stress_weight']*loss_s)
 
+                    if aux_force_weight > 0.0 and 'force' in aux:
+                        loss_item = loss_item + aux_force_weight * torch.mean((aux['force'] - item['t_F'])**2)
+                    if aux_stress_weight > 0.0 and 'stress' in aux:
+                        target_stress = item['t_S']
+                        loss_item = loss_item + aux_stress_weight * torch.mean(
+                            (aux['stress'] - torch.stack([
+                                target_stress[0,0], target_stress[1,1], target_stress[2,2],
+                                target_stress[0,1], target_stress[0,2], target_stress[1,2]
+                            ]))**2
+                        )
+
+                    if sobolev_weight > 0.0 and sobolev_sigma > 0.0:
+                        delta = torch.randn_like(item['pos']) * sobolev_sigma
+                        pos_pert = item['pos'] + delta
+                        perturbed = {**item, 'pos': pos_pert}
+                        p_E_pert, _, _, _ = model(
+                            perturbed,
+                            training=True,
+                            temperature_scale=temp_scale,
+                            detach_pos=True,
+                        )
+                        fd = (p_E_pert - p_E) + (p_F.detach() * delta).sum()
+                        loss_item = loss_item + sobolev_weight * fd.pow(2)
+
+                    if force_consistency_weight > 0.0:
+                        energy_grad = torch.autograd.grad(
+                            p_E,
+                            item['pos'],
+                            create_graph=True,
+                            retain_graph=True,
+                            allow_unused=True,
+                        )[0]
+                        if energy_grad is not None:
+                            consistency = (p_F + energy_grad).pow(2).mean()
+                            loss_item = loss_item + force_consistency_weight * consistency
+
                 # Normalize and Backward
-                loss_batch = loss_item / (len(batch) * grad_accum_steps)
+                loss_batch = loss_item / (len(items) * grad_accum_steps)
                 scaler.scale(loss_batch).backward()
 
                 batch_loss += loss_item.item()
@@ -435,6 +538,11 @@ def main():
                 with torch.no_grad():
                     pred_E_abs = p_E + baseline_energy(item['z'])
                     train_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
+                    if force_loss_ema is None:
+                        force_loss_ema = loss_f.detach()
+                    else:
+                        force_loss_ema = 0.9 * force_loss_ema + 0.1 * loss_f.detach()
+                total_items_seen += 1
 
             if (batch_idx + 1) % grad_accum_steps == 0:
                 if config.get('clip_grad_norm', None):
@@ -458,8 +566,8 @@ def main():
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        avg_train_loss = total_loss / len(train_atoms)
-        tr_e, tr_f, tr_s = train_metrics.get_metrics()
+        avg_train_loss = total_loss / max(1, total_items_seen)
+        tr_e, tr_f, tr_s, tr_f_mse, tr_f_mae = train_metrics.get_metrics()
         history['train_loss'].append(avg_train_loss)
 
         # Validation
@@ -477,7 +585,7 @@ def main():
                 # still avoid higher-order graphs with ``create_graph=False``
                 # inside the model during validation.
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-                    p_E, p_F, p_S = model(item, training=False)
+                    p_E, p_F, p_S, _ = model(item, training=False)
                     n_ats = len(item['z'])
                     target_E = item['t_E'] - baseline_energy(item['z'])
                     loss_e = ((p_E - target_E) / n_ats)**2
@@ -488,11 +596,15 @@ def main():
                 val_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
 
         avg_val_loss = val_loss_accum / len(val_atoms)
-        val_e, val_f, val_s = val_metrics.get_metrics()
+        val_e, val_f, val_s, val_f_mse, val_f_mae = val_metrics.get_metrics()
         history['val_loss'].append(avg_val_loss)
         scheduler.step(avg_val_loss)
 
-        print(f"{epoch+1:5d} | {avg_train_loss:8.4f} | {tr_e:8.2f} | {tr_f:8.4f} | {tr_s:8.4f} || {avg_val_loss:8.4f} | {val_e:8.2f} | {val_f:8.4f}")
+        print(
+            f"{epoch+1:5d} | "
+            f"{avg_train_loss:10.4f} | {tr_e:10.2f} | {tr_f:12.6f} | {tr_f_mse:12.6f} | {tr_f_mae:12.6f} | {tr_s:10.4f} || "
+            f"{avg_val_loss:10.4f} | {val_e:10.2f} | {val_f:16.6f} | {val_f_mse:16.6f}"
+        )
 
         if ckpt_interval > 0 and (epoch + 1) % ckpt_interval == 0:
             ckpt_dir = config.get('checkpoint_dir', 'checkpoints')
