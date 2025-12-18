@@ -17,6 +17,7 @@ class LocalMPAttentionBlock(nn.Module):
         irreps_in,
         hidden_dim,
         use_local_mp: bool = True,
+        use_micro_mp: bool = True,
         local_mp_sharpness: float = 6.0,
         attention_message_clip: float | None = None,
         attention_conditioned_decay: bool = True,
@@ -24,6 +25,12 @@ class LocalMPAttentionBlock(nn.Module):
     ):
         super().__init__()
         self.use_local_mp = use_local_mp
+        self.use_micro_mp = use_micro_mp
+        self.pre_mp = (
+            LocalMessagePassing(irreps_in, sharpness=local_mp_sharpness)
+            if use_local_mp and use_micro_mp
+            else None
+        )
         self.local_mp = (
             LocalMessagePassing(irreps_in, sharpness=local_mp_sharpness)
             if use_local_mp
@@ -38,6 +45,8 @@ class LocalMPAttentionBlock(nn.Module):
         )
 
     def forward(self, h, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0):
+        if self.use_local_mp and self.pre_mp is not None:
+            h = self.pre_mp(h, edge_index, edge_len)
         if self.use_local_mp and self.local_mp is not None:
             h = self.local_mp(h, edge_index, edge_len)
         h = self.attention(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
@@ -62,6 +71,7 @@ class FlashACE(nn.Module):
         use_aux_force_head: bool = True,
         use_aux_stress_head: bool = True,
         local_message_passing: bool = True,
+        local_mp_micro_step: bool = True,
         local_mp_sharpness: float = 6.0,
     ):
         super().__init__()
@@ -74,6 +84,7 @@ class FlashACE(nn.Module):
         self.use_aux_force_head = use_aux_force_head
         self.use_aux_stress_head = use_aux_stress_head
         self.use_local_mp = local_message_passing
+        self.use_local_mp_micro_step = local_mp_micro_step
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -90,6 +101,7 @@ class FlashACE(nn.Module):
             self.ace.irreps_out,
             hidden_dim,
             use_local_mp=local_message_passing,
+            use_micro_mp=local_mp_micro_step,
             local_mp_sharpness=local_mp_sharpness,
             attention_message_clip=attention_message_clip,
             attention_conditioned_decay=attention_conditioned_decay,
@@ -101,6 +113,7 @@ class FlashACE(nn.Module):
                     self.ace.irreps_out,
                     hidden_dim,
                     use_local_mp=local_message_passing,
+                    use_micro_mp=local_mp_micro_step,
                     local_mp_sharpness=local_mp_sharpness,
                     attention_message_clip=attention_message_clip,
                     attention_conditioned_decay=attention_conditioned_decay,

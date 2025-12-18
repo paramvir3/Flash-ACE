@@ -363,6 +363,7 @@ def main():
         use_aux_force_head=config.get('use_aux_force_head', True),
         use_aux_stress_head=config.get('use_aux_stress_head', True),
         local_message_passing=config.get('local_message_passing', True),
+        local_mp_micro_step=config.get('local_mp_micro_step', True),
         local_mp_sharpness=config.get('local_mp_sharpness', 6.0),
     ).to(device)
     
