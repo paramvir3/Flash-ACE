@@ -182,26 +182,30 @@ class DenseFlashAttention(nn.Module):
         if sender.numel() == 0:
             return x
 
+        # These projections are generic node embeddings (queries/keys) rather than
+        # energy-specific features. The radial/tangential projections provide the
+        # value streams mixed into the updated representation, keeping a clean
+        # separation between scoring features and message content.
         if self.share_qkv_mode == "all":
-            energy_base = self.w_proj_shared(x)
+            qk_base = self.w_proj_shared(x)
             radial_base = self.radial_update_shared(x)
             tangential_base = self.tangential_update_shared(x)
-            energy_proj = energy_base.unsqueeze(0).expand(self.num_heads, -1, -1)
+            qk_proj = qk_base.unsqueeze(0).expand(self.num_heads, -1, -1)
             radial_proj = radial_base.unsqueeze(0).expand(self.num_heads, -1, -1)
             tangential_proj = tangential_base.unsqueeze(0).expand(self.num_heads, -1, -1)
         elif self.share_qkv_mode == "kv":
-            energy_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
+            qk_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
             radial_base = self.radial_update_shared(x)
             tangential_base = self.tangential_update_shared(x)
             radial_proj = radial_base.unsqueeze(0).expand(self.num_heads, -1, -1)
             tangential_proj = tangential_base.unsqueeze(0).expand(self.num_heads, -1, -1)
         else:
-            energy_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
+            qk_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
             radial_proj = torch.stack([layer(x) for layer in self.radial_update], dim=0)
             tangential_proj = torch.stack([layer(x) for layer in self.tangential_update], dim=0)
 
         out = self._geometric_decomposition_attention(
-            energy_proj,
+            qk_proj,
             radial_proj,
             tangential_proj,
             sender,
@@ -215,7 +219,7 @@ class DenseFlashAttention(nn.Module):
 
     def _geometric_decomposition_attention(
         self,
-        energy_proj,
+        qk_proj,
         radial_proj,
         tangential_proj,
         sender,
@@ -224,17 +228,19 @@ class DenseFlashAttention(nn.Module):
         temperature_scale: float,
     ):
         # *_proj are shaped (num_heads, num_nodes, feature_dim)
-        num_heads = energy_proj.shape[0]
-        num_nodes = energy_proj.shape[1]
+        num_heads = qk_proj.shape[0]
+        num_nodes = qk_proj.shape[1]
 
-        energy_delta = energy_proj[:, sender] - energy_proj[:, receiver]
+        # qk_proj drives the scoring (queries/keys) while radial/tangential
+        # projections carry the values that get mixed into the updated features.
+        qk_delta = qk_proj[:, sender] - qk_proj[:, receiver]
         radial_delta = radial_proj[:, sender] - radial_proj[:, receiver]
         tangential_delta = tangential_proj[:, sender] - tangential_proj[:, receiver]
 
         # Radial energy penalizes long bonds, tangential is distance agnostic.
         radial_distance_scale = F.softplus(self._radial_distance_log_scale).to(edge_len.dtype)[:, None]
 
-        receiver_feat = energy_proj[:, receiver]  # (heads, edges, feature_dim)
+        receiver_feat = qk_proj[:, receiver]  # (heads, edges, feature_dim)
         if self.use_conditioned_decay:
             decay_offset = torch.stack(
                 [mlp(receiver_feat[h]).squeeze(-1) for h, mlp in enumerate(self.radial_decay_mlp)],
@@ -245,11 +251,11 @@ class DenseFlashAttention(nn.Module):
                 dim=0,
             )
         else:
-            decay_offset = torch.zeros_like(energy_delta[..., 0])
-            temp_offset = torch.zeros_like(energy_delta[..., 0])
+            decay_offset = torch.zeros_like(qk_delta[..., 0])
+            temp_offset = torch.zeros_like(qk_delta[..., 0])
 
         radial_logits = (
-            (energy_delta * self.radial_score[:, None, :]).sum(dim=-1).float()
+            (qk_delta * self.radial_score[:, None, :]).sum(dim=-1).float()
             - (radial_distance_scale + decay_offset).float() * edge_len.float()
         )
         radial_temp = F.softplus(
@@ -260,12 +266,12 @@ class DenseFlashAttention(nn.Module):
         radial_temp = (radial_temp * temperature_scale).float()
         radial_logits = radial_logits / (radial_temp + 1e-4)
         tangential_logits = (
-            energy_delta * self.tangential_score[:, None, :]
+            qk_delta * self.tangential_score[:, None, :]
         ).sum(dim=-1).float()
 
         num_edges = sender.numel()
-        feature_dim = energy_proj.shape[-1]
-        out = torch.zeros_like(energy_proj)
+        feature_dim = qk_proj.shape[-1]
+        out = torch.zeros_like(qk_proj)
         if num_edges == 0:
             return out.mean(dim=0)
 
