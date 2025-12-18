@@ -430,6 +430,9 @@ def main():
     aux_stress_weight = float(config.get('aux_stress_weight', 0.0))
     sobolev_weight = float(config.get('sobolev_weight', 0.0))
     sobolev_sigma = float(config.get('sobolev_sigma', 0.0))
+    edge_dropout_prob = float(config.get('edge_dropout_prob', 0.0))
+    warmup_steps = int(config.get('warmup_steps', 0) or 0)
+    base_lr = optimizer.param_groups[0]['lr']
     
     def _scheduled_value(base_value, schedule, epoch_idx):
         if not schedule:
@@ -493,6 +496,13 @@ def main():
                 for k, v in item.items():
                     if isinstance(v, torch.Tensor):
                         item[k] = v.to(device, non_blocking=True)
+                # Edge dropout for robustness; validation keeps all edges.
+                if training and edge_dropout_prob > 0.0:
+                    edge_idx = item['edge_index']
+                    if edge_idx.numel() > 0:
+                        mask = torch.rand(edge_idx.shape[1], device=edge_idx.device) > edge_dropout_prob
+                        edge_idx = edge_idx[:, mask]
+                        item['edge_index'] = edge_idx
                 if force_consistency_weight > 0.0:
                     item['pos'] = item['pos'].clone().detach().requires_grad_(True)
 
@@ -577,6 +587,15 @@ def main():
                     )
                 scaler.step(optimizer)
                 scaler.update()
+                if warmup_steps > 0:
+                    global_step = epoch * len(train_loader) + batch_idx + 1
+                    if global_step <= warmup_steps:
+                        factor = float(global_step) / float(warmup_steps)
+                        for g in optimizer.param_groups:
+                            g['lr'] = base_lr * factor
+                    else:
+                        for g in optimizer.param_groups:
+                            g['lr'] = base_lr
                 optimizer.zero_grad(set_to_none=True)
             total_loss += batch_loss
 

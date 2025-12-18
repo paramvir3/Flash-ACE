@@ -118,12 +118,14 @@ class FlashACE(nn.Module):
         # Layer normalization on scalar channels stabilizes the single-layer
         # regime and makes the force head less sensitive to feature scale drift.
         self.scalar_norm = nn.LayerNorm(hidden_dim)
+        self.force_gate = nn.Linear(1, 1)
         self.aux_force_head = None
         self.aux_stress_head = None
         if self.use_aux_force_head:
             self.aux_force_head = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.SiLU(),
+                nn.Dropout(p=0.1),
                 nn.Linear(hidden_dim, 3),
             )
         if self.use_aux_stress_head:
@@ -166,7 +168,7 @@ class FlashACE(nn.Module):
             epsilon = None
 
         edge_vec = pos[edge_index[0]] - pos[edge_index[1]]
-        edge_len = torch.norm(edge_vec, dim=1)
+        edge_len = torch.clamp(torch.norm(edge_vec, dim=1), max=self.r_max)
         
         # 1. Pipeline (No checkpoints)
         h = self.emb(z)
@@ -187,7 +189,9 @@ class FlashACE(nn.Module):
 
         aux = {}
         if self.use_aux_force_head and self.aux_force_head is not None:
-            aux['force'] = self.aux_force_head(scalars)
+            mean_edge = edge_len.mean().unsqueeze(0)
+            gate = torch.sigmoid(self.force_gate(mean_edge))
+            aux['force'] = gate * self.aux_force_head(scalars)
         if self.use_aux_stress_head and self.aux_stress_head is not None:
             pooled = scalars.mean(dim=0, keepdim=True)
             stress_voigt = self.aux_stress_head(pooled).view(-1)

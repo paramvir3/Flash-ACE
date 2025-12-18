@@ -13,7 +13,7 @@ model_save_path: "model.pt"
 # ------------------------------------------------------------------------------
 r_max: 5
 l_max: 1
-num_radial: 16             # Wider radial basis for higher force fidelity
+num_radial: 20             # Slightly wider radial basis for single-layer robustness
 hidden_dim: 128
 num_layers: 1              # Single lightweight local MP + attention block
 radial_basis_type: "bessel"       # Options: bessel, gaussian
@@ -36,11 +36,13 @@ lr_scheduler_factor: 0.5
 lr_scheduler_patience: 6         # Faster LR reductions if plateaus
 lr_min: 0.00005
 clip_grad_norm: 1.0
+warmup_steps: 200                # Short LR warmup steps for stability
 use_amp: true                    # Enable mixed precision on CUDA for speed
 amp_dtype: "bfloat16"            # Prefer bf16 for stability; use float16 if unavailable
 grad_accum_steps: 2              # Higher effective batch for steadier forces
 precompute_neighbors: true       # Cache neighbor lists to cut CPU overhead
 random_rotation: true            # Apply random SO(3) rotations per batch item
+edge_dropout_prob: 0.05          # Drop a fraction of edges during training for robustness
 device: "cuda"
 checkpoint_dir: "checkpoints"     # Directory to stash periodic checkpoints
 checkpoint_interval: 0           # Save a checkpoint every N epochs (0 disables)
