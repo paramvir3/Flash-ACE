@@ -86,8 +86,17 @@ class FlashACE(nn.Module):
             envelope_exponent=envelope_exponent,
             gaussian_width=gaussian_width,
         )
-        self.blocks = nn.ModuleList(
-            [
+        self.single_block = LocalMPAttentionBlock(
+            self.ace.irreps_out,
+            hidden_dim,
+            use_local_mp=local_message_passing,
+            local_mp_sharpness=local_mp_sharpness,
+            attention_message_clip=attention_message_clip,
+            attention_conditioned_decay=attention_conditioned_decay,
+            attention_share_qkv=attention_share_qkv,
+        )
+        self.blocks = None if num_layers <= 1 else nn.ModuleList(
+            [self.single_block] + [
                 LocalMPAttentionBlock(
                     self.ace.irreps_out,
                     hidden_dim,
@@ -97,7 +106,7 @@ class FlashACE(nn.Module):
                     attention_conditioned_decay=attention_conditioned_decay,
                     attention_share_qkv=attention_share_qkv,
                 )
-                for _ in range(num_layers)
+                for _ in range(num_layers - 1)
             ]
         )
         
@@ -160,8 +169,11 @@ class FlashACE(nn.Module):
         h = self.emb(z)
         h = self.ace(h, edge_index, edge_vec, edge_len)
 
-        for block in self.blocks:
-            h = block(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
+        if self.blocks is None:
+            h = self.single_block(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
+        else:
+            for block in self.blocks:
+                h = block(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
             
         # 2. Readout
         # Note: We extract only the scalar (L=0) features for energy

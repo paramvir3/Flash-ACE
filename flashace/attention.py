@@ -26,11 +26,8 @@ class LocalMessagePassing(nn.Module):
         self.irreps_in = o3.Irreps(irreps_in)
         self.mix = o3.Linear(self.irreps_in, self.irreps_in)
         self.distance_log_scale = nn.Parameter(torch.tensor(sharpness).log())
-        self.filter = nn.Sequential(
-            nn.Linear(1, max(1, self.feature_dim // 4)),
-            nn.SiLU(),
-            nn.Linear(max(1, self.feature_dim // 4), 1),
-        )
+        # Lightweight scalar gate: a single linear avoids extra hidden activations.
+        self.filter = nn.Linear(1, 1)
 
     def forward(self, x, edge_index, edge_len):
         if edge_index.numel() == 0:
