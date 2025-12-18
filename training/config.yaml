@@ -15,7 +15,7 @@ r_max: 5
 l_max: 1
 num_radial: 16             # Wider radial basis for higher force fidelity
 hidden_dim: 128
-num_layers: 3              # Combined local MP + local attention blocks
+num_layers: 1              # Single local MP + single local attention block
 radial_basis_type: "bessel"       # Options: bessel, gaussian
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)

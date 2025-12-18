@@ -10,7 +10,7 @@ class FlashACE(nn.Module):
         l_max=2,
         num_radial=8,
         hidden_dim=128,
-        num_layers=2,
+        num_layers=1,
         radial_basis_type: str = "bessel",
         radial_trainable: bool = False,
         envelope_exponent: int = 5,
@@ -46,21 +46,15 @@ class FlashACE(nn.Module):
             gaussian_width=gaussian_width,
         )
         
-        self.local_mp = nn.ModuleList([
-            LocalMessagePassing(self.ace.irreps_out, sharpness=local_mp_sharpness)
-            for _ in range(num_layers)
-        ]) if self.use_local_mp else None
+        self.local_mp = LocalMessagePassing(self.ace.irreps_out, sharpness=local_mp_sharpness) if self.use_local_mp else None
 
-        self.layers = nn.ModuleList([
-            DenseFlashAttention(
-                self.ace.irreps_out,
-                hidden_dim,
-                message_clip=attention_message_clip,
-                use_conditioned_decay=attention_conditioned_decay,
-                share_qkv_mode=attention_share_qkv,
-            )
-            for _ in range(num_layers)
-        ])
+        self.attention = DenseFlashAttention(
+            self.ace.irreps_out,
+            hidden_dim,
+            message_clip=attention_message_clip,
+            use_conditioned_decay=attention_conditioned_decay,
+            share_qkv_mode=attention_share_qkv,
+        )
         
         self.readout = nn.Sequential(
             nn.Linear(hidden_dim, 64), 
@@ -121,10 +115,10 @@ class FlashACE(nn.Module):
         h = self.emb(z)
         h = self.ace(h, edge_index, edge_vec, edge_len)
 
-        for idx, layer in enumerate(self.layers):
-            if self.use_local_mp and self.local_mp is not None:
-                h = self.local_mp[idx](h, edge_index, edge_len)
-            h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
+        if self.use_local_mp and self.local_mp is not None:
+            h = self.local_mp(h, edge_index, edge_len)
+
+        h = self.attention(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
             
         # 2. Readout
         # Note: We extract only the scalar (L=0) features for energy
