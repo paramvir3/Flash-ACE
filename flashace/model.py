@@ -3,6 +3,47 @@ import torch.nn as nn
 from .physics import ACE_Descriptor
 from .attention import DenseFlashAttention, LocalMessagePassing
 
+
+class LocalMPAttentionBlock(nn.Module):
+    """Single local message passing + attention block.
+
+    Keeps locality high via distance-decayed aggregation, then lets attention
+    share information directionally within the same neighborhood. This keeps
+    the stack shallow and fast while preserving short-range force sensitivity.
+    """
+
+    def __init__(
+        self,
+        irreps_in,
+        hidden_dim,
+        use_local_mp: bool = True,
+        local_mp_sharpness: float = 6.0,
+        attention_message_clip: float | None = None,
+        attention_conditioned_decay: bool = True,
+        attention_share_qkv: str | bool = "none",
+    ):
+        super().__init__()
+        self.use_local_mp = use_local_mp
+        self.local_mp = (
+            LocalMessagePassing(irreps_in, sharpness=local_mp_sharpness)
+            if use_local_mp
+            else None
+        )
+        self.attention = DenseFlashAttention(
+            irreps_in,
+            hidden_dim,
+            message_clip=attention_message_clip,
+            use_conditioned_decay=attention_conditioned_decay,
+            share_qkv_mode=attention_share_qkv,
+        )
+
+    def forward(self, h, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0):
+        if self.use_local_mp and self.local_mp is not None:
+            h = self.local_mp(h, edge_index, edge_len)
+        h = self.attention(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
+        return h
+
+
 class FlashACE(nn.Module):
     def __init__(
         self,
@@ -45,15 +86,19 @@ class FlashACE(nn.Module):
             envelope_exponent=envelope_exponent,
             gaussian_width=gaussian_width,
         )
-        
-        self.local_mp = LocalMessagePassing(self.ace.irreps_out, sharpness=local_mp_sharpness) if self.use_local_mp else None
-
-        self.attention = DenseFlashAttention(
-            self.ace.irreps_out,
-            hidden_dim,
-            message_clip=attention_message_clip,
-            use_conditioned_decay=attention_conditioned_decay,
-            share_qkv_mode=attention_share_qkv,
+        self.blocks = nn.ModuleList(
+            [
+                LocalMPAttentionBlock(
+                    self.ace.irreps_out,
+                    hidden_dim,
+                    use_local_mp=local_message_passing,
+                    local_mp_sharpness=local_mp_sharpness,
+                    attention_message_clip=attention_message_clip,
+                    attention_conditioned_decay=attention_conditioned_decay,
+                    attention_share_qkv=attention_share_qkv,
+                )
+                for _ in range(num_layers)
+            ]
         )
         
         self.readout = nn.Sequential(
@@ -115,10 +160,8 @@ class FlashACE(nn.Module):
         h = self.emb(z)
         h = self.ace(h, edge_index, edge_vec, edge_len)
 
-        if self.use_local_mp and self.local_mp is not None:
-            h = self.local_mp(h, edge_index, edge_len)
-
-        h = self.attention(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
+        for block in self.blocks:
+            h = block(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
             
         # 2. Readout
         # Note: We extract only the scalar (L=0) features for energy
