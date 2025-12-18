@@ -115,6 +115,9 @@ class FlashACE(nn.Module):
             nn.SiLU(), 
             nn.Linear(64, 1)
         )
+        # Layer normalization on scalar channels stabilizes the single-layer
+        # regime and makes the force head less sensitive to feature scale drift.
+        self.scalar_norm = nn.LayerNorm(hidden_dim)
         self.aux_force_head = None
         self.aux_stress_head = None
         if self.use_aux_force_head:
@@ -178,7 +181,8 @@ class FlashACE(nn.Module):
         # 2. Readout
         # Note: We extract only the scalar (L=0) features for energy
         # The optimized physics.py puts scalars first, so this slice is correct.
-        scalars = h[:, :self.hidden_dim] 
+        scalars = h[:, :self.hidden_dim]
+        scalars = self.scalar_norm(scalars)
         E = torch.sum(self.readout(scalars))
 
         aux = {}
