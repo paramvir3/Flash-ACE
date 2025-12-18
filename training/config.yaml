@@ -15,13 +15,15 @@ r_max: 5
 l_max: 1
 num_radial: 16             # Wider radial basis for higher force fidelity
 hidden_dim: 128
-num_layers: 4              # Deeper attention stack (keep LR lower and clip gradients)
+num_layers: 4              # Kept for backward compatibility; see local_mp_layers/attention_layers
 radial_basis_type: "bessel"       # Options: bessel, gaussian
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)
 gaussian_width: 0.5              # Relative Gaussian width multiplier (only used if basis=gaussian)
 local_message_passing: true      # Enable lightweight local message passing before attention
 local_mp_sharpness: 6.0          # Controls decay of the scalar distance kernel
+local_mp_layers: 3               # Number of local MP blocks before global attention
+attention_layers: 1              # Fewer attention layers for faster long-range sharing
 
 # ------------------------------------------------------------------------------
 # 3. TRAINING PARAMETERS
