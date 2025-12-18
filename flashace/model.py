@@ -22,8 +22,6 @@ class FlashACE(nn.Module):
         use_aux_stress_head: bool = True,
         local_message_passing: bool = True,
         local_mp_sharpness: float = 6.0,
-        local_mp_layers: int | None = None,
-        attention_layers: int | None = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -48,12 +46,9 @@ class FlashACE(nn.Module):
             gaussian_width=gaussian_width,
         )
         
-        mp_layers = local_mp_layers if local_mp_layers is not None else max(1, num_layers - 1)
-        attn_layers = attention_layers if attention_layers is not None else 1
-
         self.local_mp = nn.ModuleList([
             LocalMessagePassing(self.ace.irreps_out, sharpness=local_mp_sharpness)
-            for _ in range(mp_layers)
+            for _ in range(num_layers)
         ]) if self.use_local_mp else None
 
         self.layers = nn.ModuleList([
@@ -64,7 +59,7 @@ class FlashACE(nn.Module):
                 use_conditioned_decay=attention_conditioned_decay,
                 share_qkv_mode=attention_share_qkv,
             )
-            for _ in range(attn_layers)
+            for _ in range(num_layers)
         ])
         
         self.readout = nn.Sequential(
@@ -126,11 +121,9 @@ class FlashACE(nn.Module):
         h = self.emb(z)
         h = self.ace(h, edge_index, edge_vec, edge_len)
 
-        if self.use_local_mp and self.local_mp is not None:
-            for mp in self.local_mp:
-                h = mp(h, edge_index, edge_len)
-
-        for layer in self.layers:
+        for idx, layer in enumerate(self.layers):
+            if self.use_local_mp and self.local_mp is not None:
+                h = self.local_mp[idx](h, edge_index, edge_len)
             h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
             
         # 2. Readout

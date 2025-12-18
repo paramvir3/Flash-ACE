@@ -332,8 +332,6 @@ def main():
         use_aux_stress_head=config.get('use_aux_stress_head', True),
         local_message_passing=config.get('local_message_passing', True),
         local_mp_sharpness=config.get('local_mp_sharpness', 6.0),
-        local_mp_layers=config.get('local_mp_layers'),
-        attention_layers=config.get('attention_layers'),
     ).to(device)
     
     optimizer = optim.Adam(
