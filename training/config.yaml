@@ -21,7 +21,8 @@ radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)
 gaussian_width: 0.5              # Relative Gaussian width multiplier (only used if basis=gaussian)
 local_message_passing: true      # Enable lightweight local message passing before attention
-local_mp_micro_step: true        # Add an extra pre-attention local MP micro-step for stronger locality
+local_mp_micro_step: true        # Add pre-attention local MP micro-steps for stronger locality
+local_mp_micro_steps: 2          # Reuse the same light MP weights twice to reach 2-hop neighborhoods
 local_mp_sharpness: 6.0          # Controls decay of the scalar distance kernel
 normalize_forces: true           # Standardize forces by dataset RMS (NequIP-style) for stable loss scaling
 force_rms: null                  # Optional manual override [fx, fy, fz] eV/Å; auto-computed if null
@@ -45,7 +46,7 @@ amp_dtype: "bfloat16"            # Prefer bf16 for stability; use float16 if una
 grad_accum_steps: 2              # Higher effective batch for steadier forces
 precompute_neighbors: true       # Cache neighbor lists to cut CPU overhead
 random_rotation: true            # Apply random SO(3) rotations per batch item
-edge_dropout_prob: 0.05          # Drop a fraction of edges during training for robustness
+edge_dropout_prob: 0.02          # Light dropout to avoid losing too much context in a single block
 device: "cuda"
 checkpoint_dir: "checkpoints"     # Directory to stash periodic checkpoints
 checkpoint_interval: 0           # Save a checkpoint every N epochs (0 disables)
@@ -61,14 +62,14 @@ solve_atomic_energies: true       # Fit species reference energies from the trai
 # ------------------------------------------------------------------------------
 # 4. LOSS WEIGHTS
 # ------------------------------------------------------------------------------
-energy_weight: 0.0               # Focus purely on force supervision
-forces_weight: 16.0              # Higher force weight for single-layer robustness
+energy_weight: 0.1               # Small anchor on energies to keep the potential smooth
+forces_weight: 12.0              # Slightly softer to pair with the energy anchor
 stress_weight: 0.0               # Disable unless stresses are critical
 
 # Auxiliary and regularization weights
 aux_force_weight: 0.3            # Stronger auxiliary force supervision
 aux_stress_weight: 0.0           # Disable aux stress by default
-force_consistency_weight: 0.0    # Disable for faster, force-only focus
+force_consistency_weight: 0.05   # Mild anchor to keep forces conservative
 sobolev_weight: 0.0              # Disable to avoid extra backward passes
 sobolev_sigma: 0.0
 
@@ -77,7 +78,7 @@ energy_weight_schedule:
   []
 forces_weight_schedule:
   - epoch: 80
-    value: 8.0
+    value: 10.0
 aux_force_weight_schedule:
   - epoch: 60
     value: 0.1
