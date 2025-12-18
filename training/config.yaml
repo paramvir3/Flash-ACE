@@ -63,16 +63,13 @@ stress_weight: 0.0               # Disable unless stresses are critical
 # Auxiliary and regularization weights
 aux_force_weight: 0.2            # Stronger auxiliary force supervision
 aux_stress_weight: 0.0           # Disable aux stress by default
-force_consistency_weight: 0.05   # Sharper tie between energy gradient and force head
-sobolev_weight: 0.003            # Slightly stronger perturbation regularization
-sobolev_sigma: 0.03
+force_consistency_weight: 0.0    # Disable for faster, force-only focus
+sobolev_weight: 0.0              # Disable to avoid extra backward passes
+sobolev_sigma: 0.0
 
 # Loss/regularization schedules (epoch numbers are 1-indexed)
 energy_weight_schedule:
-  - epoch: 30
-    value: 1.5
-  - epoch: 80
-    value: 2.0
+  []
 forces_weight_schedule:
   - epoch: 80
     value: 8.0
@@ -80,10 +77,7 @@ aux_force_weight_schedule:
   - epoch: 60
     value: 0.1
 sobolev_weight_schedule:
-  - epoch: 1
-    value: 0.003
-  - epoch: 60
-    value: 0.0
+  []
 
 # Small-displacement augmentation
 displacement_prob: 0.1
