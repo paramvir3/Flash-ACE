@@ -64,6 +64,8 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, en
             'use_amp': config.get('use_amp', False),
             'grad_accum_steps': max(1, int(config.get('grad_accum_steps', 1))),
             'precompute_neighbors': config.get('precompute_neighbors', False),
+            'normalize_forces': config.get('normalize_forces', False),
+            'force_rms': config.get('force_rms'),
         }
     }
     torch.save(checkpoint, path)
@@ -184,6 +186,28 @@ def compute_mean_energy_per_atom(atoms_seq):
     return (total_energy / total_atoms) if total_atoms > 0 else 0.0
 
 
+def compute_force_stats(atoms_seq):
+    """Compute per-component force scale for normalization.
+
+    Matching NequIP-style normalization, we standardize forces by the dataset
+    RMS so the loss is well conditioned across elements and compositions.
+    """
+
+    all_forces = []
+    for atoms in atoms_seq:
+        forces = atoms.get_forces()
+        if forces is not None:
+            all_forces.append(np.asarray(forces, dtype=np.float64).reshape(-1, 3))
+    if not all_forces:
+        return None
+
+    stacked = np.concatenate(all_forces, axis=0)
+    rms = np.sqrt(np.mean(np.square(stacked), axis=0))
+    # Avoid division by zero; fall back to ones if any component is degenerate.
+    rms = np.where(rms < 1e-8, 1.0, rms)
+    return rms.astype(np.float32)
+
+
 def compute_atomic_energies_from_dataset(atoms_seq):
     """Solve for per-species reference energies via least squares.
 
@@ -295,6 +319,14 @@ def main():
         energy_shift_per_atom = compute_mean_energy_per_atom(train_atoms)
         print(f"Computed mean energy per atom for normalization: {energy_shift_per_atom:.6f} eV")
 
+    force_rms = None
+    if config.get('normalize_forces', False):
+        force_rms = compute_force_stats(train_atoms)
+        if force_rms is not None:
+            config['force_rms'] = force_rms.tolist()
+            pretty = ", ".join(f"{c:.6f}" for c in force_rms)
+            print(f"Force RMS normalization (eV/Å): [{pretty}] -> using for loss scaling")
+
     # DATALOADERS
     train_ds = AtomisticDataset(
         train_atoms,
@@ -381,6 +413,13 @@ def main():
                     energy_shift_per_atom = ckpt_shift
                     print(f"Using checkpoint energy shift per atom: {energy_shift_per_atom:.6f} eV")
 
+        ckpt_force_rms = checkpoint.get('config', {}).get('force_rms')
+        if config.get('normalize_forces', False) and ckpt_force_rms is not None:
+            force_rms = ckpt_force_rms
+            config['force_rms'] = ckpt_force_rms
+            pretty = ", ".join(f"{float(c):.6f}" for c in ckpt_force_rms)
+            print(f"Using checkpoint force RMS for normalization: [{pretty}]")
+
         start_epoch = int(checkpoint.get('epoch', 0))
         print(f"Resuming training from epoch {start_epoch}")
 
@@ -389,6 +428,13 @@ def main():
         energy_shift = torch.tensor(energy_shift_per_atom, dtype=torch.float32, device=device)
 
     atomic_energy_vec = atomic_energy_tensor(atomic_energy_map, device)
+
+    force_scale = None
+    if config.get('normalize_forces', False):
+        if force_rms is None:
+            force_rms = config.get('force_rms')
+        if force_rms is not None:
+            force_scale = torch.tensor(force_rms, device=device, dtype=torch.float32)
 
     def baseline_energy(z_tensor):
         if atomic_energy_vec is not None:
@@ -497,7 +543,7 @@ def main():
                     if isinstance(v, torch.Tensor):
                         item[k] = v.to(device, non_blocking=True)
                 # Edge dropout for robustness; validation keeps all edges.
-                if training and edge_dropout_prob > 0.0:
+                if model.training and edge_dropout_prob > 0.0:
                     edge_idx = item['edge_index']
                     if edge_idx.numel() > 0:
                         mask = torch.rand(edge_idx.shape[1], device=edge_idx.device) > edge_dropout_prob
@@ -519,17 +565,25 @@ def main():
 
                     target_E = item['t_E'] - baseline_energy(item['z'])
                     loss_e = ((p_E - target_E) / n_ats)**2
-                    loss_f = torch.mean((p_F - item['t_F'])**2)
+                    force_residual = p_F - item['t_F']
+                    if force_scale is not None:
+                        scale = force_scale.to(dtype=p_F.dtype)
+                        force_residual = force_residual / scale
+                    loss_f = torch.mean(force_residual**2)
                     loss_s = torch.tensor(0.0, device=device)
                     if torch.norm(item['t_S']) > 1e-6:
                         loss_s = torch.mean((p_S - item['t_S'])**2)
 
-                        loss_item = (energy_weight*loss_e) + \
-                                    (forces_weight*loss_f) + \
-                                    (config['stress_weight']*loss_s)
+                    loss_item = (energy_weight*loss_e) + \
+                                (forces_weight*loss_f) + \
+                                (config['stress_weight']*loss_s)
 
-                        if aux_force_weight > 0.0 and 'force' in aux:
-                            loss_item = loss_item + aux_force_weight * torch.mean((aux['force'] - item['t_F'])**2)
+                    if aux_force_weight > 0.0 and 'force' in aux:
+                        aux_force_residual = aux['force'] - item['t_F']
+                        if force_scale is not None:
+                            scale = force_scale.to(dtype=aux_force_residual.dtype)
+                            aux_force_residual = aux_force_residual / scale
+                        loss_item = loss_item + aux_force_weight * torch.mean(aux_force_residual**2)
                     if aux_stress_weight > 0.0 and 'stress' in aux:
                         target_stress = item['t_S']
                         loss_item = loss_item + aux_stress_weight * torch.mean(
@@ -561,7 +615,11 @@ def main():
                             allow_unused=True,
                         )[0]
                         if energy_grad is not None:
-                            consistency = (p_F + energy_grad).pow(2).mean()
+                            consistency_residual = p_F + energy_grad
+                            if force_scale is not None:
+                                scale = force_scale.to(dtype=consistency_residual.dtype)
+                                consistency_residual = consistency_residual / scale
+                            consistency = consistency_residual.pow(2).mean()
                             loss_item = loss_item + force_consistency_weight * consistency
 
                 # Normalize and Backward
@@ -633,7 +691,11 @@ def main():
                     n_ats = len(item['z'])
                     target_E = item['t_E'] - baseline_energy(item['z'])
                     loss_e = ((p_E - target_E) / n_ats)**2
-                    loss_f = torch.mean((p_F - item['t_F'])**2)
+                    force_residual = p_F - item['t_F']
+                    if force_scale is not None:
+                        scale = force_scale.to(dtype=force_residual.dtype)
+                        force_residual = force_residual / scale
+                    loss_f = torch.mean(force_residual**2)
                     val_loss_accum += (energy_weight*loss_e) + (forces_weight*loss_f)
 
                 pred_E_abs = p_E + baseline_energy(item['z'])
