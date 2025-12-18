@@ -52,11 +52,20 @@ class FlashACECalculator(Calculator):
             l_max=conf['l_max'],
             num_radial=conf['num_radial'],
             hidden_dim=conf['hidden_dim'],
-            num_layers=conf['num_layers']
+            num_layers=conf['num_layers'],
+            radial_basis_type=conf.get('radial_basis_type', 'bessel'),
+            radial_trainable=conf.get('radial_trainable', False),
+            envelope_exponent=conf.get('envelope_exponent', 5),
+            gaussian_width=conf.get('gaussian_width', 0.5),
+            attention_message_clip=conf.get('attention_message_clip', None),
+            attention_conditioned_decay=conf.get('attention_conditioned_decay', True),
+            attention_share_qkv=conf.get('attention_share_qkv', "none"),
+            use_aux_force_head=conf.get('use_aux_force_head', False),
+            use_aux_stress_head=conf.get('use_aux_stress_head', False),
         )
         
         # 4. Load Weights
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         self.model.to(self.device)
         self.model.eval()
 
@@ -88,9 +97,9 @@ class FlashACECalculator(Calculator):
 
         # If calculating stress, enable gradients w.r.t cell (training=True)
         if calc_stress:
-            pred_E, pred_F, pred_S = self.model(data, training=True)
+            pred_E, pred_F, pred_S, _ = self.model(data, training=True)
         else:
-            pred_E, pred_F, _ = self.model(data, training=False)
+            pred_E, pred_F, _, _ = self.model(data, training=False)
 
         if self.atomic_energy_tensor is not None:
             if torch.max(z).item() >= self.atomic_energy_tensor.shape[0]:
