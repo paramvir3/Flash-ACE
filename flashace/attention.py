@@ -63,12 +63,14 @@ class DenseFlashAttention(nn.Module):
         message_clip: float | None = None,
         use_conditioned_decay: bool = True,
         share_qkv_mode: str | bool = "none",
+        long_range_bins: int = 0,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.feature_dim = o3.Irreps(irreps_in).dim
         self.message_clip = message_clip
         self.use_conditioned_decay = use_conditioned_decay
+        self.long_range_bins = max(0, int(long_range_bins))
         if isinstance(share_qkv_mode, bool):
             share_qkv_mode = "all" if share_qkv_mode else "none"
         if share_qkv_mode not in {"none", "kv", "all"}:
@@ -139,6 +141,10 @@ class DenseFlashAttention(nn.Module):
         )
 
         self.w_out = o3.Linear(irreps_in, irreps_in)
+        if self.long_range_bins > 0:
+            self.long_range_bias = nn.Parameter(torch.zeros(num_heads, self.long_range_bins))
+        else:
+            self.register_parameter("long_range_bias", None)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -260,14 +266,13 @@ class DenseFlashAttention(nn.Module):
             (qk_delta * self.radial_score[:, None, :]).sum(dim=-1).float()
             - (radial_distance_scale + decay_offset).float() * edge_len.float()
         )
-        # Optional reciprocal-space bias (broadcast per head if provided as 1D)
-        if reciprocal_bias is not None:
-            if reciprocal_bias.ndim == 1:
-                rb = reciprocal_bias[None, None, :].expand(num_heads, radial_logits.shape[1], -1)
-                radial_logits = radial_logits + rb.mean(dim=-1)
-            elif reciprocal_bias.ndim == 2:
-                rb = reciprocal_bias[None, :, :].expand(num_heads, -1, -1)
-                radial_logits = radial_logits + rb.mean(dim=-1)
+        if reciprocal_bias is not None and self.long_range_bias is not None:
+            # reciprocal_bias: (num_edges, bins) or None
+            # apply learned per-bin bias per head
+            rb = reciprocal_bias  # (E, B)
+            # combine: (H, B) * (E, B) -> (H, E)
+            lr_term = torch.einsum("hb,eb->he", self.long_range_bias, rb)
+            radial_logits = radial_logits + lr_term
         radial_temp = F.softplus(
             self._radial_temp_bias[:, None]
             + self._radial_temp_weight[:, None] * edge_len
@@ -278,13 +283,9 @@ class DenseFlashAttention(nn.Module):
         tangential_logits = (
             qk_delta * self.tangential_score[:, None, :]
         ).sum(dim=-1).float()
-        if reciprocal_bias is not None:
-            if reciprocal_bias.ndim == 1:
-                rb = reciprocal_bias[None, None, :].expand(num_heads, tangential_logits.shape[1], -1)
-                tangential_logits = tangential_logits + rb.mean(dim=-1)
-            elif reciprocal_bias.ndim == 2:
-                rb = reciprocal_bias[None, :, :].expand(num_heads, -1, -1)
-                tangential_logits = tangential_logits + rb.mean(dim=-1)
+        if reciprocal_bias is not None and self.long_range_bias is not None:
+            lr_term = torch.einsum("hb,eb->he", self.long_range_bias, reciprocal_bias)
+            tangential_logits = tangential_logits + lr_term
 
         num_edges = sender.numel()
         feature_dim = qk_proj.shape[-1]

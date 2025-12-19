@@ -40,6 +40,7 @@ class FlashACE(nn.Module):
         self.use_aux_stress_head = use_aux_stress_head
         self.reciprocal_shells = max(0, int(reciprocal_shells))
         self.reciprocal_scale = float(reciprocal_scale)
+        self.reciprocal_bins = (2 * self.reciprocal_shells + 1) ** 3 - 1 if self.reciprocal_shells > 0 else 0
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -61,6 +62,7 @@ class FlashACE(nn.Module):
                     message_clip=attention_message_clip,
                     use_conditioned_decay=attention_conditioned_decay,
                     share_qkv_mode=attention_share_qkv,
+                    long_range_bins=self.reciprocal_bins,
                 )
                 for _ in range(num_layers)
             ]
