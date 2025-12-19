@@ -350,21 +350,21 @@ def main():
                               collate_fn=AtomisticDataset.collate_fn, num_workers=2)
 
     print("--- Initializing FlashACE ---")
-        model = FlashACE(
-            r_max=config['r_max'], l_max=config['l_max'], num_radial=config['num_radial'],
-            hidden_dim=config['hidden_dim'], num_layers=config['num_layers'],
-            radial_basis_type=config.get('radial_basis_type', 'bessel'),
-            radial_trainable=config.get('radial_trainable', False),
-            envelope_exponent=config.get('envelope_exponent', 5),
-            gaussian_width=config.get('gaussian_width', 0.5),
-            attention_message_clip=config.get('attention_message_clip', None),
-            attention_conditioned_decay=config.get('attention_conditioned_decay', True),
-            attention_share_qkv=config.get('attention_share_qkv', "none"),
-            use_aux_force_head=config.get('use_aux_force_head', True),
-            use_aux_stress_head=config.get('use_aux_stress_head', True),
-            reciprocal_shells=config.get('reciprocal_shells', 0),
-            reciprocal_scale=config.get('reciprocal_scale', 1.0),
-        ).to(device)
+    model = FlashACE(
+        r_max=config['r_max'], l_max=config['l_max'], num_radial=config['num_radial'],
+        hidden_dim=config['hidden_dim'], num_layers=config['num_layers'],
+        radial_basis_type=config.get('radial_basis_type', 'bessel'),
+        radial_trainable=config.get('radial_trainable', False),
+        envelope_exponent=config.get('envelope_exponent', 5),
+        gaussian_width=config.get('gaussian_width', 0.5),
+        attention_message_clip=config.get('attention_message_clip', None),
+        attention_conditioned_decay=config.get('attention_conditioned_decay', True),
+        attention_share_qkv=config.get('attention_share_qkv', "none"),
+        use_aux_force_head=config.get('use_aux_force_head', True),
+        use_aux_stress_head=config.get('use_aux_stress_head', True),
+        reciprocal_shells=config.get('reciprocal_shells', 0),
+        reciprocal_scale=config.get('reciprocal_scale', 1.0),
+    ).to(device)
     
     optimizer = optim.Adam(
         model.parameters(), lr=config['learning_rate'], amsgrad=True,
