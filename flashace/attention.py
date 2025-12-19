@@ -64,6 +64,7 @@ class DenseFlashAttention(nn.Module):
         use_conditioned_decay: bool = True,
         share_qkv_mode: str | bool = "none",
         long_range_bins: int = 0,
+        debye_init: float = 1.0,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -71,6 +72,7 @@ class DenseFlashAttention(nn.Module):
         self.message_clip = message_clip
         self.use_conditioned_decay = use_conditioned_decay
         self.long_range_bins = max(0, int(long_range_bins))
+        self.debye_kappa = nn.Parameter(torch.tensor(float(debye_init)))
         if isinstance(share_qkv_mode, bool):
             share_qkv_mode = "all" if share_qkv_mode else "none"
         if share_qkv_mode not in {"none", "kv", "all"}:
@@ -265,6 +267,7 @@ class DenseFlashAttention(nn.Module):
         radial_logits = (
             (qk_delta * self.radial_score[:, None, :]).sum(dim=-1).float()
             - (radial_distance_scale + decay_offset).float() * edge_len.float()
+            - F.softplus(self.debye_kappa).float() * edge_len.float()
         )
         if reciprocal_bias is not None and self.long_range_bias is not None:
             # reciprocal_bias: (num_edges, bins) or None

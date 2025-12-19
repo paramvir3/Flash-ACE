@@ -28,6 +28,9 @@ class FlashACE(nn.Module):
         use_aux_stress_head: bool = True,
         reciprocal_shells: int = 0,
         reciprocal_scale: float = 1.0,
+        reciprocal_pe: bool = False,
+        reciprocal_pe_dim: int = 8,
+        debye_init: float = 1.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -41,6 +44,8 @@ class FlashACE(nn.Module):
         self.reciprocal_shells = max(0, int(reciprocal_shells))
         self.reciprocal_scale = float(reciprocal_scale)
         self.reciprocal_bins = (2 * self.reciprocal_shells + 1) ** 3 - 1 if self.reciprocal_shells > 0 else 0
+        self.reciprocal_pe = reciprocal_pe
+        self.reciprocal_pe_dim = max(0, int(reciprocal_pe_dim))
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -63,6 +68,7 @@ class FlashACE(nn.Module):
                     use_conditioned_decay=attention_conditioned_decay,
                     share_qkv_mode=attention_share_qkv,
                     long_range_bins=self.reciprocal_bins,
+                    debye_init=debye_init,
                 )
                 for _ in range(num_layers)
             ]
@@ -145,6 +151,17 @@ class FlashACE(nn.Module):
         edge_len = torch.clamp(torch.norm(edge_vec, dim=1), max=self.r_max)
 
         h = self.emb(z)
+        # Optional reciprocal positional encoding
+        if self.reciprocal_pe and self.reciprocal_shells > 0 and cell is not None:
+            recip = self._reciprocal_features(pos, cell)
+            if recip is not None and recip.numel() > 0:
+                # Use the first reciprocal_pe_dim components (sin/cos pairs) if available
+                G = recip[: self.reciprocal_pe_dim]
+                # Broadcast positions against top-G entries; sin/cos encode and concatenate
+                phases = pos @ torch.randn(pos.shape[1], device=pos.device, dtype=pos.dtype).unsqueeze(0).t()
+                # Fallback if G is shorter than requested
+                sincos = torch.cat([torch.sin(phases), torch.cos(phases)], dim=-1)
+                h = h + sincos[:, : h.shape[1]]
         h = self.ace(h, edge_index, edge_vec, edge_len)
         recip = self._reciprocal_features(pos, cell)
         recip_bias = recip if recip is not None else None
