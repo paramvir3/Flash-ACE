@@ -176,7 +176,7 @@ class DenseFlashAttention(nn.Module):
                     nn.init.xavier_uniform_(m.weight)
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0):
+    def forward(self, x, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0, reciprocal_bias=None):
         sender, receiver = edge_index
         num_nodes = x.shape[0]
         if sender.numel() == 0:
@@ -212,6 +212,7 @@ class DenseFlashAttention(nn.Module):
             receiver,
             edge_len,
             temperature_scale=temperature_scale,
+            reciprocal_bias=reciprocal_bias,
         )
 
         out = torch.nan_to_num(out)
@@ -226,6 +227,7 @@ class DenseFlashAttention(nn.Module):
         receiver,
         edge_len,
         temperature_scale: float,
+        reciprocal_bias=None,
     ):
         # *_proj are shaped (num_heads, num_nodes, feature_dim)
         num_heads = qk_proj.shape[0]
@@ -258,6 +260,14 @@ class DenseFlashAttention(nn.Module):
             (qk_delta * self.radial_score[:, None, :]).sum(dim=-1).float()
             - (radial_distance_scale + decay_offset).float() * edge_len.float()
         )
+        # Optional reciprocal-space bias (broadcast per head if provided as 1D)
+        if reciprocal_bias is not None:
+            if reciprocal_bias.ndim == 1:
+                rb = reciprocal_bias[None, None, :].expand(num_heads, radial_logits.shape[1], -1)
+                radial_logits = radial_logits + rb.mean(dim=-1)
+            elif reciprocal_bias.ndim == 2:
+                rb = reciprocal_bias[None, :, :].expand(num_heads, -1, -1)
+                radial_logits = radial_logits + rb.mean(dim=-1)
         radial_temp = F.softplus(
             self._radial_temp_bias[:, None]
             + self._radial_temp_weight[:, None] * edge_len
@@ -268,6 +278,13 @@ class DenseFlashAttention(nn.Module):
         tangential_logits = (
             qk_delta * self.tangential_score[:, None, :]
         ).sum(dim=-1).float()
+        if reciprocal_bias is not None:
+            if reciprocal_bias.ndim == 1:
+                rb = reciprocal_bias[None, None, :].expand(num_heads, tangential_logits.shape[1], -1)
+                tangential_logits = tangential_logits + rb.mean(dim=-1)
+            elif reciprocal_bias.ndim == 2:
+                rb = reciprocal_bias[None, :, :].expand(num_heads, -1, -1)
+                tangential_logits = tangential_logits + rb.mean(dim=-1)
 
         num_edges = sender.numel()
         feature_dim = qk_proj.shape[-1]

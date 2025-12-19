@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 
@@ -24,6 +26,8 @@ class FlashACE(nn.Module):
         attention_share_qkv: str | bool = "none",
         use_aux_force_head: bool = True,
         use_aux_stress_head: bool = True,
+        reciprocal_shells: int = 0,
+        reciprocal_scale: float = 1.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -34,6 +38,8 @@ class FlashACE(nn.Module):
         self.attention_share_qkv = attention_share_qkv
         self.use_aux_force_head = use_aux_force_head
         self.use_aux_stress_head = use_aux_stress_head
+        self.reciprocal_shells = max(0, int(reciprocal_shells))
+        self.reciprocal_scale = float(reciprocal_scale)
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -82,9 +88,37 @@ class FlashACE(nn.Module):
                 nn.Linear(hidden_dim, 6),
             )
 
+    def _reciprocal_features(self, pos, cell):
+        if self.reciprocal_shells <= 0 or cell is None:
+            return None
+        # cell: (3, 3)
+        cell_det = torch.det(cell)
+        if torch.abs(cell_det) < 1e-8:
+            return None
+        reciprocal = 2 * math.pi * torch.inverse(cell).t()
+        shells = []
+        max_n = self.reciprocal_shells
+        for h in range(-max_n, max_n + 1):
+            for k in range(-max_n, max_n + 1):
+                for l in range(-max_n, max_n + 1):
+                    if h == k == l == 0:
+                        continue
+                    g_cart = h * reciprocal[0] + k * reciprocal[1] + l * reciprocal[2]
+                    shells.append(g_cart)
+        if not shells:
+            return None
+        G = torch.stack(shells, dim=0)  # (M, 3)
+        phases = pos @ G.t()  # (N, M)
+        s_real = torch.cos(phases).sum(dim=0)
+        s_imag = torch.sin(phases).sum(dim=0)
+        s_mag = torch.sqrt(s_real**2 + s_imag**2 + 1e-9)
+        s_norm = s_mag / (pos.shape[0] + 1e-6)
+        return s_norm * self.reciprocal_scale
+
     def forward(self, data, training=False, temperature_scale: float = 1.0, detach_pos: bool = True):
         z, pos, edge_index = data["z"], data["pos"], data["edge_index"]
         cell_volume = data.get("volume", None)
+        cell = data.get("cell", None)
 
         if detach_pos:
             pos = pos.detach()
@@ -110,8 +144,10 @@ class FlashACE(nn.Module):
 
         h = self.emb(z)
         h = self.ace(h, edge_index, edge_vec, edge_len)
+        recip = self._reciprocal_features(pos, cell)
+        recip_bias = recip if recip is not None else None
         for layer in self.attention_layers:
-            h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
+            h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale, reciprocal_bias=recip_bias)
 
         scalars = self.scalar_norm(h[:, : self.hidden_dim])
         E = torch.sum(self.readout(scalars))
