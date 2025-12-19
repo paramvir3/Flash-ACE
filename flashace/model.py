@@ -46,6 +46,7 @@ class FlashACE(nn.Module):
         self.reciprocal_bins = (2 * self.reciprocal_shells + 1) ** 3 - 1 if self.reciprocal_shells > 0 else 0
         self.reciprocal_pe = reciprocal_pe
         self.reciprocal_pe_dim = max(0, int(reciprocal_pe_dim))
+        self.recip_pe_proj = nn.Linear(2 * self.reciprocal_pe_dim, hidden_dim) if self.reciprocal_pe and self.reciprocal_pe_dim > 0 else None
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -96,10 +97,9 @@ class FlashACE(nn.Module):
                 nn.Linear(hidden_dim, 6),
             )
 
-    def _reciprocal_features(self, pos, cell):
+    def _reciprocal_vectors(self, cell):
         if self.reciprocal_shells <= 0 or cell is None:
             return None
-        # cell: (3, 3)
         cell_det = torch.det(cell)
         if torch.abs(cell_det) < 1e-8:
             return None
@@ -115,7 +115,12 @@ class FlashACE(nn.Module):
                     shells.append(g_cart)
         if not shells:
             return None
-        G = torch.stack(shells, dim=0)  # (M, 3)
+        return torch.stack(shells, dim=0)  # (M, 3)
+
+    def _reciprocal_features(self, pos, cell):
+        G = self._reciprocal_vectors(cell)
+        if G is None:
+            return None
         phases = pos @ G.t()  # (N, M)
         s_real = torch.cos(phases).sum(dim=0)
         s_imag = torch.sin(phases).sum(dim=0)
@@ -151,20 +156,19 @@ class FlashACE(nn.Module):
         edge_len = torch.clamp(torch.norm(edge_vec, dim=1), max=self.r_max)
 
         h = self.emb(z)
-        # Optional reciprocal positional encoding
-        if self.reciprocal_pe and self.reciprocal_shells > 0 and cell is not None:
-            recip = self._reciprocal_features(pos, cell)
-            if recip is not None and recip.numel() > 0:
-                # Use the first reciprocal_pe_dim components (sin/cos pairs) if available
-                G = recip[: self.reciprocal_pe_dim]
-                # Broadcast positions against top-G entries; sin/cos encode and concatenate
-                phases = pos @ torch.randn(pos.shape[1], device=pos.device, dtype=pos.dtype).unsqueeze(0).t()
-                # Fallback if G is shorter than requested
-                sincos = torch.cat([torch.sin(phases), torch.cos(phases)], dim=-1)
-                h = h + sincos[:, : h.shape[1]]
+        G = self._reciprocal_vectors(cell) if self.reciprocal_pe else None
+        if self.reciprocal_pe and self.reciprocal_pe_dim > 0 and G is not None:
+            g_use = G[: self.reciprocal_pe_dim]
+            if g_use.numel() > 0:
+                phases = pos @ g_use.t()  # (N, pe_dim)
+                sincos = torch.cat([torch.sin(phases), torch.cos(phases)], dim=-1)  # (N, 2*pe_dim)
+                pe_embed = self.recip_pe_proj(sincos)
+                h = h + pe_embed
         h = self.ace(h, edge_index, edge_vec, edge_len)
         recip = self._reciprocal_features(pos, cell)
-        recip_bias = recip if recip is not None else None
+        recip_bias = None
+        if recip is not None and edge_len.numel() > 0:
+            recip_bias = recip.unsqueeze(0).expand(edge_len.shape[0], -1)
         for layer in self.attention_layers:
             h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale, reciprocal_bias=recip_bias)
 
