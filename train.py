@@ -58,6 +58,13 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, en
             'radial_trainable': config.get('radial_trainable', False),
             'envelope_exponent': config.get('envelope_exponent', 5),
             'gaussian_width': config.get('gaussian_width', 0.5),
+            'attention_message_clip': config.get('attention_message_clip', None),
+            'attention_conditioned_decay': config.get('attention_conditioned_decay', True),
+            'attention_share_qkv': config.get('attention_share_qkv', "none"),
+            'reciprocal_shells': config.get('reciprocal_shells', 0),
+            'reciprocal_scale': config.get('reciprocal_scale', 1.0),
+            'reciprocal_pe': config.get('reciprocal_pe', False),
+            'reciprocal_pe_dim': config.get('reciprocal_pe_dim', 0),
             'energy_shift_per_atom': energy_shift_per_atom,
             'atomic_energies': atomic_energies or {},
             'amp_dtype': config.get('amp_dtype', 'float16'),
@@ -419,6 +426,27 @@ def main():
             config['force_rms'] = ckpt_force_rms
             pretty = ", ".join(f"{float(c):.6f}" for c in ckpt_force_rms)
             print(f"Using checkpoint force RMS for normalization: [{pretty}]")
+
+        # Align attention/reciprocal architecture with checkpoint to avoid shape mismatches.
+        ckpt_cfg = checkpoint.get('config', {})
+        for key in [
+            'attention_message_clip',
+            'attention_conditioned_decay',
+            'attention_share_qkv',
+            'reciprocal_shells',
+            'reciprocal_scale',
+            'reciprocal_pe',
+            'reciprocal_pe_dim',
+            'num_layers',
+            'num_radial',
+            'hidden_dim',
+            'radial_basis_type',
+            'radial_trainable',
+            'envelope_exponent',
+            'gaussian_width',
+        ]:
+            if key in ckpt_cfg:
+                config[key] = ckpt_cfg[key]
 
         start_epoch = int(checkpoint.get('epoch', 0))
         print(f"Resuming training from epoch {start_epoch}")
