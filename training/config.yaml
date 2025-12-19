@@ -15,15 +15,15 @@ r_max: 5
 l_max: 1
 num_radial: 20             # Slightly wider radial basis for single-layer robustness
 hidden_dim: 128
-num_layers: 1              # Single lightweight local MP + attention block
+num_layers: 1              # Single lightweight attention block
 radial_basis_type: "bessel"       # Options: bessel, gaussian
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)
 gaussian_width: 0.5              # Relative Gaussian width multiplier (only used if basis=gaussian)
-local_message_passing: true      # Enable lightweight local message passing before attention
-local_mp_micro_step: true        # Add pre-attention local MP micro-steps for stronger locality
-local_mp_micro_steps: 2          # Reuse the same light MP weights twice to reach 2-hop neighborhoods
-local_mp_sharpness: 6.0          # Controls decay of the scalar distance kernel
+local_message_passing: false     # Attention-only path (no local MP)
+local_mp_micro_step: false       # Disable micro-steps when using attention-only
+local_mp_micro_steps: 0          # No micro-step repeats
+local_mp_sharpness: 6.0          # Unused when MP is off
 normalize_forces: true           # Standardize forces by dataset RMS (NequIP-style) for stable loss scaling
 force_rms: null                  # Optional manual override [fx, fy, fz] eV/Å; auto-computed if null
 
