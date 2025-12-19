@@ -1,0 +1,91 @@
+# Example restart configuration using a saved checkpoint.
+
+# ------------------------------------------------------------------
+# DATA / IO
+# ------------------------------------------------------------------
+train_file: "data_2.extxyz"
+valid_file: null
+val_split: 0.1
+model_save_path: "model.pt"
+
+# ------------------------------------------------------------------
+# MODEL (values will be aligned with checkpoint on load)
+# ------------------------------------------------------------------
+r_max: 5
+l_max: 1
+num_radial: 20
+hidden_dim: 128
+num_layers: 1
+radial_basis_type: "bessel"
+radial_trainable: false
+envelope_exponent: 5
+gaussian_width: 0.5
+attention_message_clip: 8.0
+attention_conditioned_decay: true
+attention_share_qkv: "kv"
+
+# Reciprocal options (set shells to 0 to disable)
+reciprocal_shells: 1
+reciprocal_scale: 1.0
+reciprocal_pe: false
+reciprocal_pe_dim: 8
+
+# ------------------------------------------------------------------
+# TRAINING
+# ------------------------------------------------------------------
+epochs: 300
+batch_size: 8
+learning_rate: 0.001
+weight_decay: 0.0
+lr_scheduler_factor: 0.5
+lr_scheduler_patience: 6
+lr_min: 0.00005
+clip_grad_norm: 1.0
+warmup_steps: 200
+use_amp: true
+amp_dtype: "bfloat16"
+grad_accum_steps: 2
+precompute_neighbors: true
+random_rotation: true
+edge_dropout_prob: 0.02
+device: "cuda"
+
+# Resume settings
+resume_from: "checkpoints/epoch_100.pt"  # point to your checkpoint
+resume_load_optimizer: true
+resume_load_scheduler: true
+resume_load_scaler: true
+use_checkpoint_energy_shift: true
+
+# ------------------------------------------------------------------
+# LOSS WEIGHTS
+# ------------------------------------------------------------------
+energy_weight: 0.1
+forces_weight: 12.0
+stress_weight: 0.0
+aux_force_weight: 0.3
+aux_stress_weight: 0.0
+force_consistency_weight: 0.05
+sobolev_weight: 0.0
+sobolev_sigma: 0.0
+
+# Schedules
+energy_weight_schedule: []
+forces_weight_schedule:
+  - epoch: 80
+    value: 10.0
+aux_force_weight_schedule:
+  - epoch: 60
+    value: 0.1
+sobolev_weight_schedule: []
+
+# Augmentation
+displacement_prob: 0.1
+displacement_sigma: 0.02
+
+# Attention temperature
+temperature_scale_start: 1.4
+temperature_scale_end: 0.9
+temperature_scale_epochs: 25
+temperature_force_ref: 0.5
+temperature_force_exponent: -0.25
