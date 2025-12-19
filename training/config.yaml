@@ -20,10 +20,8 @@ radial_basis_type: "bessel"       # Options: bessel, gaussian
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)
 gaussian_width: 0.5              # Relative Gaussian width multiplier (only used if basis=gaussian)
-local_message_passing: false     # Attention-only path (no local MP)
-local_mp_micro_step: false       # Disable micro-steps when using attention-only
-local_mp_micro_steps: 0          # No micro-step repeats
-local_mp_sharpness: 6.0          # Unused when MP is off
+reciprocal_shells: 0             # Set >0 to enable reciprocal biasing of attention
+reciprocal_scale: 1.0            # Scaling factor for reciprocal features
 normalize_forces: true           # Standardize forces by dataset RMS (NequIP-style) for stable loss scaling
 force_rms: null                  # Optional manual override [fx, fy, fz] eV/Å; auto-computed if null
 
