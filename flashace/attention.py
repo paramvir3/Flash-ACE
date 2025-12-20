@@ -69,6 +69,7 @@ class DenseFlashAttention(nn.Module):
         long_range_mix: float = 0.5,
         long_range_value_mix: float = 0.0,
         sparse_top_k: int | None = None,
+        sparse_top_k_long: int | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -81,6 +82,7 @@ class DenseFlashAttention(nn.Module):
         self.long_range_value_mix = nn.Parameter(torch.tensor(float(long_range_value_mix)))
         self.debye_kappa = nn.Parameter(torch.tensor(float(debye_init)))
         self.sparse_top_k = None if sparse_top_k is None else max(1, int(sparse_top_k))
+        self.sparse_top_k_long = None if sparse_top_k_long is None else max(1, int(sparse_top_k_long))
         if isinstance(share_qkv_mode, bool):
             share_qkv_mode = "all" if share_qkv_mode else "none"
         if share_qkv_mode not in {"none", "kv", "all"}:
@@ -341,21 +343,26 @@ class DenseFlashAttention(nn.Module):
             return torch.nan_to_num(alpha)
 
         # Optional sparse masking (DeepSeek-style top-k) applied pre-softmax per node/head.
-        if self.sparse_top_k is not None and self.sparse_top_k > 0:
-            k = self.sparse_top_k
+        def _apply_topk(logits, k_val):
+            if k_val is None or k_val <= 0:
+                return logits
             unique_nodes = receiver.unique()
             for h in range(num_heads):
                 for node in unique_nodes:
                     idx = (receiver == node).nonzero(as_tuple=False).squeeze(-1)
-                    if idx.numel() > k:
-                        topk_vals, topk_idx = torch.topk(radial_logits[h, idx], k)
-                        mask = torch.ones_like(radial_logits[h, idx], dtype=torch.bool)
+                    if idx.numel() > k_val:
+                        topk_vals, topk_idx = torch.topk(logits[h, idx], k_val)
+                        mask = torch.ones_like(logits[h, idx], dtype=torch.bool)
                         mask.scatter_(0, topk_idx, False)
-                        radial_logits[h, idx[mask]] = float("-inf")
-                        topk_vals_t, topk_idx_t = torch.topk(tangential_logits[h, idx], k)
-                        mask_t = torch.ones_like(tangential_logits[h, idx], dtype=torch.bool)
-                        mask_t.scatter_(0, topk_idx_t, False)
-                        tangential_logits[h, idx[mask_t]] = float("-inf")
+                        logits[h, idx[mask]] = float("-inf")
+            return logits
+
+        radial_logits = _apply_topk(radial_logits, self.sparse_top_k)
+        tangential_logits = _apply_topk(tangential_logits, self.sparse_top_k)
+        # Optional separate sparsity for long-range bias path if provided.
+        if reciprocal_bias is not None and self.long_range_bias is not None and self.sparse_top_k_long:
+            radial_logits = _apply_topk(radial_logits, self.sparse_top_k_long)
+            tangential_logits = _apply_topk(tangential_logits, self.sparse_top_k_long)
 
         radial_alpha = torch.nan_to_num(_segment_softmax(radial_logits))
         tangential_alpha = torch.nan_to_num(_segment_softmax(tangential_logits))
