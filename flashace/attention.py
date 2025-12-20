@@ -67,6 +67,7 @@ class DenseFlashAttention(nn.Module):
         debye_init: float = 1.0,
         long_range_heads: int = 1,
         long_range_mix: float = 0.5,
+        long_range_value_mix: float = 0.0,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -76,6 +77,7 @@ class DenseFlashAttention(nn.Module):
         self.long_range_bins = max(0, int(long_range_bins))
         self.long_range_heads = max(0, int(long_range_heads))
         self.long_range_mix = nn.Parameter(torch.tensor(float(long_range_mix)))
+        self.long_range_value_mix = nn.Parameter(torch.tensor(float(long_range_value_mix)))
         self.debye_kappa = nn.Parameter(torch.tensor(float(debye_init)))
         if isinstance(share_qkv_mode, bool):
             share_qkv_mode = "all" if share_qkv_mode else "none"
@@ -350,6 +352,10 @@ class DenseFlashAttention(nn.Module):
         ) * tangential_delta
 
         weighted_delta = blended_alpha[..., None].to(blended_delta.dtype) * blended_delta
+        if reciprocal_bias is not None and self.long_range_bias is not None:
+            lr_term = torch.einsum("hb,eb->he", self.long_range_bias, reciprocal_bias)
+            lr_mix = torch.clamp(torch.sigmoid(self.long_range_value_mix), min=0.0, max=1.0)
+            weighted_delta = weighted_delta + lr_mix[..., None] * lr_term[..., None].expand_as(weighted_delta)
         if self.message_clip is not None:
             clip = torch.tensor(self.message_clip, device=weighted_delta.device, dtype=weighted_delta.dtype)
             norms = weighted_delta.norm(dim=-1, keepdim=True)
