@@ -379,6 +379,10 @@ def main():
         use_aux_stress_head=config.get('use_aux_stress_head', True),
         reciprocal_shells=config.get('reciprocal_shells', 0),
         reciprocal_scale=config.get('reciprocal_scale', 1.0),
+        sparse_top_k=config.get('sparse_top_k'),
+        sparse_top_k_long=config.get('sparse_top_k_long'),
+        use_sparse_topk=config.get('use_sparse_topk', False),
+        use_debye_gate=config.get('use_debye_gate', False),
     ).to(device)
     
     optimizer = optim.Adam(

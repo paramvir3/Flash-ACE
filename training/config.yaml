@@ -96,3 +96,7 @@ temperature_scale_end: 0.9
 temperature_scale_epochs: 25
 temperature_force_ref: 0.5
 temperature_force_exponent: -0.25
+sparse_top_k: null                 # Disable sparse/top-k masking by default for stability
+sparse_top_k_long: null
+use_sparse_topk: false
+use_debye_gate: false              # Disable Debye gating unless explicitly enabled

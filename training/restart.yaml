@@ -29,6 +29,10 @@ reciprocal_shells: 1
 reciprocal_scale: 1.0
 reciprocal_pe: false
 reciprocal_pe_dim: 8
+sparse_top_k: null
+sparse_top_k_long: null
+use_sparse_topk: false
+use_debye_gate: false
 
 # ------------------------------------------------------------------
 # TRAINING

@@ -88,6 +88,8 @@ class DenseFlashAttention(nn.Module):
         long_range_value_mix: float = 0.0,
         sparse_top_k: int | None = None,
         sparse_top_k_long: int | None = None,
+        use_sparse_topk: bool = False,
+        use_debye_gate: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -98,7 +100,9 @@ class DenseFlashAttention(nn.Module):
         self.long_range_heads = max(0, int(long_range_heads))
         self.long_range_mix = nn.Parameter(torch.tensor(float(long_range_mix)))
         self.long_range_value_mix = nn.Parameter(torch.tensor(float(long_range_value_mix)))
+        self.use_debye_gate = use_debye_gate
         self.debye_kappa = nn.Parameter(torch.tensor(float(debye_init)))
+        self.use_sparse_topk = use_sparse_topk
         self.sparse_top_k = None if sparse_top_k is None else max(1, int(sparse_top_k))
         self.sparse_top_k_long = None if sparse_top_k_long is None else max(1, int(sparse_top_k_long))
         if isinstance(share_qkv_mode, bool):
@@ -296,8 +300,9 @@ class DenseFlashAttention(nn.Module):
         radial_logits = (
             (qk_delta * self.radial_score[:, None, :]).sum(dim=-1).float()
             - (radial_distance_scale + decay_offset).float() * edge_len.float()
-            - F.softplus(self.debye_kappa).float() * edge_len.float()
         )
+        if self.use_debye_gate:
+            radial_logits = radial_logits - F.softplus(self.debye_kappa).float() * edge_len.float()
         if reciprocal_bias is not None and self.long_range_bias is not None:
             # reciprocal_bias: (E, B)
             rb = reciprocal_bias
@@ -375,10 +380,16 @@ class DenseFlashAttention(nn.Module):
                         logits[h, idx[mask]] = float("-inf")
             return logits
 
-        radial_logits = _apply_topk(radial_logits, self.sparse_top_k)
-        tangential_logits = _apply_topk(tangential_logits, self.sparse_top_k)
+        if self.use_sparse_topk:
+            radial_logits = _apply_topk(radial_logits, self.sparse_top_k)
+            tangential_logits = _apply_topk(tangential_logits, self.sparse_top_k)
         # Optional separate sparsity for long-range bias path if provided.
-        if reciprocal_bias is not None and self.long_range_bias is not None and self.sparse_top_k_long:
+        if (
+            self.use_sparse_topk
+            and reciprocal_bias is not None
+            and self.long_range_bias is not None
+            and self.sparse_top_k_long
+        ):
             radial_logits = _apply_topk(radial_logits, self.sparse_top_k_long)
             tangential_logits = _apply_topk(tangential_logits, self.sparse_top_k_long)
 
