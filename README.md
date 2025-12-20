@@ -19,3 +19,7 @@ python train.py --config training/config.yaml
 ## The main problem 
 
 Energies converge, not forces
+
+## The current one
+DeepSeek Sparse Attention 
+
