@@ -395,7 +395,6 @@ def main():
 
     resume_path = config.get('resume_from')
     start_epoch = 0
-
     scaler = GradScaler(enabled=use_amp)
 
     if resume_path:
@@ -484,8 +483,6 @@ def main():
     history = {'train_loss':[], 'val_loss':[]}
 
     ckpt_interval = int(config.get('checkpoint_interval', 0) or 0)
-
-    scaler = GradScaler(enabled=use_amp)
 
     # Temperature curriculum for attention sharpness.
     temp_scale_start = float(config.get('temperature_scale_start', 1.0))
