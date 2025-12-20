@@ -169,11 +169,15 @@ class FlashACE(nn.Module):
                 pe_embed = self.recip_pe_proj(sincos)
                 h = h + pe_embed
         h = self.ace(h, edge_index, edge_vec, edge_len)
+        ace_base = h
         recip = self._reciprocal_features(pos, cell)
         recip_bias = None
         if recip is not None and edge_len.numel() > 0:
             recip_bias = recip.unsqueeze(0).expand(edge_len.shape[0], -1)
         for layer in self.attention_layers:
+            # Reinject the static ACE descriptor each layer to mimic iterative
+            # message passing over shared geometric features.
+            h = h + ace_base
             h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale, reciprocal_bias=recip_bias)
 
         scalars = self.scalar_norm(h[:, : self.hidden_dim])

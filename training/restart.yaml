@@ -15,7 +15,7 @@ r_max: 5
 l_max: 1
 num_radial: 20
 hidden_dim: 128
-num_layers: 1
+num_layers: 2
 radial_basis_type: "bessel"
 radial_trainable: false
 envelope_exponent: 5

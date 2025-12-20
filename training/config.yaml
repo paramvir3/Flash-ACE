@@ -15,7 +15,7 @@ r_max: 5
 l_max: 1
 num_radial: 20             # Slightly wider radial basis for single-layer robustness
 hidden_dim: 128
-num_layers: 1              # Single lightweight attention block
+num_layers: 2              # Two attention blocks for iterative mixing
 radial_basis_type: "bessel"       # Options: bessel, gaussian
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)
