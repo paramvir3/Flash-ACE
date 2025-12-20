@@ -31,6 +31,8 @@ class FlashACE(nn.Module):
         reciprocal_pe: bool = False,
         reciprocal_pe_dim: int = 8,
         debye_init: float = 1.0,
+        long_range_heads: int = 1,
+        long_range_mix: float = 0.5,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -70,6 +72,8 @@ class FlashACE(nn.Module):
                     share_qkv_mode=attention_share_qkv,
                     long_range_bins=self.reciprocal_bins,
                     debye_init=debye_init,
+                    long_range_heads=long_range_heads,
+                    long_range_mix=long_range_mix,
                 )
                 for _ in range(num_layers)
             ]

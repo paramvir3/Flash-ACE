@@ -65,6 +65,8 @@ class DenseFlashAttention(nn.Module):
         share_qkv_mode: str | bool = "none",
         long_range_bins: int = 0,
         debye_init: float = 1.0,
+        long_range_heads: int = 1,
+        long_range_mix: float = 0.5,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -72,6 +74,8 @@ class DenseFlashAttention(nn.Module):
         self.message_clip = message_clip
         self.use_conditioned_decay = use_conditioned_decay
         self.long_range_bins = max(0, int(long_range_bins))
+        self.long_range_heads = max(0, int(long_range_heads))
+        self.long_range_mix = nn.Parameter(torch.tensor(float(long_range_mix)))
         self.debye_kappa = nn.Parameter(torch.tensor(float(debye_init)))
         if isinstance(share_qkv_mode, bool):
             share_qkv_mode = "all" if share_qkv_mode else "none"
@@ -144,7 +148,8 @@ class DenseFlashAttention(nn.Module):
 
         self.w_out = o3.Linear(irreps_in, irreps_in)
         if self.long_range_bins > 0:
-            self.long_range_bias = nn.Parameter(torch.zeros(num_heads, self.long_range_bins))
+            lr_heads = max(1, self.long_range_heads)
+            self.long_range_bias = nn.Parameter(torch.zeros(lr_heads, self.long_range_bins))
         else:
             self.register_parameter("long_range_bias", None)
         self.reset_parameters()
@@ -270,12 +275,11 @@ class DenseFlashAttention(nn.Module):
             - F.softplus(self.debye_kappa).float() * edge_len.float()
         )
         if reciprocal_bias is not None and self.long_range_bias is not None:
-            # reciprocal_bias: (num_edges, bins) or None
-            # apply learned per-bin bias per head
-            rb = reciprocal_bias  # (E, B)
-            # combine: (H, B) * (E, B) -> (H, E)
+            # reciprocal_bias: (E, B)
+            rb = reciprocal_bias
             lr_term = torch.einsum("hb,eb->he", self.long_range_bias, rb)
-            radial_logits = radial_logits + lr_term
+            mix = torch.clamp(torch.sigmoid(self.long_range_mix), min=0.0, max=1.0)
+            radial_logits = radial_logits + mix * lr_term
         radial_temp = F.softplus(
             self._radial_temp_bias[:, None]
             + self._radial_temp_weight[:, None] * edge_len
@@ -288,7 +292,8 @@ class DenseFlashAttention(nn.Module):
         ).sum(dim=-1).float()
         if reciprocal_bias is not None and self.long_range_bias is not None:
             lr_term = torch.einsum("hb,eb->he", self.long_range_bias, reciprocal_bias)
-            tangential_logits = tangential_logits + lr_term
+            mix = torch.clamp(torch.sigmoid(self.long_range_mix), min=0.0, max=1.0)
+            tangential_logits = tangential_logits + mix * lr_term
 
         num_edges = sender.numel()
         feature_dim = qk_proj.shape[-1]
