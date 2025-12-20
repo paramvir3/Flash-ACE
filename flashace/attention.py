@@ -1,13 +1,31 @@
-import importlib.util
+import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from e3nn import o3
 
-_torch_scatter_available = importlib.util.find_spec("torch_scatter") is not None
-if _torch_scatter_available:
+try:
     from torch_scatter import scatter_add, scatter_softmax
+
+    _torch_scatter_available = True
+except (ImportError, OSError) as exc:
+    _torch_scatter_available = False
+    torch_version = getattr(torch, "__version__", "unknown")
+    cuda_version = getattr(torch.version, "cuda", None) or "cpu"
+    warnings.warn(
+        (
+            "torch-scatter is missing or was built for a different torch/CUDA version.\n"
+            f"Detected torch=={torch_version} with CUDA={cuda_version}. "
+            "Install a matching wheel, e.g.:\n"
+            f"  pip install torch-scatter -f https://data.pyg.org/whl/torch-{torch_version}+cuXXX.html\n"
+            "Replace cuXXX with your CUDA tag (or +cpu for CPU-only builds). "
+            "Falling back to slower index_add; install the correct wheel for best performance."
+        ),
+        RuntimeWarning,
+    )
+    scatter_add = None
+    scatter_softmax = None
 
 
 class LocalMessagePassing(nn.Module):

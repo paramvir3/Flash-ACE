@@ -51,9 +51,31 @@ You can now switch the ACE radial basis between two families to probe descriptor
 
 Additional knobs: `envelope_exponent` controls how sharply the polynomial cutoff decays near `r_max` (higher exponents emulate the steep envelopes used in some tensored ACE variants). These levers let you test whether your system benefits more from oscillatory (Bessel) or localized (Gaussian) radial support without touching the architecture.
 
-
 ## Stress computation hygiene
 
 Stresses are now derived from a symmetric small-strain parameterization (six unique components) and normalized by the *deformed* cell volume. This mirrors the Cauchy stress definition used in ACE/MACE and avoids antisymmetric rotational artifacts or inflated stresses under volumetric deformation.
 
+## Installation notes (torch-scatter)
+
+`torch-scatter` must match your installed PyTorch and CUDA build. If the wheel is
+missing or ABI-incompatible, you will see import errors like
+`undefined symbol: _ZN5torch3jit17parseSchemaOrNameERKSs`. Install in this order:
+
+1. Install PyTorch for your CUDA version (example for CUDA 11.8):
+   ```bash
+   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+   ```
+2. Install the matching `torch-scatter` wheel (replace `2.2.1` and `cu118` with
+   your torch version/CUDA tag; use `+cpu` for CPU-only):
+   ```bash
+   pip install torch-scatter -f https://data.pyg.org/whl/torch-2.2.1+cu118.html
+   ```
+3. Install Flash-ACE (editable for development):
+   ```bash
+   pip install -e .
+   ```
+
+If `torch-scatter` is absent or mismatched, Flash-ACE will fall back to slower
+`index_add` operations and emit a warning—install the correct wheel for best
+performance.
 
