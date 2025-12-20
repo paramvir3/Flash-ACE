@@ -33,6 +33,7 @@ class FlashACE(nn.Module):
         debye_init: float = 1.0,
         long_range_heads: int = 1,
         long_range_mix: float = 0.5,
+        sparse_top_k: int | None = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -74,6 +75,7 @@ class FlashACE(nn.Module):
                     debye_init=debye_init,
                     long_range_heads=long_range_heads,
                     long_range_mix=long_range_mix,
+                    sparse_top_k=sparse_top_k,
                 )
                 for _ in range(num_layers)
             ]

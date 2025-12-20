@@ -68,6 +68,7 @@ class DenseFlashAttention(nn.Module):
         long_range_heads: int = 1,
         long_range_mix: float = 0.5,
         long_range_value_mix: float = 0.0,
+        sparse_top_k: int | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -79,6 +80,7 @@ class DenseFlashAttention(nn.Module):
         self.long_range_mix = nn.Parameter(torch.tensor(float(long_range_mix)))
         self.long_range_value_mix = nn.Parameter(torch.tensor(float(long_range_value_mix)))
         self.debye_kappa = nn.Parameter(torch.tensor(float(debye_init)))
+        self.sparse_top_k = None if sparse_top_k is None else max(1, int(sparse_top_k))
         if isinstance(share_qkv_mode, bool):
             share_qkv_mode = "all" if share_qkv_mode else "none"
         if share_qkv_mode not in {"none", "kv", "all"}:
@@ -151,7 +153,7 @@ class DenseFlashAttention(nn.Module):
         self.w_out = o3.Linear(irreps_in, irreps_in)
         if self.long_range_bins > 0:
             lr_heads = max(1, self.long_range_heads)
-            self.long_range_bias = nn.Parameter(torch.zeros(lr_heads, self.long_range_bins))
+        self.long_range_bias = nn.Parameter(torch.zeros(lr_heads, self.long_range_bins))
         else:
             self.register_parameter("long_range_bias", None)
         self.reset_parameters()
@@ -340,6 +342,22 @@ class DenseFlashAttention(nn.Module):
 
         radial_alpha = torch.nan_to_num(_segment_softmax(radial_logits))
         tangential_alpha = torch.nan_to_num(_segment_softmax(tangential_logits))
+
+        if self.sparse_top_k is not None and self.sparse_top_k > 0:
+            # Mask alphas to top-k per node per head for sparsity.
+            k = self.sparse_top_k
+            for h in range(num_heads):
+                for node in receiver.unique():
+                    idx = (receiver == node).nonzero(as_tuple=False).squeeze(-1)
+                    if idx.numel() > k:
+                        vals, order = radial_alpha[h, idx].topk(k)
+                        mask = torch.ones_like(radial_alpha[h, idx], dtype=bool)
+                        mask.scatter_(0, order, False)
+                        radial_alpha[h, idx[mask]] = 0.0
+                        vals, order = tangential_alpha[h, idx].topk(k)
+                        mask = torch.ones_like(tangential_alpha[h, idx], dtype=bool)
+                        mask.scatter_(0, order, False)
+                        tangential_alpha[h, idx[mask]] = 0.0
 
         mix_gate = torch.sigmoid(
             self._mix_bias[:, None]
