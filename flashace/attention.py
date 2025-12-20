@@ -1,5 +1,3 @@
-import warnings
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,25 +5,20 @@ from e3nn import o3
 
 try:
     from torch_scatter import scatter_add, scatter_softmax
-
-    _torch_scatter_available = True
 except (ImportError, OSError) as exc:
-    _torch_scatter_available = False
     torch_version = getattr(torch, "__version__", "unknown")
     cuda_version = getattr(torch.version, "cuda", None) or "cpu"
-    warnings.warn(
+    cuda_tag = "cpu" if cuda_version == "cpu" else f"cu{cuda_version.replace('.', '')}"
+    raise ImportError(
         (
-            "torch-scatter is missing or was built for a different torch/CUDA version.\n"
+            "torch-scatter is required and must match your torch/CUDA build. "
             f"Detected torch=={torch_version} with CUDA={cuda_version}. "
-            "Install a matching wheel, e.g.:\n"
-            f"  pip install torch-scatter -f https://data.pyg.org/whl/torch-{torch_version}+cuXXX.html\n"
-            "Replace cuXXX with your CUDA tag (or +cpu for CPU-only builds). "
-            "Falling back to slower index_add; install the correct wheel for best performance."
-        ),
-        RuntimeWarning,
-    )
-    scatter_add = None
-    scatter_softmax = None
+            "Install a matching wheel before running FlashACE, e.g.:\n"
+            f"  pip install --force-reinstall torch-scatter -f "
+            f"https://data.pyg.org/whl/torch-{torch_version}+{cuda_tag}.html\n"
+            "Replace the CUDA tag if your torch build differs."
+        )
+    ) from exc
 
 
 class LocalMessagePassing(nn.Module):
@@ -59,14 +52,8 @@ class LocalMessagePassing(nn.Module):
 
         messages = weights[:, None].to(x.dtype) * x[sender]
 
-        if _torch_scatter_available:
-            agg = scatter_add(messages, receiver, dim=0, dim_size=x.size(0))
-            degree = scatter_add(torch.ones_like(edge_len), receiver, dim=0, dim_size=x.size(0))
-        else:
-            agg = torch.zeros_like(x)
-            agg = agg.index_add(0, receiver, messages)
-            degree = torch.zeros(x.size(0), device=x.device, dtype=edge_len.dtype)
-            degree = degree.index_add(0, receiver, torch.ones_like(edge_len))
+        agg = scatter_add(messages, receiver, dim=0, dim_size=x.size(0))
+        degree = scatter_add(torch.ones_like(edge_len), receiver, dim=0, dim_size=x.size(0))
 
         norm = torch.clamp(degree, min=1.0).unsqueeze(-1)
         agg = agg / norm
@@ -334,36 +321,9 @@ class DenseFlashAttention(nn.Module):
 
         def _segment_softmax(logits):
             # logits: (heads, num_edges)
-            if _torch_scatter_available:
-                return scatter_softmax(
-                    logits, expanded_receiver, dim=1, dim_size=num_nodes
-                )
-
-            max_init = torch.full(
-                (num_heads, num_nodes),
-                float("-inf"),
-                device=logits.device,
-                dtype=logits.dtype,
+            return scatter_softmax(
+                logits, expanded_receiver, dim=1, dim_size=num_nodes
             )
-            max_per_node = max_init.scatter_reduce(
-                1,
-                expanded_receiver,
-                logits,
-                reduce="amax",
-                include_self=True,
-            )
-            max_per_node = torch.where(
-                torch.isfinite(max_per_node), max_per_node, torch.zeros_like(max_per_node)
-            )
-
-            centered = logits - max_per_node.gather(1, expanded_receiver)
-            exp_logits = torch.exp(centered)
-
-            denom = torch.zeros_like(max_per_node).scatter_add(
-                1, expanded_receiver, exp_logits
-            )
-            alpha = exp_logits / (denom.gather(1, expanded_receiver) + 1e-9)
-            return torch.nan_to_num(alpha)
 
         # Optional sparse masking (DeepSeek-style top-k) applied pre-softmax per node/head.
         def _apply_topk(logits, k_val):
@@ -417,17 +377,10 @@ class DenseFlashAttention(nn.Module):
             safe = norms + 1e-8
             scale = torch.tanh(norms / clip) * (clip / safe)
             weighted_delta = weighted_delta * scale
-        if _torch_scatter_available:
-            out = scatter_add(
-                weighted_delta,
-                expanded_receiver[:, :, None].expand(-1, -1, feature_dim),
-                dim=1,
-                dim_size=num_nodes,
-            )
-        else:
-            out = out.scatter_add(
-                1,
-                expanded_receiver[:, :, None].expand(-1, -1, feature_dim),
-                weighted_delta,
-            )
+        out = scatter_add(
+            weighted_delta,
+            expanded_receiver[:, :, None].expand(-1, -1, feature_dim),
+            dim=1,
+            dim_size=num_nodes,
+        )
         return out.mean(dim=0)

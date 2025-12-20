@@ -72,11 +72,9 @@ missing or ABI-incompatible, you will see import errors like
    ```
 3. Install Flash-ACE (editable for development):
    ```bash
-   pip install -e .            # base install (will fall back to index_add)
-   # OR pull in torch-scatter automatically if a matching wheel is available:
-   pip install -e .[scatter]
+   pip install -e .
    ```
 
-If `torch-scatter` is absent or mismatched, Flash-ACE will fall back to slower
-`index_add` operations and emit a warning—install the correct wheel for best
-performance.
+If `torch-scatter` is absent or ABI-mismatched, the import will fail with
+guidance to install the correct wheel—ensure steps (1) and (2) match your
+Torch/CUDA build before installing Flash-ACE.
