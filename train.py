@@ -6,6 +6,14 @@ import torch
 import torch.optim as optim
 import numpy as np
 import time
+
+# Prefer the newer torch.amp.GradScaler when available to avoid deprecation warnings
+# on recent PyTorch versions, but fall back to torch.cuda.amp.GradScaler for older
+# releases.
+try:
+    from torch.amp import GradScaler  # PyTorch 2.0+
+except (ImportError, AttributeError):  # pragma: no cover - older torch versions
+    from torch.cuda.amp import GradScaler
 from ase.io import read
 from ase.data import atomic_numbers, chemical_symbols
 from e3nn import o3
@@ -388,7 +396,7 @@ def main():
     resume_path = config.get('resume_from')
     start_epoch = 0
 
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = GradScaler(enabled=use_amp)
 
     if resume_path:
         print(f"--- Loading checkpoint from {resume_path} ---")
@@ -477,7 +485,7 @@ def main():
 
     ckpt_interval = int(config.get('checkpoint_interval', 0) or 0)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = GradScaler(enabled=use_amp)
 
     # Temperature curriculum for attention sharpness.
     temp_scale_start = float(config.get('temperature_scale_start', 1.0))
