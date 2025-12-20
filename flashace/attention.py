@@ -340,24 +340,25 @@ class DenseFlashAttention(nn.Module):
             alpha = exp_logits / (denom.gather(1, expanded_receiver) + 1e-9)
             return torch.nan_to_num(alpha)
 
-        radial_alpha = torch.nan_to_num(_segment_softmax(radial_logits))
-        tangential_alpha = torch.nan_to_num(_segment_softmax(tangential_logits))
-
+        # Optional sparse masking (DeepSeek-style top-k) applied pre-softmax per node/head.
         if self.sparse_top_k is not None and self.sparse_top_k > 0:
-            # Mask alphas to top-k per node per head for sparsity.
             k = self.sparse_top_k
+            unique_nodes = receiver.unique()
             for h in range(num_heads):
-                for node in receiver.unique():
+                for node in unique_nodes:
                     idx = (receiver == node).nonzero(as_tuple=False).squeeze(-1)
                     if idx.numel() > k:
-                        vals, order = radial_alpha[h, idx].topk(k)
-                        mask = torch.ones_like(radial_alpha[h, idx], dtype=bool)
-                        mask.scatter_(0, order, False)
-                        radial_alpha[h, idx[mask]] = 0.0
-                        vals, order = tangential_alpha[h, idx].topk(k)
-                        mask = torch.ones_like(tangential_alpha[h, idx], dtype=bool)
-                        mask.scatter_(0, order, False)
-                        tangential_alpha[h, idx[mask]] = 0.0
+                        topk_vals, topk_idx = torch.topk(radial_logits[h, idx], k)
+                        mask = torch.ones_like(radial_logits[h, idx], dtype=torch.bool)
+                        mask.scatter_(0, topk_idx, False)
+                        radial_logits[h, idx[mask]] = float("-inf")
+                        topk_vals_t, topk_idx_t = torch.topk(tangential_logits[h, idx], k)
+                        mask_t = torch.ones_like(tangential_logits[h, idx], dtype=torch.bool)
+                        mask_t.scatter_(0, topk_idx_t, False)
+                        tangential_logits[h, idx[mask_t]] = float("-inf")
+
+        radial_alpha = torch.nan_to_num(_segment_softmax(radial_logits))
+        tangential_alpha = torch.nan_to_num(_segment_softmax(tangential_logits))
 
         mix_gate = torch.sigmoid(
             self._mix_bias[:, None]
