@@ -155,7 +155,7 @@ class DenseFlashAttention(nn.Module):
         self.w_out = o3.Linear(irreps_in, irreps_in)
         if self.long_range_bins > 0:
             lr_heads = max(1, self.long_range_heads)
-        self.long_range_bias = nn.Parameter(torch.zeros(lr_heads, self.long_range_bins))
+            self.long_range_bias = nn.Parameter(torch.zeros(lr_heads, self.long_range_bins))
         else:
             self.register_parameter("long_range_bias", None)
         self.reset_parameters()
