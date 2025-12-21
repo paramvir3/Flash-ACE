@@ -18,12 +18,18 @@ class DenseFlashAttention(nn.Module):
         message_clip: float | None = None,
         use_conditioned_decay: bool = True,
         share_qkv_mode: str | bool = "none",
+        scalar_pre_norm: bool = True,
+        layer_scale_init_value: float | None = 1e-2,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.feature_dim = o3.Irreps(irreps_in).dim
+        self.hidden_dim = hidden_dim
         self.message_clip = message_clip
         self.use_conditioned_decay = use_conditioned_decay
+        self.scalar_pre_norm = scalar_pre_norm
+        self.layer_scale_init_value = layer_scale_init_value
         if isinstance(share_qkv_mode, bool):
             share_qkv_mode = "all" if share_qkv_mode else "none"
         if share_qkv_mode not in {"none", "kv", "all"}:
@@ -94,6 +100,13 @@ class DenseFlashAttention(nn.Module):
         )
 
         self.w_out = o3.Linear(irreps_in, irreps_in)
+        self.scalar_norm = nn.LayerNorm(hidden_dim) if scalar_pre_norm else None
+        self.layer_scale = (
+            nn.Parameter(torch.full((self.feature_dim,), layer_scale_init_value))
+            if layer_scale_init_value is not None
+            else None
+        )
+        self.drop_path_rate = drop_path_rate
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -130,12 +143,18 @@ class DenseFlashAttention(nn.Module):
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight)
                     nn.init.zeros_(m.bias)
+        if self.layer_scale is not None and self.layer_scale_init_value is not None:
+            nn.init.constant_(self.layer_scale, self.layer_scale_init_value)
 
     def forward(self, x, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0):
         sender, receiver = edge_index
         num_nodes = x.shape[0]
         if sender.numel() == 0:
             return x
+
+        if self.scalar_norm is not None:
+            scalars, rest = x[..., : self.hidden_dim], x[..., self.hidden_dim :]
+            x = torch.cat((self.scalar_norm(scalars), rest), dim=-1)
 
         if self.share_qkv_mode == "all":
             energy_base = self.w_proj_shared(x)
@@ -166,7 +185,16 @@ class DenseFlashAttention(nn.Module):
         )
 
         out = torch.nan_to_num(out)
-        return x + self.w_out(out)
+        out = self.w_out(out)
+        if self.layer_scale is not None:
+            out = out * self.layer_scale
+        if self.drop_path_rate > 0.0 and self.training:
+            keep_prob = 1 - self.drop_path_rate
+            shape = (out.shape[0],) + (1,) * (out.ndim - 1)
+            random_tensor = keep_prob + torch.rand(shape, dtype=out.dtype, device=out.device)
+            random_tensor = torch.floor(random_tensor)
+            out = out / keep_prob * random_tensor
+        return x + out
 
     def _geometric_decomposition_attention(
         self,
