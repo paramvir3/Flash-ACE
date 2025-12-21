@@ -6,10 +6,10 @@ setup(
     packages=find_packages(),
     install_requires=[
         "torch>=2.0.0",
+        "torch-scatter",
         "e3nn>=0.5.0",
-        "torch-scatter",  # Critical for graph operations
         "ase",
         "numpy",
         "pyyaml"          # Required for reading config.yaml
-    ]
+    ],
 )

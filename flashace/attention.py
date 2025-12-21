@@ -1,13 +1,63 @@
-import importlib.util
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from e3nn import o3
 
-_torch_scatter_available = importlib.util.find_spec("torch_scatter") is not None
-if _torch_scatter_available:
+try:
     from torch_scatter import scatter_add, scatter_softmax
+except (ImportError, OSError) as exc:
+    torch_version = getattr(torch, "__version__", "unknown")
+    cuda_version = getattr(torch.version, "cuda", None) or "cpu"
+    cuda_tag = "cpu" if cuda_version == "cpu" else f"cu{cuda_version.replace('.', '')}"
+    raise ImportError(
+        (
+            "torch-scatter is required and must match your torch/CUDA build. "
+            f"Detected torch=={torch_version} with CUDA={cuda_version}. "
+            "Install a matching wheel before running FlashACE, e.g.:\n"
+            f"  pip install --force-reinstall torch-scatter -f "
+            f"https://data.pyg.org/whl/torch-{torch_version}+{cuda_tag}.html\n"
+            "Replace the CUDA tag if your torch build differs."
+        )
+    ) from exc
+
+
+class LocalMessagePassing(nn.Module):
+    """Lightweight locality-preserving block to sharpen force learning.
+
+    This module aggregates neighbor features with a distance-decaying scalar
+    kernel, then mixes them back into the node representation with an equivariant
+    linear map. Because the weights depend only on distances (scalars), the
+    operation preserves the irreps structure while reinforcing short-range
+    correlations.
+    """
+
+    def __init__(self, irreps_in, sharpness: float = 6.0):
+        super().__init__()
+        self.feature_dim = o3.Irreps(irreps_in).dim
+        self.irreps_in = o3.Irreps(irreps_in)
+        self.mix = o3.Linear(self.irreps_in, self.irreps_in)
+        self.distance_log_scale = nn.Parameter(torch.tensor(sharpness).log())
+        # Lightweight scalar gate: a single linear avoids extra hidden activations.
+        self.filter = nn.Linear(1, 1)
+
+    def forward(self, x, edge_index, edge_len):
+        if edge_index.numel() == 0:
+            return x
+
+        sender, receiver = edge_index
+        scale = torch.exp(self.distance_log_scale).to(edge_len.dtype)
+        decay = torch.exp(-torch.clamp(edge_len / (scale + 1e-6), min=0.0) ** 2)
+        gate = torch.sigmoid(self.filter(edge_len[:, None]).squeeze(-1))
+        weights = torch.nan_to_num(decay * gate, nan=0.0, posinf=0.0, neginf=0.0)
+
+        messages = weights[:, None].to(x.dtype) * x[sender]
+
+        agg = scatter_add(messages, receiver, dim=0, dim_size=x.size(0))
+        degree = scatter_add(torch.ones_like(edge_len), receiver, dim=0, dim_size=x.size(0))
+
+        norm = torch.clamp(degree, min=1.0).unsqueeze(-1)
+        agg = agg / norm
+        return x + self.mix(agg)
 
 class DenseFlashAttention(nn.Module):
     def __init__(
@@ -18,12 +68,30 @@ class DenseFlashAttention(nn.Module):
         message_clip: float | None = None,
         use_conditioned_decay: bool = True,
         share_qkv_mode: str | bool = "none",
+        long_range_bins: int = 0,
+        debye_init: float = 1.0,
+        long_range_heads: int = 1,
+        long_range_mix: float = 0.5,
+        long_range_value_mix: float = 0.0,
+        sparse_top_k: int | None = None,
+        sparse_top_k_long: int | None = None,
+        use_sparse_topk: bool = False,
+        use_debye_gate: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.feature_dim = o3.Irreps(irreps_in).dim
         self.message_clip = message_clip
         self.use_conditioned_decay = use_conditioned_decay
+        self.long_range_bins = max(0, int(long_range_bins))
+        self.long_range_heads = max(0, int(long_range_heads))
+        self.long_range_mix = nn.Parameter(torch.tensor(float(long_range_mix)))
+        self.long_range_value_mix = nn.Parameter(torch.tensor(float(long_range_value_mix)))
+        self.use_debye_gate = use_debye_gate
+        self.debye_kappa = nn.Parameter(torch.tensor(float(debye_init)))
+        self.use_sparse_topk = use_sparse_topk
+        self.sparse_top_k = None if sparse_top_k is None else max(1, int(sparse_top_k))
+        self.sparse_top_k_long = None if sparse_top_k_long is None else max(1, int(sparse_top_k_long))
         if isinstance(share_qkv_mode, bool):
             share_qkv_mode = "all" if share_qkv_mode else "none"
         if share_qkv_mode not in {"none", "kv", "all"}:
@@ -94,6 +162,11 @@ class DenseFlashAttention(nn.Module):
         )
 
         self.w_out = o3.Linear(irreps_in, irreps_in)
+        if self.long_range_bins > 0:
+            lr_heads = max(1, self.long_range_heads)
+            self.long_range_bias = nn.Parameter(torch.zeros(lr_heads, self.long_range_bins))
+        else:
+            self.register_parameter("long_range_bias", None)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -131,38 +204,43 @@ class DenseFlashAttention(nn.Module):
                     nn.init.xavier_uniform_(m.weight)
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0):
+    def forward(self, x, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0, reciprocal_bias=None):
         sender, receiver = edge_index
         num_nodes = x.shape[0]
         if sender.numel() == 0:
             return x
 
+        # These projections are generic node embeddings (queries/keys) rather than
+        # energy-specific features. The radial/tangential projections provide the
+        # value streams mixed into the updated representation, keeping a clean
+        # separation between scoring features and message content.
         if self.share_qkv_mode == "all":
-            energy_base = self.w_proj_shared(x)
+            qk_base = self.w_proj_shared(x)
             radial_base = self.radial_update_shared(x)
             tangential_base = self.tangential_update_shared(x)
-            energy_proj = energy_base.unsqueeze(0).expand(self.num_heads, -1, -1)
+            qk_proj = qk_base.unsqueeze(0).expand(self.num_heads, -1, -1)
             radial_proj = radial_base.unsqueeze(0).expand(self.num_heads, -1, -1)
             tangential_proj = tangential_base.unsqueeze(0).expand(self.num_heads, -1, -1)
         elif self.share_qkv_mode == "kv":
-            energy_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
+            qk_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
             radial_base = self.radial_update_shared(x)
             tangential_base = self.tangential_update_shared(x)
             radial_proj = radial_base.unsqueeze(0).expand(self.num_heads, -1, -1)
             tangential_proj = tangential_base.unsqueeze(0).expand(self.num_heads, -1, -1)
         else:
-            energy_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
+            qk_proj = torch.stack([layer(x) for layer in self.w_proj], dim=0)
             radial_proj = torch.stack([layer(x) for layer in self.radial_update], dim=0)
             tangential_proj = torch.stack([layer(x) for layer in self.tangential_update], dim=0)
 
         out = self._geometric_decomposition_attention(
-            energy_proj,
+            qk_proj,
             radial_proj,
             tangential_proj,
             sender,
             receiver,
             edge_len,
             temperature_scale=temperature_scale,
+            reciprocal_bias=reciprocal_bias,
         )
 
         out = torch.nan_to_num(out)
@@ -170,26 +248,29 @@ class DenseFlashAttention(nn.Module):
 
     def _geometric_decomposition_attention(
         self,
-        energy_proj,
+        qk_proj,
         radial_proj,
         tangential_proj,
         sender,
         receiver,
         edge_len,
         temperature_scale: float,
+        reciprocal_bias=None,
     ):
         # *_proj are shaped (num_heads, num_nodes, feature_dim)
-        num_heads = energy_proj.shape[0]
-        num_nodes = energy_proj.shape[1]
+        num_heads = qk_proj.shape[0]
+        num_nodes = qk_proj.shape[1]
 
-        energy_delta = energy_proj[:, sender] - energy_proj[:, receiver]
+        # qk_proj drives the scoring (queries/keys) while radial/tangential
+        # projections carry the values that get mixed into the updated features.
+        qk_delta = qk_proj[:, sender] - qk_proj[:, receiver]
         radial_delta = radial_proj[:, sender] - radial_proj[:, receiver]
         tangential_delta = tangential_proj[:, sender] - tangential_proj[:, receiver]
 
         # Radial energy penalizes long bonds, tangential is distance agnostic.
         radial_distance_scale = F.softplus(self._radial_distance_log_scale).to(edge_len.dtype)[:, None]
 
-        receiver_feat = energy_proj[:, receiver]  # (heads, edges, feature_dim)
+        receiver_feat = qk_proj[:, receiver]  # (heads, edges, feature_dim)
         if self.use_conditioned_decay:
             decay_offset = torch.stack(
                 [mlp(receiver_feat[h]).squeeze(-1) for h, mlp in enumerate(self.radial_decay_mlp)],
@@ -200,13 +281,21 @@ class DenseFlashAttention(nn.Module):
                 dim=0,
             )
         else:
-            decay_offset = torch.zeros_like(energy_delta[..., 0])
-            temp_offset = torch.zeros_like(energy_delta[..., 0])
+            decay_offset = torch.zeros_like(qk_delta[..., 0])
+            temp_offset = torch.zeros_like(qk_delta[..., 0])
 
         radial_logits = (
-            (energy_delta * self.radial_score[:, None, :]).sum(dim=-1).float()
+            (qk_delta * self.radial_score[:, None, :]).sum(dim=-1).float()
             - (radial_distance_scale + decay_offset).float() * edge_len.float()
         )
+        if self.use_debye_gate:
+            radial_logits = radial_logits - F.softplus(self.debye_kappa).float() * edge_len.float()
+        if reciprocal_bias is not None and self.long_range_bias is not None:
+            # reciprocal_bias: (E, B)
+            rb = reciprocal_bias
+            lr_term = torch.einsum("hb,eb->he", self.long_range_bias, rb)
+            mix = torch.clamp(torch.sigmoid(self.long_range_mix), min=0.0, max=1.0)
+            radial_logits = radial_logits + mix * lr_term
         radial_temp = F.softplus(
             self._radial_temp_bias[:, None]
             + self._radial_temp_weight[:, None] * edge_len
@@ -215,12 +304,16 @@ class DenseFlashAttention(nn.Module):
         radial_temp = (radial_temp * temperature_scale).float()
         radial_logits = radial_logits / (radial_temp + 1e-4)
         tangential_logits = (
-            energy_delta * self.tangential_score[:, None, :]
+            qk_delta * self.tangential_score[:, None, :]
         ).sum(dim=-1).float()
+        if reciprocal_bias is not None and self.long_range_bias is not None:
+            lr_term = torch.einsum("hb,eb->he", self.long_range_bias, reciprocal_bias)
+            mix = torch.clamp(torch.sigmoid(self.long_range_mix), min=0.0, max=1.0)
+            tangential_logits = tangential_logits + mix * lr_term
 
         num_edges = sender.numel()
-        feature_dim = energy_proj.shape[-1]
-        out = torch.zeros_like(energy_proj)
+        feature_dim = qk_proj.shape[-1]
+        out = torch.zeros_like(qk_proj)
         if num_edges == 0:
             return out.mean(dim=0)
 
@@ -228,36 +321,37 @@ class DenseFlashAttention(nn.Module):
 
         def _segment_softmax(logits):
             # logits: (heads, num_edges)
-            if _torch_scatter_available:
-                return scatter_softmax(
-                    logits, expanded_receiver, dim=1, dim_size=num_nodes
-                )
-
-            max_init = torch.full(
-                (num_heads, num_nodes),
-                float("-inf"),
-                device=logits.device,
-                dtype=logits.dtype,
-            )
-            max_per_node = max_init.scatter_reduce(
-                1,
-                expanded_receiver,
-                logits,
-                reduce="amax",
-                include_self=True,
-            )
-            max_per_node = torch.where(
-                torch.isfinite(max_per_node), max_per_node, torch.zeros_like(max_per_node)
+            return scatter_softmax(
+                logits, expanded_receiver, dim=1, dim_size=num_nodes
             )
 
-            centered = logits - max_per_node.gather(1, expanded_receiver)
-            exp_logits = torch.exp(centered)
+        # Optional sparse masking (DeepSeek-style top-k) applied pre-softmax per node/head.
+        def _apply_topk(logits, k_val):
+            if k_val is None or k_val <= 0:
+                return logits
+            unique_nodes = receiver.unique()
+            for h in range(num_heads):
+                for node in unique_nodes:
+                    idx = (receiver == node).nonzero(as_tuple=False).squeeze(-1)
+                    if idx.numel() > k_val:
+                        topk_vals, topk_idx = torch.topk(logits[h, idx], k_val)
+                        mask = torch.ones_like(logits[h, idx], dtype=torch.bool)
+                        mask.scatter_(0, topk_idx, False)
+                        logits[h, idx[mask]] = float("-inf")
+            return logits
 
-            denom = torch.zeros_like(max_per_node).scatter_add(
-                1, expanded_receiver, exp_logits
-            )
-            alpha = exp_logits / (denom.gather(1, expanded_receiver) + 1e-9)
-            return torch.nan_to_num(alpha)
+        if self.use_sparse_topk:
+            radial_logits = _apply_topk(radial_logits, self.sparse_top_k)
+            tangential_logits = _apply_topk(tangential_logits, self.sparse_top_k)
+        # Optional separate sparsity for long-range bias path if provided.
+        if (
+            self.use_sparse_topk
+            and reciprocal_bias is not None
+            and self.long_range_bias is not None
+            and self.sparse_top_k_long
+        ):
+            radial_logits = _apply_topk(radial_logits, self.sparse_top_k_long)
+            tangential_logits = _apply_topk(tangential_logits, self.sparse_top_k_long)
 
         radial_alpha = torch.nan_to_num(_segment_softmax(radial_logits))
         tangential_alpha = torch.nan_to_num(_segment_softmax(tangential_logits))
@@ -273,23 +367,20 @@ class DenseFlashAttention(nn.Module):
         ) * tangential_delta
 
         weighted_delta = blended_alpha[..., None].to(blended_delta.dtype) * blended_delta
+        if reciprocal_bias is not None and self.long_range_bias is not None:
+            lr_term = torch.einsum("hb,eb->he", self.long_range_bias, reciprocal_bias)
+            lr_mix = torch.clamp(torch.sigmoid(self.long_range_value_mix), min=0.0, max=1.0)
+            weighted_delta = weighted_delta + lr_mix[..., None] * lr_term[..., None].expand_as(weighted_delta)
         if self.message_clip is not None:
             clip = torch.tensor(self.message_clip, device=weighted_delta.device, dtype=weighted_delta.dtype)
             norms = weighted_delta.norm(dim=-1, keepdim=True)
             safe = norms + 1e-8
             scale = torch.tanh(norms / clip) * (clip / safe)
             weighted_delta = weighted_delta * scale
-        if _torch_scatter_available:
-            out = scatter_add(
-                weighted_delta,
-                expanded_receiver[:, :, None].expand(-1, -1, feature_dim),
-                dim=1,
-                dim_size=num_nodes,
-            )
-        else:
-            out = out.scatter_add(
-                1,
-                expanded_receiver[:, :, None].expand(-1, -1, feature_dim),
-                weighted_delta,
-            )
+        out = scatter_add(
+            weighted_delta,
+            expanded_receiver[:, :, None].expand(-1, -1, feature_dim),
+            dim=1,
+            dim_size=num_nodes,
+        )
         return out.mean(dim=0)
