@@ -336,9 +336,12 @@ def main():
         model.parameters(), lr=config['learning_rate'], amsgrad=True,
         weight_decay=config.get('weight_decay', 0.0)
     )
-    total_t_max = max(1, int(config.get('lr_scheduler_t_max', config['epochs'])))
     warmup_epochs = max(0, int(config.get('lr_warmup_epochs', 0)))
     warmup_start = float(config.get('lr_warmup_start_factor', 0.1))
+    if warmup_start <= 0.0:
+        raise ValueError("lr_warmup_start_factor must be > 0.0")
+    configured_t_max = int(config.get('lr_scheduler_t_max', config['epochs']))
+    total_t_max = max(warmup_epochs + 1, configured_t_max)
     cosine_t_max = max(1, total_t_max - warmup_epochs)
 
     cosine = optim.lr_scheduler.CosineAnnealingLR(

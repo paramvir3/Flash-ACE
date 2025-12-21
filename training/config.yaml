@@ -32,7 +32,7 @@ learning_rate: 0.002             # Slightly higher to emphasize force updates
 weight_decay: 0.0
 lr_scheduler_t_max: 300          # Epochs for one cosine cycle (defaults to total epochs)
 lr_warmup_epochs: 0              # Linear warmup steps before cosine annealing
-lr_warmup_start_factor: 0.1      # Starting LR factor for warmup (fraction of base LR)
+lr_warmup_start_factor: 0.1      # Starting LR factor for warmup (fraction of base LR, must be > 0)
 lr_min: 0.00005
 clip_grad_norm: 1.0
 use_amp: true                    # Enable mixed precision on CUDA for speed
