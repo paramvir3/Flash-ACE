@@ -336,12 +336,29 @@ def main():
         model.parameters(), lr=config['learning_rate'], amsgrad=True,
         weight_decay=config.get('weight_decay', 0.0)
     )
-    t_max = max(1, int(config.get('lr_scheduler_t_max', config['epochs'])))
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+    total_t_max = max(1, int(config.get('lr_scheduler_t_max', config['epochs'])))
+    warmup_epochs = max(0, int(config.get('lr_warmup_epochs', 0)))
+    warmup_start = float(config.get('lr_warmup_start_factor', 0.1))
+    cosine_t_max = max(1, total_t_max - warmup_epochs)
+
+    cosine = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=t_max,
+        T_max=cosine_t_max,
         eta_min=config.get('lr_min', 0.0),
     )
+    if warmup_epochs > 0:
+        warmup = optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=warmup_start,
+            total_iters=warmup_epochs,
+        )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[warmup_epochs],
+        )
+    else:
+        scheduler = cosine
 
     resume_path = config.get('resume_from')
     start_epoch = 0
