@@ -336,12 +336,11 @@ def main():
         model.parameters(), lr=config['learning_rate'], amsgrad=True,
         weight_decay=config.get('weight_decay', 0.0)
     )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    t_max = max(1, int(config.get('lr_scheduler_t_max', config['epochs'])))
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        mode='min',
-        factor=config.get('lr_scheduler_factor', 0.8),
-        patience=config.get('lr_scheduler_patience', 15),
-        min_lr=config.get('lr_min', 0.0),
+        T_max=t_max,
+        eta_min=config.get('lr_min', 0.0),
     )
 
     resume_path = config.get('resume_from')
@@ -597,7 +596,7 @@ def main():
         avg_val_loss = val_loss_accum / len(val_atoms)
         val_e, val_f, val_s, val_f_mse, val_f_mae = val_metrics.get_metrics()
         history['val_loss'].append(avg_val_loss)
-        scheduler.step(avg_val_loss)
+        scheduler.step()
 
         print(
             f"{epoch+1:5d} | "

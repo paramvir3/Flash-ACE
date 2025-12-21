@@ -30,8 +30,7 @@ batch_size: 8
 learning_rate: 0.002             # Slightly higher to emphasize force updates
 # Optional optimizer and scheduler tweaks
 weight_decay: 0.0
-lr_scheduler_factor: 0.5
-lr_scheduler_patience: 6         # Faster LR reductions if plateaus
+lr_scheduler_t_max: 300          # Epochs for one cosine cycle (defaults to total epochs)
 lr_min: 0.00005
 clip_grad_norm: 1.0
 use_amp: true                    # Enable mixed precision on CUDA for speed
