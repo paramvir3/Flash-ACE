@@ -18,6 +18,9 @@ class FlashACE(nn.Module):
         attention_message_clip: float | None = None,
         attention_conditioned_decay: bool = True,
         attention_share_qkv: str | bool = "none",
+        attention_scalar_pre_norm: bool = True,
+        attention_layer_scale_init: float | None = 1e-2,
+        drop_path_rate: float = 0.0,
         use_aux_force_head: bool = True,
         use_aux_stress_head: bool = True,
     ):
@@ -28,6 +31,9 @@ class FlashACE(nn.Module):
         self.attention_message_clip = attention_message_clip
         self.attention_conditioned_decay = attention_conditioned_decay
         self.attention_share_qkv = attention_share_qkv
+        self.attention_scalar_pre_norm = attention_scalar_pre_norm
+        self.attention_layer_scale_init = attention_layer_scale_init
+        self.drop_path_rate = drop_path_rate
         self.use_aux_force_head = use_aux_force_head
         self.use_aux_stress_head = use_aux_stress_head
 
@@ -43,6 +49,7 @@ class FlashACE(nn.Module):
             gaussian_width=gaussian_width,
         )
         
+        dpr_values = torch.linspace(0, drop_path_rate, num_layers) if num_layers > 0 else torch.tensor([])
         self.layers = nn.ModuleList([
             DenseFlashAttention(
                 self.ace.irreps_out,
@@ -50,8 +57,11 @@ class FlashACE(nn.Module):
                 message_clip=attention_message_clip,
                 use_conditioned_decay=attention_conditioned_decay,
                 share_qkv_mode=attention_share_qkv,
+                scalar_pre_norm=attention_scalar_pre_norm,
+                layer_scale_init_value=attention_layer_scale_init,
+                drop_path_rate=float(dpr_values[i]) if len(dpr_values) > 0 else 0.0,
             )
-            for _ in range(num_layers)
+            for i in range(num_layers)
         ])
         
         self.readout = nn.Sequential(

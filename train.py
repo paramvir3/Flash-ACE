@@ -342,7 +342,6 @@ def main():
         factor=config.get('lr_scheduler_factor', 0.8),
         patience=config.get('lr_scheduler_patience', 15),
         min_lr=config.get('lr_min', 0.0),
-        verbose=True
     )
 
     resume_path = config.get('resume_from')
