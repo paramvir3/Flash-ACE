@@ -50,6 +50,7 @@ class FlashACE(nn.Module):
         use_aux_force_head: bool = True,
         use_aux_stress_head: bool = True,
         message_passing_layers: int = 0,
+        interleave_descriptor: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -66,6 +67,7 @@ class FlashACE(nn.Module):
         self.use_aux_force_head = use_aux_force_head
         self.use_aux_stress_head = use_aux_stress_head
         self.message_passing_layers = max(0, int(message_passing_layers))
+        self.interleave_descriptor = bool(interleave_descriptor)
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -84,19 +86,23 @@ class FlashACE(nn.Module):
         )
 
         dpr_values = torch.linspace(0, drop_path_rate, num_layers) if num_layers > 0 else torch.tensor([])
-        self.layers = nn.ModuleList([
-            DenseFlashAttention(
-                self.ace.irreps_out,
-                hidden_dim,
-                message_clip=attention_message_clip,
-                use_conditioned_decay=attention_conditioned_decay,
-                share_qkv_mode=attention_share_qkv,
-                scalar_pre_norm=attention_scalar_pre_norm,
-                layer_scale_init_value=attention_layer_scale_init,
-                drop_path_rate=float(dpr_values[i]) if len(dpr_values) > 0 else 0.0,
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            self.layers.append(
+                DenseFlashAttention(
+                    self.ace.irreps_out,
+                    hidden_dim,
+                    message_clip=attention_message_clip,
+                    use_conditioned_decay=attention_conditioned_decay,
+                    share_qkv_mode=attention_share_qkv,
+                    scalar_pre_norm=attention_scalar_pre_norm,
+                    layer_scale_init_value=attention_layer_scale_init,
+                    drop_path_rate=float(dpr_values[i]) if len(dpr_values) > 0 else 0.0,
+                )
             )
-            for i in range(num_layers)
-        ])
+            if self.interleave_descriptor:
+                # Lightweight descriptor refresh between attention blocks; uses scalar slice.
+                self.layers.append("descriptor_refresh")
         
         self.readout = nn.Sequential(
             nn.Linear(hidden_dim, 64), 
@@ -166,6 +172,11 @@ class FlashACE(nn.Module):
         for mp_layer in self.mp_layers:
             h = mp_layer(h, edge_index, edge_len)
         for layer in self.layers:
+            if layer == "descriptor_refresh":
+                scalars = h[..., : self.hidden_dim]
+                desc = self.ace(scalars, edge_index, edge_vec, edge_len)
+                h = h + desc if self.descriptor_residual else desc
+                continue
             h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
             
         # 2. Readout

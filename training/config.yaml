@@ -19,6 +19,7 @@ num_layers: 2
 descriptor_passes: 1            # Number of ACE descriptor iterations before attention
 descriptor_residual: true       # Add descriptor outputs residually across passes
 message_passing_layers: 0        # Optional scalar-only message passing steps before attention
+interleave_descriptor: false     # Refresh descriptor between attention blocks
 radial_basis_type: "bessel"       # Options: bessel, gaussian
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)
