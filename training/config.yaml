@@ -58,6 +58,8 @@ solve_atomic_energies: false      # Fit species reference energies from the trai
 # ------------------------------------------------------------------------------
 energy_weight: 1.0
 forces_weight: 10.0              # Emphasize forces early
+forces_weight_final: 10.0        # Optional target force weight to anneal toward
+forces_weight_decay_epochs: 0    # Epochs to linearly decay force weight (0 = no decay)
 stress_weight: 0.0               # Disable unless stresses are critical
 
 # Auxiliary and regularization weights
