@@ -39,6 +39,8 @@ class FlashACE(nn.Module):
         radial_trainable: bool = False,
         envelope_exponent: int = 5,
         gaussian_width: float = 0.5,
+        descriptor_passes: int = 1,
+        descriptor_residual: bool = True,
         attention_message_clip: float | None = None,
         attention_conditioned_decay: bool = True,
         attention_share_qkv: str | bool = "none",
@@ -53,6 +55,8 @@ class FlashACE(nn.Module):
         self.hidden_dim = hidden_dim
         self.r_max = r_max
         self.l_max = l_max
+        self.descriptor_passes = max(1, int(descriptor_passes))
+        self.descriptor_residual = bool(descriptor_residual)
         self.attention_message_clip = attention_message_clip
         self.attention_conditioned_decay = attention_conditioned_decay
         self.attention_share_qkv = attention_share_qkv
@@ -149,9 +153,16 @@ class FlashACE(nn.Module):
         edge_vec = pos[edge_index[0]] - pos[edge_index[1]]
         edge_len = torch.norm(edge_vec, dim=1)
         
-        # 1. Pipeline (No checkpoints)
+        # 1. Descriptor iterations (optionally residual) before message passing / attention.
         h = self.emb(z)
-        h = self.ace(h, edge_index, edge_vec, edge_len)
+        for i in range(self.descriptor_passes):
+            scalars = h[..., : self.hidden_dim]
+            desc = self.ace(scalars, edge_index, edge_vec, edge_len)
+            if i == 0 or not self.descriptor_residual:
+                h = desc
+            else:
+                h = h + desc
+
         for mp_layer in self.mp_layers:
             h = mp_layer(h, edge_index, edge_len)
         for layer in self.layers:
