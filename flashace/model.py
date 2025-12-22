@@ -3,6 +3,30 @@ import torch.nn as nn
 from .physics import ACE_Descriptor
 from .attention import DenseFlashAttention
 
+class ScalarMessagePassing(nn.Module):
+    """Lightweight, scalar-only message passing to mimic NequIP-style updates."""
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_len: torch.Tensor) -> torch.Tensor:
+        scalars, rest = h[..., : self.hidden_dim], h[..., self.hidden_dim :]
+        sender, receiver = edge_index
+        if sender.numel() == 0:
+            return h
+
+        msg_in = torch.cat([scalars[sender], scalars[receiver], edge_len.unsqueeze(-1)], dim=-1)
+        msgs = self.mlp(msg_in)
+        agg = torch.zeros_like(scalars)
+        agg.index_add_(0, receiver, msgs)
+        scalars = scalars + agg
+        return torch.cat([scalars, rest], dim=-1)
+
 class FlashACE(nn.Module):
     def __init__(
         self,
@@ -23,6 +47,7 @@ class FlashACE(nn.Module):
         drop_path_rate: float = 0.0,
         use_aux_force_head: bool = True,
         use_aux_stress_head: bool = True,
+        message_passing_layers: int = 0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -36,6 +61,7 @@ class FlashACE(nn.Module):
         self.drop_path_rate = drop_path_rate
         self.use_aux_force_head = use_aux_force_head
         self.use_aux_stress_head = use_aux_stress_head
+        self.message_passing_layers = max(0, int(message_passing_layers))
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -49,6 +75,10 @@ class FlashACE(nn.Module):
             gaussian_width=gaussian_width,
         )
         
+        self.mp_layers = nn.ModuleList(
+            [ScalarMessagePassing(hidden_dim) for _ in range(self.message_passing_layers)]
+        )
+
         dpr_values = torch.linspace(0, drop_path_rate, num_layers) if num_layers > 0 else torch.tensor([])
         self.layers = nn.ModuleList([
             DenseFlashAttention(
@@ -122,6 +152,8 @@ class FlashACE(nn.Module):
         # 1. Pipeline (No checkpoints)
         h = self.emb(z)
         h = self.ace(h, edge_index, edge_vec, edge_len)
+        for mp_layer in self.mp_layers:
+            h = mp_layer(h, edge_index, edge_len)
         for layer in self.layers:
             h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
             

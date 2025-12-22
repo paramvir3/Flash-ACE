@@ -16,6 +16,7 @@ l_max: 1
 num_radial: 12
 hidden_dim: 128
 num_layers: 2
+message_passing_layers: 0        # Optional scalar-only message passing steps before attention
 radial_basis_type: "bessel"       # Options: bessel, gaussian
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)
