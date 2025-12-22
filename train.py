@@ -338,27 +338,37 @@ def main():
     )
     warmup_epochs = max(0, int(config.get('lr_warmup_epochs', 0)))
     warmup_start = float(config.get('lr_warmup_start_factor', 0.1))
+    scheduler_interval = str(config.get('lr_scheduler_interval', 'epoch')).lower()
     if warmup_start <= 0.0:
         raise ValueError("lr_warmup_start_factor must be > 0.0")
+    if scheduler_interval not in {'epoch', 'step'}:
+        raise ValueError("lr_scheduler_interval must be 'epoch' or 'step'")
+
+    steps_per_epoch = max(1, len(train_loader))
     configured_t_max = int(config.get('lr_scheduler_t_max', config['epochs']))
-    total_t_max = max(warmup_epochs + 1, configured_t_max)
-    cosine_t_max = max(1, total_t_max - warmup_epochs)
+    if scheduler_interval == 'step':
+        warmup_iters = warmup_epochs * steps_per_epoch
+        total_iters = max(warmup_iters + 1, configured_t_max * steps_per_epoch)
+    else:
+        warmup_iters = warmup_epochs
+        total_iters = max(warmup_epochs + 1, configured_t_max)
+    cosine_t_max = max(1, total_iters - warmup_iters)
 
     cosine = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=cosine_t_max,
         eta_min=config.get('lr_min', 0.0),
     )
-    if warmup_epochs > 0:
+    if warmup_iters > 0:
         warmup = optim.lr_scheduler.LinearLR(
             optimizer,
             start_factor=warmup_start,
-            total_iters=warmup_epochs,
+            total_iters=warmup_iters,
         )
         scheduler = optim.lr_scheduler.SequentialLR(
             optimizer,
             schedulers=[warmup, cosine],
-            milestones=[warmup_epochs],
+            milestones=[warmup_iters],
         )
     else:
         scheduler = cosine
@@ -571,6 +581,8 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                if scheduler_interval == 'step':
+                    scheduler.step()
             total_loss += batch_loss
 
         # Flush any residual gradients if the last batch didn't trigger a step
@@ -583,6 +595,8 @@ def main():
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            if scheduler_interval == 'step':
+                scheduler.step()
 
         avg_train_loss = total_loss / max(1, total_items_seen)
         tr_e, tr_f, tr_s, tr_f_mse, tr_f_mae = train_metrics.get_metrics()
@@ -616,7 +630,8 @@ def main():
         avg_val_loss = val_loss_accum / len(val_atoms)
         val_e, val_f, val_s, val_f_mse, val_f_mae = val_metrics.get_metrics()
         history['val_loss'].append(avg_val_loss)
-        scheduler.step()
+        if scheduler_interval == 'epoch':
+            scheduler.step()
 
         print(
             f"{epoch+1:5d} | "
