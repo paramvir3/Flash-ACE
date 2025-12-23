@@ -27,6 +27,8 @@ radial_basis_type: "bessel"       # Options: bessel, gaussian
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)
 gaussian_width: 0.5              # Relative Gaussian width multiplier (only used if basis=gaussian)
+radial_mlp_hidden: 64           # Hidden width for the radial mixing MLP
+radial_mlp_layers: 2            # Layers for the radial mixing MLP
 
 # ------------------------------------------------------------------------------
 # 3. TRAINING PARAMETERS

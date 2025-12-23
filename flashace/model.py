@@ -114,6 +114,8 @@ class FlashACE(nn.Module):
         gaussian_width: float = 0.5,
         descriptor_passes: int = 1,
         descriptor_residual: bool = True,
+        radial_mlp_hidden: int = 64,
+        radial_mlp_layers: int = 2,
         attention_message_clip: float | None = None,
         attention_conditioned_decay: bool = True,
         attention_share_qkv: str | bool = "none",
@@ -158,6 +160,8 @@ class FlashACE(nn.Module):
             radial_trainable=radial_trainable,
             envelope_exponent=envelope_exponent,
             gaussian_width=gaussian_width,
+            radial_mlp_hidden=radial_mlp_hidden,
+            radial_mlp_layers=radial_mlp_layers,
         )
 
         self.mp_layers = nn.ModuleList(
