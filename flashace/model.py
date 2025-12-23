@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from e3nn import o3
 from .physics import ACE_Descriptor
 from .attention import DenseFlashAttention
 
