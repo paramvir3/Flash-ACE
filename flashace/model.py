@@ -149,6 +149,8 @@ class FlashACE(nn.Module):
         self.edge_update_per_layer = bool(edge_update_per_layer)
         self.node_update_mlp = bool(node_update_mlp)
         self.edge_state_dim = int(edge_state_dim) if edge_state_dim is not None else hidden_dim
+        self.edge_sh_irreps = o3.Irreps.spherical_harmonics(l_max)
+        self.edge_sh_dim = self.edge_sh_irreps.dim
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -274,7 +276,11 @@ class FlashACE(nn.Module):
                 h = self.edge_updates[idx](h, edge_index, edge_len)
             if self.edge_update_per_layer and len(self.edge_state_updates) > 0 and edge_state is not None:
                 edge_state = self.edge_state_updates[idx](h[..., : self.hidden_dim], edge_index, edge_len, edge_state)
-            h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale, edge_attr=edge_state)
+            edge_attr = edge_state
+            if self.edge_update_per_layer:
+                edge_sh = o3.spherical_harmonics(self.edge_sh_irreps, edge_vec, normalize=True, normalization="component")
+                edge_attr = torch.cat([edge_state, edge_sh], dim=-1) if edge_state is not None else edge_sh
+            h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale, edge_attr=edge_attr)
             if self.node_update_mlp and len(self.node_updates) > 0:
                 h = self.node_updates[idx](h)
             

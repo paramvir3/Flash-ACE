@@ -104,6 +104,12 @@ class DenseFlashAttention(nn.Module):
 
         self.w_out = o3.Linear(irreps_in, irreps_in)
         self.scalar_norm = nn.LayerNorm(hidden_dim) if scalar_pre_norm else None
+        self.scalar_post_norm = nn.LayerNorm(hidden_dim)
+        self.scalar_gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
         self.layer_scale = (
             nn.Parameter(torch.full((self.feature_dim,), layer_scale_init_value))
             if layer_scale_init_value is not None
@@ -148,6 +154,10 @@ class DenseFlashAttention(nn.Module):
                     nn.init.zeros_(m.bias)
         if self.layer_scale is not None and self.layer_scale_init_value is not None:
             nn.init.constant_(self.layer_scale, self.layer_scale_init_value)
+        for m in self.scalar_gate.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0, edge_attr: torch.Tensor | None = None):
         sender, receiver = edge_index
@@ -198,6 +208,12 @@ class DenseFlashAttention(nn.Module):
             random_tensor = keep_prob + torch.rand(shape, dtype=out.dtype, device=out.device)
             random_tensor = torch.floor(random_tensor)
             out = out / keep_prob * random_tensor
+        # Scalar gating and normalization on block output
+        out_scalars, out_rest = out[..., : self.hidden_dim], out[..., self.hidden_dim :]
+        gated = self.scalar_gate(out_scalars)
+        if self.scalar_post_norm is not None:
+            out_scalars = self.scalar_post_norm(out_scalars)
+        out = torch.cat([out_scalars * torch.sigmoid(gated), out_rest], dim=-1)
         return x + out
 
     def _geometric_decomposition_attention(
