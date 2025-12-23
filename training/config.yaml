@@ -38,6 +38,8 @@ lr_scheduler_t_max: 300          # Epochs for one cosine cycle (defaults to tota
 lr_warmup_epochs: 0              # Linear warmup steps before cosine annealing
 lr_warmup_start_factor: 0.1      # Starting LR factor for warmup (fraction of base LR, must be > 0)
 lr_scheduler_interval: "epoch"   # Apply LR schedule per 'epoch' or per 'step' for faster ramping
+lr_scheduler_use_restarts: false # Use cosine annealing with warm restarts instead of a single cycle
+lr_restart_mult: 1.0             # Restart period multiplier for CosineAnnealingWarmRestarts
 lr_min: 0.00005
 clip_grad_norm: 1.0
 use_amp: true                    # Enable mixed precision on CUDA for speed

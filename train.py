@@ -354,11 +354,21 @@ def main():
         total_iters = max(warmup_epochs + 1, configured_t_max)
     cosine_t_max = max(1, total_iters - warmup_iters)
 
-    cosine = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=cosine_t_max,
-        eta_min=config.get('lr_min', 0.0),
-    )
+    use_restarts = bool(config.get('lr_scheduler_use_restarts', False))
+    restart_mult = float(config.get('lr_restart_mult', 1.0))
+    if use_restarts:
+        cosine = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=cosine_t_max,
+            T_mult=max(1.0, restart_mult),
+            eta_min=config.get('lr_min', 0.0),
+        )
+    else:
+        cosine = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cosine_t_max,
+            eta_min=config.get('lr_min', 0.0),
+        )
     if warmup_iters > 0:
         warmup = optim.lr_scheduler.LinearLR(
             optimizer,
