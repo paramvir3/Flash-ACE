@@ -152,6 +152,8 @@ class FlashACE(nn.Module):
         self.edge_state_dim = int(edge_state_dim) if edge_state_dim is not None else hidden_dim
         self.edge_sh_irreps = o3.Irreps.spherical_harmonics(l_max)
         self.edge_sh_dim = self.edge_sh_irreps.dim
+        self.edge_irreps = o3.Irreps(f"{hidden_dim}x0e + {max(1, hidden_dim//4)}x1e")
+        self.node_scalar_irreps = o3.Irreps(f"{hidden_dim}x0e")
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -173,13 +175,15 @@ class FlashACE(nn.Module):
         self.edge_updates = nn.ModuleList(
             [EdgeUpdate(hidden_dim) for _ in range(num_layers)] if self.edge_update_per_layer else []
         )
-        self.edge_state_init = EdgeStateInit(hidden_dim, self.edge_state_dim) if self.edge_update_per_layer else None
-        self.edge_state_updates = nn.ModuleList(
-            [EdgeStateUpdate(hidden_dim, self.edge_state_dim) for _ in range(num_layers)] if self.edge_update_per_layer else []
-        )
         self.node_updates = nn.ModuleList(
             [NodeUpdateMLP(hidden_dim) for _ in range(num_layers)] if self.node_update_mlp else []
         )
+        self.edge_tp_sender = o3.FullyConnectedTensorProduct(
+            self.node_scalar_irreps, self.edge_sh_irreps, self.edge_irreps
+        ) if self.edge_update_per_layer else None
+        self.edge_tp_receiver = o3.FullyConnectedTensorProduct(
+            self.node_scalar_irreps, self.edge_sh_irreps, self.edge_irreps
+        ) if self.edge_update_per_layer else None
 
         dpr_values = torch.linspace(0, drop_path_rate, num_layers) if num_layers > 0 else torch.tensor([])
         self.layers = nn.ModuleList([
@@ -265,8 +269,10 @@ class FlashACE(nn.Module):
             h = mp_layer(h, edge_index, edge_len)
 
         edge_state = None
-        if self.edge_update_per_layer and self.edge_state_init is not None:
-            edge_state = self.edge_state_init(h[..., : self.hidden_dim], edge_index, edge_len)
+        edge_sh = None
+        sender, receiver = edge_index
+        if self.edge_update_per_layer:
+            edge_sh = o3.spherical_harmonics(self.edge_sh_irreps, edge_vec, normalize=True, normalization="component")
 
         for idx, layer in enumerate(self.layers):
             if self.interleave_descriptor:
@@ -275,12 +281,13 @@ class FlashACE(nn.Module):
                 h = h + desc if self.descriptor_residual else desc
             if self.edge_update_per_layer and len(self.edge_updates) > 0:
                 h = self.edge_updates[idx](h, edge_index, edge_len)
-            if self.edge_update_per_layer and len(self.edge_state_updates) > 0 and edge_state is not None:
-                edge_state = self.edge_state_updates[idx](h[..., : self.hidden_dim], edge_index, edge_len, edge_state)
             edge_attr = edge_state
             if self.edge_update_per_layer:
-                edge_sh = o3.spherical_harmonics(self.edge_sh_irreps, edge_vec, normalize=True, normalization="component")
-                edge_attr = torch.cat([edge_state, edge_sh], dim=-1) if edge_state is not None else edge_sh
+                h_scalars = h[..., : self.hidden_dim]
+                edge_attr_sender = self.edge_tp_sender(h_scalars[sender], edge_sh)
+                edge_attr_receiver = self.edge_tp_receiver(h_scalars[receiver], edge_sh)
+                edge_state = edge_attr_sender + edge_attr_receiver
+                edge_attr = edge_state
             h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale, edge_attr=edge_attr)
             if self.node_update_mlp and len(self.node_updates) > 0:
                 h = self.node_updates[idx](h)
