@@ -27,6 +27,30 @@ class ScalarMessagePassing(nn.Module):
         scalars = scalars + agg
         return torch.cat([scalars, rest], dim=-1)
 
+class EdgeUpdate(nn.Module):
+    """Per-layer scalar edge update that refreshes node scalars from current states."""
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_len: torch.Tensor) -> torch.Tensor:
+        scalars, rest = h[..., : self.hidden_dim], h[..., self.hidden_dim :]
+        sender, receiver = edge_index
+        if sender.numel() == 0:
+            return h
+
+        msg_in = torch.cat([scalars[sender], scalars[receiver], edge_len.unsqueeze(-1)], dim=-1)
+        msgs = self.mlp(msg_in)
+        agg = torch.zeros_like(scalars)
+        agg.index_add_(0, receiver, msgs)
+        scalars = scalars + agg
+        return torch.cat([scalars, rest], dim=-1)
+
 class FlashACE(nn.Module):
     def __init__(
         self,
@@ -51,6 +75,7 @@ class FlashACE(nn.Module):
         use_aux_stress_head: bool = True,
         message_passing_layers: int = 0,
         interleave_descriptor: bool = False,
+        edge_update_per_layer: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -68,6 +93,7 @@ class FlashACE(nn.Module):
         self.use_aux_stress_head = use_aux_stress_head
         self.message_passing_layers = max(0, int(message_passing_layers))
         self.interleave_descriptor = bool(interleave_descriptor)
+        self.edge_update_per_layer = bool(edge_update_per_layer)
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -80,9 +106,12 @@ class FlashACE(nn.Module):
             envelope_exponent=envelope_exponent,
             gaussian_width=gaussian_width,
         )
-        
+
         self.mp_layers = nn.ModuleList(
             [ScalarMessagePassing(hidden_dim) for _ in range(self.message_passing_layers)]
+        )
+        self.edge_updates = nn.ModuleList(
+            [EdgeUpdate(hidden_dim) for _ in range(num_layers)] if self.edge_update_per_layer else []
         )
 
         dpr_values = torch.linspace(0, drop_path_rate, num_layers) if num_layers > 0 else torch.tensor([])
@@ -167,11 +196,13 @@ class FlashACE(nn.Module):
 
         for mp_layer in self.mp_layers:
             h = mp_layer(h, edge_index, edge_len)
-        for layer in self.layers:
+        for idx, layer in enumerate(self.layers):
             if self.interleave_descriptor:
                 scalars = h[..., : self.hidden_dim]
                 desc = self.ace(scalars, edge_index, edge_vec, edge_len)
                 h = h + desc if self.descriptor_residual else desc
+            if self.edge_update_per_layer and len(self.edge_updates) > 0:
+                h = self.edge_updates[idx](h, edge_index, edge_len)
             h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
             
         # 2. Readout
