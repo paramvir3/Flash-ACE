@@ -21,6 +21,8 @@ descriptor_residual: true       # Add descriptor outputs residually across passe
 message_passing_layers: 0        # Optional scalar-only message passing steps before attention
 interleave_descriptor: false     # Refresh descriptor between attention blocks
 edge_update_per_layer: false     # Apply a scalar edge update before each attention block
+edge_state_dim: 128              # Dimension of learned edge embeddings (defaults to hidden_dim)
+node_update_mlp: false           # Apply per-block node MLP after attention
 radial_basis_type: "bessel"       # Options: bessel, gaussian
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)

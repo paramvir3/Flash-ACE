@@ -51,6 +51,55 @@ class EdgeUpdate(nn.Module):
         scalars = scalars + agg
         return torch.cat([scalars, rest], dim=-1)
 
+class EdgeStateInit(nn.Module):
+    """Initialize per-edge embeddings from current node scalars and distances."""
+    def __init__(self, node_dim: int, edge_state_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(node_dim * 2 + 1, edge_state_dim),
+            nn.SiLU(),
+            nn.Linear(edge_state_dim, edge_state_dim),
+        )
+
+    def forward(self, scalars: torch.Tensor, edge_index: torch.Tensor, edge_len: torch.Tensor) -> torch.Tensor:
+        sender, receiver = edge_index
+        if sender.numel() == 0:
+            return torch.zeros((0, self.mlp[-1].out_features), device=scalars.device, dtype=scalars.dtype)
+        msg_in = torch.cat([scalars[sender], scalars[receiver], edge_len.unsqueeze(-1)], dim=-1)
+        return self.mlp(msg_in)
+
+class EdgeStateUpdate(nn.Module):
+    """Update edge embeddings from current node scalars and previous edge state."""
+    def __init__(self, node_dim: int, edge_state_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(node_dim * 2 + edge_state_dim + 1, edge_state_dim),
+            nn.SiLU(),
+            nn.Linear(edge_state_dim, edge_state_dim),
+        )
+
+    def forward(self, scalars: torch.Tensor, edge_index: torch.Tensor, edge_len: torch.Tensor, edge_state: torch.Tensor) -> torch.Tensor:
+        sender, receiver = edge_index
+        if sender.numel() == 0:
+            return edge_state
+        msg_in = torch.cat([scalars[sender], scalars[receiver], edge_state, edge_len.unsqueeze(-1)], dim=-1)
+        return self.mlp(msg_in)
+
+class NodeUpdateMLP(nn.Module):
+    """Irrep-aware node update on scalars only (post-aggregation)."""
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        scalars, rest = h[..., : self.mlp[0].in_features], h[..., self.mlp[0].in_features :]
+        scalars = scalars + self.mlp(scalars)
+        return torch.cat([scalars, rest], dim=-1)
+
 class FlashACE(nn.Module):
     def __init__(
         self,
@@ -76,6 +125,8 @@ class FlashACE(nn.Module):
         message_passing_layers: int = 0,
         interleave_descriptor: bool = False,
         edge_update_per_layer: bool = False,
+        edge_state_dim: int | None = None,
+        node_update_mlp: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -94,6 +145,8 @@ class FlashACE(nn.Module):
         self.message_passing_layers = max(0, int(message_passing_layers))
         self.interleave_descriptor = bool(interleave_descriptor)
         self.edge_update_per_layer = bool(edge_update_per_layer)
+        self.node_update_mlp = bool(node_update_mlp)
+        self.edge_state_dim = int(edge_state_dim) if edge_state_dim is not None else hidden_dim
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -112,6 +165,13 @@ class FlashACE(nn.Module):
         )
         self.edge_updates = nn.ModuleList(
             [EdgeUpdate(hidden_dim) for _ in range(num_layers)] if self.edge_update_per_layer else []
+        )
+        self.edge_state_init = EdgeStateInit(hidden_dim, self.edge_state_dim) if self.edge_update_per_layer else None
+        self.edge_state_updates = nn.ModuleList(
+            [EdgeStateUpdate(hidden_dim, self.edge_state_dim) for _ in range(num_layers)] if self.edge_update_per_layer else []
+        )
+        self.node_updates = nn.ModuleList(
+            [NodeUpdateMLP(hidden_dim) for _ in range(num_layers)] if self.node_update_mlp else []
         )
 
         dpr_values = torch.linspace(0, drop_path_rate, num_layers) if num_layers > 0 else torch.tensor([])
@@ -183,7 +243,7 @@ class FlashACE(nn.Module):
 
         edge_vec = pos[edge_index[0]] - pos[edge_index[1]]
         edge_len = torch.norm(edge_vec, dim=1)
-        
+
         # 1. Descriptor iterations (optionally residual) before message passing / attention.
         h = self.emb(z)
         for i in range(self.descriptor_passes):
@@ -196,6 +256,11 @@ class FlashACE(nn.Module):
 
         for mp_layer in self.mp_layers:
             h = mp_layer(h, edge_index, edge_len)
+
+        edge_state = None
+        if self.edge_update_per_layer and self.edge_state_init is not None:
+            edge_state = self.edge_state_init(h[..., : self.hidden_dim], edge_index, edge_len)
+
         for idx, layer in enumerate(self.layers):
             if self.interleave_descriptor:
                 scalars = h[..., : self.hidden_dim]
@@ -203,7 +268,11 @@ class FlashACE(nn.Module):
                 h = h + desc if self.descriptor_residual else desc
             if self.edge_update_per_layer and len(self.edge_updates) > 0:
                 h = self.edge_updates[idx](h, edge_index, edge_len)
-            h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
+            if self.edge_update_per_layer and len(self.edge_state_updates) > 0 and edge_state is not None:
+                edge_state = self.edge_state_updates[idx](h[..., : self.hidden_dim], edge_index, edge_len, edge_state)
+            h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale, edge_attr=edge_state)
+            if self.node_update_mlp and len(self.node_updates) > 0:
+                h = self.node_updates[idx](h)
             
         # 2. Readout
         # Note: We extract only the scalar (L=0) features for energy
