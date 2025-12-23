@@ -21,6 +21,8 @@ class DenseFlashAttention(nn.Module):
         scalar_pre_norm: bool = True,
         layer_scale_init_value: float | None = 1e-2,
         drop_path_rate: float = 0.0,
+        edge_film: bool = False,
+        edge_film_hidden: int | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -30,6 +32,7 @@ class DenseFlashAttention(nn.Module):
         self.use_conditioned_decay = use_conditioned_decay
         self.scalar_pre_norm = scalar_pre_norm
         self.layer_scale_init_value = layer_scale_init_value
+        self.edge_film = bool(edge_film)
         if isinstance(share_qkv_mode, bool):
             share_qkv_mode = "all" if share_qkv_mode else "none"
         if share_qkv_mode not in {"none", "kv", "all"}:
@@ -59,6 +62,12 @@ class DenseFlashAttention(nn.Module):
 
         # Edge attribute projection (shared across heads) for optional edge embeddings.
         self.edge_attr_proj = nn.Linear(hidden_dim, self.feature_dim)
+        film_hidden = edge_film_hidden or max(1, self.feature_dim // 2)
+        self.edge_film_mlp = nn.Sequential(
+            nn.Linear(self.feature_dim, film_hidden),
+            nn.SiLU(),
+            nn.Linear(film_hidden, 2 * self.feature_dim),
+        )
 
         # Geometry-aware scoring vectors
         self.radial_score = nn.Parameter(
@@ -158,6 +167,10 @@ class DenseFlashAttention(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
+        for m in self.edge_film_mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0, edge_attr: torch.Tensor | None = None):
         sender, receiver = edge_index
@@ -238,6 +251,10 @@ class DenseFlashAttention(nn.Module):
         if edge_attr is not None:
             # Project edge attributes to feature dim and broadcast per head
             edge_attr_proj = self.edge_attr_proj(edge_attr)  # (edges, feature_dim)
+            if self.edge_film:
+                film = self.edge_film_mlp(edge_attr_proj)
+                gamma, beta = film.split(self.feature_dim, dim=-1)
+                edge_attr_proj = edge_attr_proj * (1.0 + torch.tanh(gamma)) + beta
             edge_attr_proj = edge_attr_proj.unsqueeze(0).expand(num_heads, -1, -1)
             energy_delta = energy_delta + edge_attr_proj
             radial_delta = radial_delta + edge_attr_proj
