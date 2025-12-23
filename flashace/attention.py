@@ -57,6 +57,9 @@ class DenseFlashAttention(nn.Module):
                 [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
             )
 
+        # Edge attribute projection (shared across heads) for optional edge embeddings.
+        self.edge_attr_proj = nn.Linear(hidden_dim, self.feature_dim)
+
         # Geometry-aware scoring vectors
         self.radial_score = nn.Parameter(
             torch.empty(num_heads, self.feature_dim)
@@ -146,7 +149,7 @@ class DenseFlashAttention(nn.Module):
         if self.layer_scale is not None and self.layer_scale_init_value is not None:
             nn.init.constant_(self.layer_scale, self.layer_scale_init_value)
 
-    def forward(self, x, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0):
+    def forward(self, x, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0, edge_attr: torch.Tensor | None = None):
         sender, receiver = edge_index
         num_nodes = x.shape[0]
         if sender.numel() == 0:
@@ -182,6 +185,7 @@ class DenseFlashAttention(nn.Module):
             receiver,
             edge_len,
             temperature_scale=temperature_scale,
+            edge_attr=edge_attr,
         )
 
         out = torch.nan_to_num(out)
@@ -205,6 +209,7 @@ class DenseFlashAttention(nn.Module):
         receiver,
         edge_len,
         temperature_scale: float,
+        edge_attr: torch.Tensor | None = None,
     ):
         # *_proj are shaped (num_heads, num_nodes, feature_dim)
         num_heads = energy_proj.shape[0]
@@ -213,6 +218,14 @@ class DenseFlashAttention(nn.Module):
         energy_delta = energy_proj[:, sender] - energy_proj[:, receiver]
         radial_delta = radial_proj[:, sender] - radial_proj[:, receiver]
         tangential_delta = tangential_proj[:, sender] - tangential_proj[:, receiver]
+
+        if edge_attr is not None:
+            # Project edge attributes to feature dim and broadcast per head
+            edge_attr_proj = self.edge_attr_proj(edge_attr)  # (edges, feature_dim)
+            edge_attr_proj = edge_attr_proj.unsqueeze(0).expand(num_heads, -1, -1)
+            energy_delta = energy_delta + edge_attr_proj
+            radial_delta = radial_delta + edge_attr_proj
+            tangential_delta = tangential_delta + edge_attr_proj
 
         # Radial energy penalizes long bonds, tangential is distance agnostic.
         radial_distance_scale = F.softplus(self._radial_distance_log_scale).to(edge_len.dtype)[:, None]
