@@ -23,6 +23,8 @@ class ScalarMessagePassing(nn.Module):
 
         msg_in = torch.cat([scalars[sender], scalars[receiver], edge_len.unsqueeze(-1)], dim=-1)
         msgs = self.mlp(msg_in)
+        if msgs.dtype != scalars.dtype:
+            msgs = msgs.to(scalars.dtype)
         agg = torch.zeros_like(scalars)
         agg.index_add_(0, receiver, msgs)
         scalars = scalars + agg
@@ -47,6 +49,8 @@ class EdgeUpdate(nn.Module):
 
         msg_in = torch.cat([scalars[sender], scalars[receiver], edge_len.unsqueeze(-1)], dim=-1)
         msgs = self.mlp(msg_in)
+        if msgs.dtype != scalars.dtype:
+            msgs = msgs.to(scalars.dtype)
         agg = torch.zeros_like(scalars)
         agg.index_add_(0, receiver, msgs)
         scalars = scalars + agg
