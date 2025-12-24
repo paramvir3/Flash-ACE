@@ -134,6 +134,7 @@ class FlashACE(nn.Module):
         attention_edge_film_hidden: int | None = None,
         attention_scalar_post_norm: bool = False,
         attention_scalar_post_gate: bool = False,
+        attention_tensor_post_gate: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -162,6 +163,7 @@ class FlashACE(nn.Module):
         self.attention_edge_film_hidden = attention_edge_film_hidden
         self.attention_scalar_post_norm = bool(attention_scalar_post_norm)
         self.attention_scalar_post_gate = bool(attention_scalar_post_gate)
+        self.attention_tensor_post_gate = bool(attention_tensor_post_gate)
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -208,6 +210,7 @@ class FlashACE(nn.Module):
                 edge_film_hidden=self.attention_edge_film_hidden,
                 scalar_post_norm=self.attention_scalar_post_norm,
                 scalar_post_gate=self.attention_scalar_post_gate,
+                tensor_post_gate=self.attention_tensor_post_gate,
             )
             for i in range(num_layers)
         ])

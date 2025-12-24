@@ -25,6 +25,7 @@ class DenseFlashAttention(nn.Module):
         edge_film_hidden: int | None = None,
         scalar_post_norm: bool = False,
         scalar_post_gate: bool = False,
+        tensor_post_gate: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -37,6 +38,7 @@ class DenseFlashAttention(nn.Module):
         self.edge_film = bool(edge_film)
         self.scalar_post_norm_enabled = bool(scalar_post_norm)
         self.scalar_post_gate_enabled = bool(scalar_post_gate)
+        self.tensor_post_gate_enabled = bool(tensor_post_gate)
         if isinstance(share_qkv_mode, bool):
             share_qkv_mode = "all" if share_qkv_mode else "none"
         if share_qkv_mode not in {"none", "kv", "all"}:
@@ -125,6 +127,15 @@ class DenseFlashAttention(nn.Module):
                 nn.SiLU(),
                 nn.Linear(hidden_dim, hidden_dim),
             )
+        self.tensor_gate = None
+        if self.tensor_post_gate_enabled:
+            rest_dim = self.feature_dim - hidden_dim
+            if rest_dim > 0:
+                self.tensor_gate = nn.Sequential(
+                    nn.Linear(hidden_dim, rest_dim),
+                    nn.SiLU(),
+                    nn.Linear(rest_dim, rest_dim),
+                )
         self.layer_scale = (
             nn.Parameter(torch.full((self.feature_dim,), layer_scale_init_value))
             if layer_scale_init_value is not None
@@ -171,6 +182,11 @@ class DenseFlashAttention(nn.Module):
             nn.init.constant_(self.layer_scale, self.layer_scale_init_value)
         if self.scalar_gate is not None:
             for m in self.scalar_gate.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.zeros_(m.bias)
+        if self.tensor_gate is not None:
+            for m in self.tensor_gate.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight)
                     nn.init.zeros_(m.bias)
@@ -236,6 +252,9 @@ class DenseFlashAttention(nn.Module):
             if self.scalar_gate is not None:
                 gated = self.scalar_gate(out_scalars)
                 out_scalars = out_scalars * torch.sigmoid(gated)
+            if self.tensor_gate is not None and out_rest.numel() > 0:
+                tgate = self.tensor_gate(out_scalars)
+                out_rest = out_rest * torch.sigmoid(tgate)
             out = torch.cat([out_scalars, out_rest], dim=-1)
         return x + out
 
