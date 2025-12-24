@@ -165,6 +165,11 @@ class ACE_Descriptor(nn.Module):
         # Node Features (Scalar Input)
         self.irreps_node = o3.Irreps(f"{hidden_dim}x0e")
         # ------------------------------------------------------------------
+        self._scalar_slices = [
+            sl
+            for (mul, ir), sl in zip(self.irreps_out, self.irreps_out.slices())
+            if ir.l == 0
+        ]
 
         # 2. A-Basis Components
         self.radial_basis = ACERadialBasis(
@@ -216,6 +221,11 @@ class ACE_Descriptor(nn.Module):
 
         # Linear Mixing to recover full feature interactions
         self.mix = o3.Linear(self.tp_b.irreps_out, self.irreps_out)
+
+    def project_scalars(self, features: torch.Tensor) -> torch.Tensor:
+        if not self._scalar_slices:
+            raise ValueError("No scalar irreps found to project to invariants.")
+        return torch.cat([features[..., sl] for sl in self._scalar_slices], dim=-1)
 
     def forward(self, node_attrs, edge_index, edge_vec, edge_len):
         sender, receiver = edge_index

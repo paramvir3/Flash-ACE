@@ -19,6 +19,7 @@ class DenseFlashAttention(nn.Module):
         use_conditioned_decay: bool = True,
         share_qkv_mode: str | bool = "none",
         scalar_pre_norm: bool = True,
+        edge_attr_dim: int | None = None,
         layer_scale_init_value: float | None = 1e-2,
         drop_path_rate: float = 0.0,
         edge_film: bool = False,
@@ -67,7 +68,8 @@ class DenseFlashAttention(nn.Module):
             )
 
         # Edge attribute projection (shared across heads) for optional edge embeddings.
-        self.edge_attr_proj = nn.Linear(hidden_dim, self.feature_dim)
+        edge_attr_dim = edge_attr_dim or hidden_dim
+        self.edge_attr_proj = nn.Linear(edge_attr_dim, self.feature_dim)
         film_hidden = edge_film_hidden or max(1, self.feature_dim // 2)
         self.edge_film_mlp = nn.Sequential(
             nn.Linear(self.feature_dim, film_hidden),

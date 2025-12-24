@@ -18,6 +18,7 @@ hidden_dim: 128
 num_layers: 2
 descriptor_passes: 1            # Number of ACE descriptor iterations before attention
 descriptor_residual: true       # Add descriptor outputs residually across passes
+invariant_descriptor: false     # Use invariant (scalar-only) ACE descriptor features
 message_passing_layers: 0        # Optional scalar-only message passing steps before attention
 interleave_descriptor: false     # Refresh descriptor between attention blocks
 edge_update_per_layer: false     # Apply a scalar edge update before each attention block

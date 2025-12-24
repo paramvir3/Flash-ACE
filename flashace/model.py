@@ -130,6 +130,7 @@ class FlashACE(nn.Module):
         edge_update_per_layer: bool = False,
         edge_state_dim: int | None = None,
         node_update_mlp: bool = False,
+        invariant_descriptor: bool = False,
         attention_edge_film: bool = False,
         attention_edge_film_hidden: int | None = None,
         attention_scalar_post_norm: bool = False,
@@ -154,6 +155,7 @@ class FlashACE(nn.Module):
         self.interleave_descriptor = bool(interleave_descriptor)
         self.edge_update_per_layer = bool(edge_update_per_layer)
         self.node_update_mlp = bool(node_update_mlp)
+        self.invariant_descriptor = bool(invariant_descriptor)
         self.edge_state_dim = int(edge_state_dim) if edge_state_dim is not None else hidden_dim
         self.edge_sh_irreps = o3.Irreps.spherical_harmonics(l_max)
         self.edge_sh_dim = self.edge_sh_irreps.dim
@@ -178,6 +180,9 @@ class FlashACE(nn.Module):
             radial_mlp_hidden=radial_mlp_hidden,
             radial_mlp_layers=radial_mlp_layers,
         )
+        self.attention_irreps = (
+            o3.Irreps(f"{hidden_dim}x0e") if self.invariant_descriptor else self.ace.irreps_out
+        )
 
         self.mp_layers = nn.ModuleList(
             [ScalarMessagePassing(hidden_dim) for _ in range(self.message_passing_layers)]
@@ -198,12 +203,13 @@ class FlashACE(nn.Module):
         dpr_values = torch.linspace(0, drop_path_rate, num_layers) if num_layers > 0 else torch.tensor([])
         self.layers = nn.ModuleList([
             DenseFlashAttention(
-                self.ace.irreps_out,
+                self.attention_irreps,
                 hidden_dim,
                 message_clip=attention_message_clip,
                 use_conditioned_decay=attention_conditioned_decay,
                 share_qkv_mode=attention_share_qkv,
                 scalar_pre_norm=attention_scalar_pre_norm,
+                edge_attr_dim=self.edge_irreps.dim if self.edge_update_per_layer else None,
                 layer_scale_init_value=attention_layer_scale_init,
                 drop_path_rate=float(dpr_values[i]) if len(dpr_values) > 0 else 0.0,
                 edge_film=self.attention_edge_film,
@@ -274,7 +280,8 @@ class FlashACE(nn.Module):
         h = self.emb(z)
         for i in range(self.descriptor_passes):
             scalars = h[..., : self.hidden_dim]
-            desc = self.ace(scalars, edge_index, edge_vec, edge_len)
+            desc_full = self.ace(scalars, edge_index, edge_vec, edge_len)
+            desc = self.ace.project_scalars(desc_full) if self.invariant_descriptor else desc_full
             if i == 0 or not self.descriptor_residual:
                 h = desc
             else:
@@ -292,7 +299,8 @@ class FlashACE(nn.Module):
         for idx, layer in enumerate(self.layers):
             if self.interleave_descriptor:
                 scalars = h[..., : self.hidden_dim]
-                desc = self.ace(scalars, edge_index, edge_vec, edge_len)
+                desc_full = self.ace(scalars, edge_index, edge_vec, edge_len)
+                desc = self.ace.project_scalars(desc_full) if self.invariant_descriptor else desc_full
                 h = h + desc if self.descriptor_residual else desc
             if self.edge_update_per_layer and len(self.edge_updates) > 0:
                 h = self.edge_updates[idx](h, edge_index, edge_len)
