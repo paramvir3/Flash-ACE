@@ -23,6 +23,8 @@ class DenseFlashAttention(nn.Module):
         drop_path_rate: float = 0.0,
         edge_film: bool = False,
         edge_film_hidden: int | None = None,
+        scalar_post_norm: bool = False,
+        scalar_post_gate: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -33,6 +35,8 @@ class DenseFlashAttention(nn.Module):
         self.scalar_pre_norm = scalar_pre_norm
         self.layer_scale_init_value = layer_scale_init_value
         self.edge_film = bool(edge_film)
+        self.scalar_post_norm_enabled = bool(scalar_post_norm)
+        self.scalar_post_gate_enabled = bool(scalar_post_gate)
         if isinstance(share_qkv_mode, bool):
             share_qkv_mode = "all" if share_qkv_mode else "none"
         if share_qkv_mode not in {"none", "kv", "all"}:
@@ -113,12 +117,14 @@ class DenseFlashAttention(nn.Module):
 
         self.w_out = o3.Linear(irreps_in, irreps_in)
         self.scalar_norm = nn.LayerNorm(hidden_dim) if scalar_pre_norm else None
-        self.scalar_post_norm = nn.LayerNorm(hidden_dim)
-        self.scalar_gate = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
+        self.scalar_post_norm = nn.LayerNorm(hidden_dim) if self.scalar_post_norm_enabled else None
+        self.scalar_gate = None
+        if self.scalar_post_gate_enabled:
+            self.scalar_gate = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
         self.layer_scale = (
             nn.Parameter(torch.full((self.feature_dim,), layer_scale_init_value))
             if layer_scale_init_value is not None
@@ -163,10 +169,11 @@ class DenseFlashAttention(nn.Module):
                     nn.init.zeros_(m.bias)
         if self.layer_scale is not None and self.layer_scale_init_value is not None:
             nn.init.constant_(self.layer_scale, self.layer_scale_init_value)
-        for m in self.scalar_gate.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
+        if self.scalar_gate is not None:
+            for m in self.scalar_gate.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.zeros_(m.bias)
         for m in self.edge_film_mlp.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -222,11 +229,14 @@ class DenseFlashAttention(nn.Module):
             random_tensor = torch.floor(random_tensor)
             out = out / keep_prob * random_tensor
         # Scalar gating and normalization on block output
-        out_scalars, out_rest = out[..., : self.hidden_dim], out[..., self.hidden_dim :]
-        gated = self.scalar_gate(out_scalars)
-        if self.scalar_post_norm is not None:
-            out_scalars = self.scalar_post_norm(out_scalars)
-        out = torch.cat([out_scalars * torch.sigmoid(gated), out_rest], dim=-1)
+        if self.scalar_post_norm is not None or self.scalar_gate is not None:
+            out_scalars, out_rest = out[..., : self.hidden_dim], out[..., self.hidden_dim :]
+            if self.scalar_post_norm is not None:
+                out_scalars = self.scalar_post_norm(out_scalars)
+            if self.scalar_gate is not None:
+                gated = self.scalar_gate(out_scalars)
+                out_scalars = out_scalars * torch.sigmoid(gated)
+            out = torch.cat([out_scalars, out_rest], dim=-1)
         return x + out
 
     def _geometric_decomposition_attention(
