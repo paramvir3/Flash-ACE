@@ -19,3 +19,5 @@ python train.py --config training/config.yaml
 ## The main problem 
 
 Energies converge, not forces
+
+Transfomer block improves
