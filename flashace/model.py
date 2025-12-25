@@ -106,19 +106,44 @@ class NodeUpdateMLP(nn.Module):
 
 class TransformerBlock(nn.Module):
     """Full transformer block with pre-norm attention and FFN on all channels."""
-    def __init__(self, feature_dim: int, num_heads: int, ffn_hidden: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        feature_dim: int,
+        num_heads: int,
+        ffn_hidden: int,
+        dropout: float = 0.0,
+        residual_dropout: float = 0.0,
+        ffn_gated: bool = False,
+        layer_scale_init: float | None = None,
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(feature_dim)
         self.attn = nn.MultiheadAttention(
             feature_dim, num_heads, dropout=dropout, batch_first=True
         )
         self.norm2 = nn.LayerNorm(feature_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(feature_dim, ffn_hidden),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_hidden, feature_dim),
-            nn.Dropout(dropout),
+        self.ffn_gated = ffn_gated
+        if ffn_gated:
+            self.ffn_in = nn.Linear(feature_dim, ffn_hidden * 2)
+            self.ffn_out = nn.Linear(ffn_hidden, feature_dim)
+        else:
+            self.ffn = nn.Sequential(
+                nn.Linear(feature_dim, ffn_hidden),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(ffn_hidden, feature_dim),
+            )
+        self.residual_dropout = nn.Dropout(residual_dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_scale_attn = (
+            nn.Parameter(torch.full((feature_dim,), layer_scale_init))
+            if layer_scale_init is not None
+            else None
+        )
+        self.layer_scale_ffn = (
+            nn.Parameter(torch.full((feature_dim,), layer_scale_init))
+            if layer_scale_init is not None
+            else None
         )
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -132,9 +157,20 @@ class TransformerBlock(nn.Module):
             attn_mask=attn_mask,
             need_weights=False,
         )
-        x = residual + attn_out.squeeze(0)
+        attn_out = attn_out.squeeze(0)
+        if self.layer_scale_attn is not None:
+            attn_out = attn_out * self.layer_scale_attn
+        x = residual + self.residual_dropout(attn_out)
         x_norm = self.norm2(x)
-        return x + self.ffn(x_norm)
+        if self.ffn_gated:
+            gate, value = self.ffn_in(x_norm).chunk(2, dim=-1)
+            ffn_out = self.ffn_out(torch.silu(gate) * value)
+        else:
+            ffn_out = self.ffn(x_norm)
+        ffn_out = self.dropout(ffn_out)
+        if self.layer_scale_ffn is not None:
+            ffn_out = ffn_out * self.layer_scale_ffn
+        return x + self.residual_dropout(ffn_out)
 
 class FlashACE(nn.Module):
     def __init__(
@@ -155,6 +191,9 @@ class FlashACE(nn.Module):
         transformer_num_heads: int = 4,
         transformer_ffn_hidden: int | None = None,
         transformer_dropout: float = 0.0,
+        transformer_residual_dropout: float = 0.0,
+        transformer_ffn_gated: bool = False,
+        transformer_layer_scale_init: float | None = None,
         use_transformer: bool = True,
         attention_neighbor_mask: bool = False,
         use_aux_force_head: bool = True,
@@ -173,6 +212,9 @@ class FlashACE(nn.Module):
         self.transformer_num_heads = max(1, int(transformer_num_heads))
         self.transformer_ffn_hidden = transformer_ffn_hidden
         self.transformer_dropout = float(transformer_dropout)
+        self.transformer_residual_dropout = float(transformer_residual_dropout)
+        self.transformer_ffn_gated = bool(transformer_ffn_gated)
+        self.transformer_layer_scale_init = transformer_layer_scale_init
         self.use_transformer = bool(use_transformer)
         self.attention_neighbor_mask = bool(attention_neighbor_mask)
         self.use_aux_force_head = use_aux_force_head
@@ -215,6 +257,9 @@ class FlashACE(nn.Module):
                     self.transformer_num_heads,
                     ffn_hidden,
                     dropout=self.transformer_dropout,
+                    residual_dropout=self.transformer_residual_dropout,
+                    ffn_gated=self.transformer_ffn_gated,
+                    layer_scale_init=self.transformer_layer_scale_init,
                 )
                 for i in range(num_layers)
             ]
