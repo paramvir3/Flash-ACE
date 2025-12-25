@@ -24,7 +24,7 @@ class FlashACECalculator(Calculator):
 
         # 2. Load Model & Config
         try:
-            checkpoint = torch.load(model_path, map_location=self.device)
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         except FileNotFoundError:
             raise FileNotFoundError(f"Model file not found: {model_path}")
 
