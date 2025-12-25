@@ -65,6 +65,7 @@ class FlashACECalculator(Calculator):
             transformer_layer_scale_init=conf.get('transformer_layer_scale_init', None),
             transformer_attention_chunk_size=conf.get('transformer_attention_chunk_size', None),
             use_transformer=conf.get('use_transformer', True),
+            transformer_scalar_only=conf.get('transformer_scalar_only', False),
             attention_neighbor_mask=conf.get('attention_neighbor_mask', False),
             descriptor_passes=conf.get('descriptor_passes', 1),
             descriptor_residual=conf.get('descriptor_residual', True),

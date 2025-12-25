@@ -191,6 +191,37 @@ class TransformerBlock(nn.Module):
             ffn_out = ffn_out * self.layer_scale_ffn
         return x + self.residual_dropout(ffn_out)
 
+
+class ScalarTransformerBlock(nn.Module):
+    """Transformer block applied only to scalar channels."""
+    def __init__(
+        self,
+        scalar_dim: int,
+        num_heads: int,
+        ffn_hidden: int,
+        dropout: float = 0.0,
+        residual_dropout: float = 0.0,
+        ffn_gated: bool = False,
+        layer_scale_init: float | None = None,
+        attention_chunk_size: int | None = None,
+    ):
+        super().__init__()
+        self.block = TransformerBlock(
+            scalar_dim,
+            num_heads,
+            ffn_hidden,
+            dropout=dropout,
+            residual_dropout=residual_dropout,
+            ffn_gated=ffn_gated,
+            layer_scale_init=layer_scale_init,
+            attention_chunk_size=attention_chunk_size,
+        )
+
+    def forward(self, h: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        scalars, rest = h[..., : self.block.norm1.normalized_shape[0]], h[..., self.block.norm1.normalized_shape[0] :]
+        scalars = self.block(scalars, attn_mask=attn_mask)
+        return torch.cat([scalars, rest], dim=-1)
+
 class FlashACE(nn.Module):
     def __init__(
         self,
@@ -215,6 +246,7 @@ class FlashACE(nn.Module):
         transformer_layer_scale_init: float | None = None,
         transformer_attention_chunk_size: int | None = None,
         use_transformer: bool = True,
+        transformer_scalar_only: bool = False,
         attention_neighbor_mask: bool = False,
         use_aux_force_head: bool = True,
         use_aux_stress_head: bool = True,
@@ -237,6 +269,7 @@ class FlashACE(nn.Module):
         self.transformer_layer_scale_init = transformer_layer_scale_init
         self.transformer_attention_chunk_size = transformer_attention_chunk_size
         self.use_transformer = bool(use_transformer)
+        self.transformer_scalar_only = bool(transformer_scalar_only)
         self.attention_neighbor_mask = bool(attention_neighbor_mask)
         self.use_aux_force_head = use_aux_force_head
         self.use_aux_stress_head = use_aux_stress_head
@@ -271,23 +304,42 @@ class FlashACE(nn.Module):
             [NodeUpdateMLP(hidden_dim) for _ in range(num_layers)] if self.node_update_mlp else []
         )
         ffn_hidden = self.transformer_ffn_hidden or self.attention_irreps.dim * 4
-        self.layers = nn.ModuleList(
-            [
-                TransformerBlock(
-                    self.attention_irreps.dim,
-                    self.transformer_num_heads,
-                    ffn_hidden,
-                    dropout=self.transformer_dropout,
-                    residual_dropout=self.transformer_residual_dropout,
-                    ffn_gated=self.transformer_ffn_gated,
-                    layer_scale_init=self.transformer_layer_scale_init,
-                    attention_chunk_size=self.transformer_attention_chunk_size,
+        if self.use_transformer:
+            if self.transformer_scalar_only:
+                scalar_ffn_hidden = self.transformer_ffn_hidden or self.hidden_dim * 4
+                self.layers = nn.ModuleList(
+                    [
+                        ScalarTransformerBlock(
+                            self.hidden_dim,
+                            self.transformer_num_heads,
+                            scalar_ffn_hidden,
+                            dropout=self.transformer_dropout,
+                            residual_dropout=self.transformer_residual_dropout,
+                            ffn_gated=self.transformer_ffn_gated,
+                            layer_scale_init=self.transformer_layer_scale_init,
+                            attention_chunk_size=self.transformer_attention_chunk_size,
+                        )
+                        for i in range(num_layers)
+                    ]
                 )
-                for i in range(num_layers)
-            ]
-            if self.use_transformer
-            else []
-        )
+            else:
+                self.layers = nn.ModuleList(
+                    [
+                        TransformerBlock(
+                            self.attention_irreps.dim,
+                            self.transformer_num_heads,
+                            ffn_hidden,
+                            dropout=self.transformer_dropout,
+                            residual_dropout=self.transformer_residual_dropout,
+                            ffn_gated=self.transformer_ffn_gated,
+                            layer_scale_init=self.transformer_layer_scale_init,
+                            attention_chunk_size=self.transformer_attention_chunk_size,
+                        )
+                        for i in range(num_layers)
+                    ]
+                )
+        else:
+            self.layers = nn.ModuleList()
         
         self.readout = nn.Sequential(
             nn.Linear(hidden_dim, 64), 
