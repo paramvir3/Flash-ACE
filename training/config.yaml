@@ -22,9 +22,9 @@ message_passing_layers: 0        # Optional scalar-only message passing steps be
 interleave_descriptor: false     # Refresh descriptor between attention blocks
 edge_update_per_layer: false     # Apply a scalar edge update before each attention block
 node_update_mlp: false           # Apply per-block node MLP after attention
-attention_use_ffn: false         # Enable transformer-style FFN after each attention block
-attention_ffn_hidden: null       # Hidden width for FFN (defaults to 4x hidden_dim)
-attention_ffn_dropout: 0.0       # Dropout applied inside FFN
+transformer_num_heads: 4         # Multi-head attention heads for transformer blocks
+transformer_ffn_hidden: null     # Hidden width for FFN (defaults to 4x feature dim)
+transformer_dropout: 0.0         # Dropout in transformer attention/FFN
 radial_basis_type: "bessel"       # Options: bessel, gaussian
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)
@@ -87,9 +87,6 @@ displacement_prob: 0.1
 displacement_sigma: 0.02
 
 # Attention controls
-attention_message_clip: 8.0
-attention_conditioned_decay: true
-attention_share_qkv: "kv"        # Share KV across heads for stability
 temperature_scale_start: 1.3
 temperature_scale_end: 1.0
 temperature_scale_epochs: 15

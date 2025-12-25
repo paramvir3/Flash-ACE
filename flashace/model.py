@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from e3nn import o3
 from .physics import ACE_Descriptor
-from .attention import DenseFlashAttention
 
 class ScalarMessagePassing(nn.Module):
     """Lightweight, scalar-only message passing to mimic NequIP-style updates."""
@@ -105,25 +104,36 @@ class NodeUpdateMLP(nn.Module):
         scalars = scalars + self.mlp(scalars)
         return torch.cat([scalars, rest], dim=-1)
 
-class ScalarTransformerFFN(nn.Module):
-    """Transformer-style FFN on scalar channels with pre-norm and residual."""
-    def __init__(self, hidden_dim: int, ffn_hidden: int, dropout: float = 0.0):
+class TransformerBlock(nn.Module):
+    """Full transformer block with pre-norm attention and FFN on all channels."""
+    def __init__(self, feature_dim: int, num_heads: int, ffn_hidden: int, dropout: float = 0.0):
         super().__init__()
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.norm1 = nn.LayerNorm(feature_dim)
+        self.attn = nn.MultiheadAttention(
+            feature_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(feature_dim)
         self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, ffn_hidden),
+            nn.Linear(feature_dim, ffn_hidden),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(ffn_hidden, hidden_dim),
+            nn.Linear(ffn_hidden, feature_dim),
+            nn.Dropout(dropout),
         )
-        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        scalars, rest = h[..., : self.norm.normalized_shape[0]], h[..., self.norm.normalized_shape[0] :]
-        residual = scalars
-        scalars = self.norm(scalars)
-        scalars = residual + self.dropout(self.ffn(scalars))
-        return torch.cat([scalars, rest], dim=-1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Treat nodes as the sequence dimension; single batch.
+        residual = x
+        x_norm = self.norm1(x)
+        attn_out, _ = self.attn(
+            x_norm.unsqueeze(0),
+            x_norm.unsqueeze(0),
+            x_norm.unsqueeze(0),
+            need_weights=False,
+        )
+        x = residual + attn_out.squeeze(0)
+        x_norm = self.norm2(x)
+        return x + self.ffn(x_norm)
 
 class FlashACE(nn.Module):
     def __init__(
@@ -141,21 +151,15 @@ class FlashACE(nn.Module):
         descriptor_residual: bool = True,
         radial_mlp_hidden: int = 64,
         radial_mlp_layers: int = 2,
-        attention_message_clip: float | None = None,
-        attention_conditioned_decay: bool = True,
-        attention_share_qkv: str | bool = "none",
-        attention_scalar_pre_norm: bool = True,
-        attention_layer_scale_init: float | None = 1e-2,
-        drop_path_rate: float = 0.0,
+        transformer_num_heads: int = 4,
+        transformer_ffn_hidden: int | None = None,
+        transformer_dropout: float = 0.0,
         use_aux_force_head: bool = True,
         use_aux_stress_head: bool = True,
         message_passing_layers: int = 0,
         interleave_descriptor: bool = False,
         edge_update_per_layer: bool = False,
         node_update_mlp: bool = False,
-        attention_use_ffn: bool = False,
-        attention_ffn_hidden: int | None = None,
-        attention_ffn_dropout: float = 0.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -163,21 +167,15 @@ class FlashACE(nn.Module):
         self.l_max = l_max
         self.descriptor_passes = max(1, int(descriptor_passes))
         self.descriptor_residual = bool(descriptor_residual)
-        self.attention_message_clip = attention_message_clip
-        self.attention_conditioned_decay = attention_conditioned_decay
-        self.attention_share_qkv = attention_share_qkv
-        self.attention_scalar_pre_norm = attention_scalar_pre_norm
-        self.attention_layer_scale_init = attention_layer_scale_init
-        self.drop_path_rate = drop_path_rate
+        self.transformer_num_heads = max(1, int(transformer_num_heads))
+        self.transformer_ffn_hidden = transformer_ffn_hidden
+        self.transformer_dropout = float(transformer_dropout)
         self.use_aux_force_head = use_aux_force_head
         self.use_aux_stress_head = use_aux_stress_head
         self.message_passing_layers = max(0, int(message_passing_layers))
         self.interleave_descriptor = bool(interleave_descriptor)
         self.edge_update_per_layer = bool(edge_update_per_layer)
         self.node_update_mlp = bool(node_update_mlp)
-        self.attention_use_ffn = bool(attention_use_ffn)
-        self.attention_ffn_hidden = attention_ffn_hidden
-        self.attention_ffn_dropout = float(attention_ffn_dropout)
         self.node_scalar_irreps = o3.Irreps(f"{hidden_dim}x0e")
 
         self.emb = nn.Embedding(118, hidden_dim)
@@ -204,26 +202,13 @@ class FlashACE(nn.Module):
         self.node_updates = nn.ModuleList(
             [NodeUpdateMLP(hidden_dim) for _ in range(num_layers)] if self.node_update_mlp else []
         )
-        ffn_hidden = self.attention_ffn_hidden or hidden_dim * 4
-        self.ffn_layers = nn.ModuleList(
-            [
-                ScalarTransformerFFN(hidden_dim, ffn_hidden, dropout=self.attention_ffn_dropout)
-                for _ in range(num_layers)
-            ]
-            if self.attention_use_ffn
-            else []
-        )
-        dpr_values = torch.linspace(0, drop_path_rate, num_layers) if num_layers > 0 else torch.tensor([])
+        ffn_hidden = self.transformer_ffn_hidden or self.attention_irreps.dim * 4
         self.layers = nn.ModuleList([
-            DenseFlashAttention(
-                self.attention_irreps,
-                hidden_dim,
-                message_clip=attention_message_clip,
-                use_conditioned_decay=attention_conditioned_decay,
-                share_qkv_mode=attention_share_qkv,
-                scalar_pre_norm=attention_scalar_pre_norm,
-                layer_scale_init_value=attention_layer_scale_init,
-                drop_path_rate=float(dpr_values[i]) if len(dpr_values) > 0 else 0.0,
+            TransformerBlock(
+                self.attention_irreps.dim,
+                self.transformer_num_heads,
+                ffn_hidden,
+                dropout=self.transformer_dropout,
             )
             for i in range(num_layers)
         ])
@@ -303,11 +288,9 @@ class FlashACE(nn.Module):
                 h = h + desc if self.descriptor_residual else desc
             if self.edge_update_per_layer and len(self.edge_updates) > 0:
                 h = self.edge_updates[idx](h, edge_index, edge_len)
-            h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
+            h = layer(h)
             if self.node_update_mlp and len(self.node_updates) > 0:
                 h = self.node_updates[idx](h)
-            if self.attention_use_ffn and len(self.ffn_layers) > 0:
-                h = self.ffn_layers[idx](h)
             
         # 2. Readout
         # Note: We extract only the scalar (L=0) features for energy
