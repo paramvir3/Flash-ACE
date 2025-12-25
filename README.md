@@ -20,4 +20,4 @@ python train.py --config training/config.yaml
 
 Energies converge, not forces
 
-Transfomer block improves
+Transfomer block improves force learning
