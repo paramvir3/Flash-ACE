@@ -276,13 +276,14 @@ def main():
         sdp_backend = str(config.get('sdp_backend', 'auto')).lower()
         if sdp_backend not in {'auto', 'flash', 'mem_efficient', 'math'}:
             raise ValueError("sdp_backend must be one of {'auto', 'flash', 'mem_efficient', 'math'}")
-        if sdp_backend != "auto":
-            if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-                torch.backends.cuda.enable_flash_sdp(sdp_backend == "flash")
-            if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-                torch.backends.cuda.enable_mem_efficient_sdp(sdp_backend == "mem_efficient")
-            if hasattr(torch.backends.cuda, "enable_math_sdp"):
-                torch.backends.cuda.enable_math_sdp(sdp_backend == "math")
+        if sdp_backend == "auto":
+            sdp_backend = "math"
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(sdp_backend == "flash")
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(sdp_backend == "mem_efficient")
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(sdp_backend == "math")
     
 
     print(f"Reading data from {config['train_file']}...")
