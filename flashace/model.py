@@ -105,6 +105,26 @@ class NodeUpdateMLP(nn.Module):
         scalars = scalars + self.mlp(scalars)
         return torch.cat([scalars, rest], dim=-1)
 
+class ScalarTransformerFFN(nn.Module):
+    """Transformer-style FFN on scalar channels with pre-norm and residual."""
+    def __init__(self, hidden_dim: int, ffn_hidden: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_hidden, hidden_dim),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        scalars, rest = h[..., : self.norm.normalized_shape[0]], h[..., self.norm.normalized_shape[0] :]
+        residual = scalars
+        scalars = self.norm(scalars)
+        scalars = residual + self.dropout(self.ffn(scalars))
+        return torch.cat([scalars, rest], dim=-1)
+
 class FlashACE(nn.Module):
     def __init__(
         self,
@@ -133,6 +153,9 @@ class FlashACE(nn.Module):
         interleave_descriptor: bool = False,
         edge_update_per_layer: bool = False,
         node_update_mlp: bool = False,
+        attention_use_ffn: bool = False,
+        attention_ffn_hidden: int | None = None,
+        attention_ffn_dropout: float = 0.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -152,6 +175,9 @@ class FlashACE(nn.Module):
         self.interleave_descriptor = bool(interleave_descriptor)
         self.edge_update_per_layer = bool(edge_update_per_layer)
         self.node_update_mlp = bool(node_update_mlp)
+        self.attention_use_ffn = bool(attention_use_ffn)
+        self.attention_ffn_hidden = attention_ffn_hidden
+        self.attention_ffn_dropout = float(attention_ffn_dropout)
         self.node_scalar_irreps = o3.Irreps(f"{hidden_dim}x0e")
 
         self.emb = nn.Embedding(118, hidden_dim)
@@ -177,6 +203,15 @@ class FlashACE(nn.Module):
         )
         self.node_updates = nn.ModuleList(
             [NodeUpdateMLP(hidden_dim) for _ in range(num_layers)] if self.node_update_mlp else []
+        )
+        ffn_hidden = self.attention_ffn_hidden or hidden_dim * 4
+        self.ffn_layers = nn.ModuleList(
+            [
+                ScalarTransformerFFN(hidden_dim, ffn_hidden, dropout=self.attention_ffn_dropout)
+                for _ in range(num_layers)
+            ]
+            if self.attention_use_ffn
+            else []
         )
         dpr_values = torch.linspace(0, drop_path_rate, num_layers) if num_layers > 0 else torch.tensor([])
         self.layers = nn.ModuleList([
@@ -271,6 +306,8 @@ class FlashACE(nn.Module):
             h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
             if self.node_update_mlp and len(self.node_updates) > 0:
                 h = self.node_updates[idx](h)
+            if self.attention_use_ffn and len(self.ffn_layers) > 0:
+                h = self.ffn_layers[idx](h)
             
         # 2. Readout
         # Note: We extract only the scalar (L=0) features for energy

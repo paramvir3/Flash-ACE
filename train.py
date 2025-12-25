@@ -336,6 +336,9 @@ def main():
         interleave_descriptor=config.get('interleave_descriptor', False),
         edge_update_per_layer=config.get('edge_update_per_layer', False),
         node_update_mlp=config.get('node_update_mlp', False),
+        attention_use_ffn=config.get('attention_use_ffn', False),
+        attention_ffn_hidden=config.get('attention_ffn_hidden', None),
+        attention_ffn_dropout=config.get('attention_ffn_dropout', 0.0),
         use_aux_force_head=config.get('use_aux_force_head', True),
         use_aux_stress_head=config.get('use_aux_stress_head', True),
     ).to(device)
