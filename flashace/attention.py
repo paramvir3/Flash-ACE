@@ -19,14 +19,8 @@ class DenseFlashAttention(nn.Module):
         use_conditioned_decay: bool = True,
         share_qkv_mode: str | bool = "none",
         scalar_pre_norm: bool = True,
-        edge_attr_dim: int | None = None,
         layer_scale_init_value: float | None = 1e-2,
         drop_path_rate: float = 0.0,
-        edge_film: bool = False,
-        edge_film_hidden: int | None = None,
-        scalar_post_norm: bool = False,
-        scalar_post_gate: bool = False,
-        tensor_post_gate: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -36,10 +30,6 @@ class DenseFlashAttention(nn.Module):
         self.use_conditioned_decay = use_conditioned_decay
         self.scalar_pre_norm = scalar_pre_norm
         self.layer_scale_init_value = layer_scale_init_value
-        self.edge_film = bool(edge_film)
-        self.scalar_post_norm_enabled = bool(scalar_post_norm)
-        self.scalar_post_gate_enabled = bool(scalar_post_gate)
-        self.tensor_post_gate_enabled = bool(tensor_post_gate)
         if isinstance(share_qkv_mode, bool):
             share_qkv_mode = "all" if share_qkv_mode else "none"
         if share_qkv_mode not in {"none", "kv", "all"}:
@@ -66,16 +56,6 @@ class DenseFlashAttention(nn.Module):
             self.tangential_update = nn.ModuleList(
                 [o3.Linear(irreps_in, irreps_in) for _ in range(num_heads)]
             )
-
-        # Edge attribute projection (shared across heads) for optional edge embeddings.
-        edge_attr_dim = edge_attr_dim or hidden_dim
-        self.edge_attr_proj = nn.Linear(edge_attr_dim, self.feature_dim)
-        film_hidden = edge_film_hidden or max(1, self.feature_dim // 2)
-        self.edge_film_mlp = nn.Sequential(
-            nn.Linear(self.feature_dim, film_hidden),
-            nn.SiLU(),
-            nn.Linear(film_hidden, 2 * self.feature_dim),
-        )
 
         # Geometry-aware scoring vectors
         self.radial_score = nn.Parameter(
@@ -121,23 +101,6 @@ class DenseFlashAttention(nn.Module):
 
         self.w_out = o3.Linear(irreps_in, irreps_in)
         self.scalar_norm = nn.LayerNorm(hidden_dim) if scalar_pre_norm else None
-        self.scalar_post_norm = nn.LayerNorm(hidden_dim) if self.scalar_post_norm_enabled else None
-        self.scalar_gate = None
-        if self.scalar_post_gate_enabled:
-            self.scalar_gate = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-            )
-        self.tensor_gate = None
-        if self.tensor_post_gate_enabled:
-            rest_dim = self.feature_dim - hidden_dim
-            if rest_dim > 0:
-                self.tensor_gate = nn.Sequential(
-                    nn.Linear(hidden_dim, rest_dim),
-                    nn.SiLU(),
-                    nn.Linear(rest_dim, rest_dim),
-                )
         self.layer_scale = (
             nn.Parameter(torch.full((self.feature_dim,), layer_scale_init_value))
             if layer_scale_init_value is not None
@@ -182,22 +145,7 @@ class DenseFlashAttention(nn.Module):
                     nn.init.zeros_(m.bias)
         if self.layer_scale is not None and self.layer_scale_init_value is not None:
             nn.init.constant_(self.layer_scale, self.layer_scale_init_value)
-        if self.scalar_gate is not None:
-            for m in self.scalar_gate.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight)
-                    nn.init.zeros_(m.bias)
-        if self.tensor_gate is not None:
-            for m in self.tensor_gate.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight)
-                    nn.init.zeros_(m.bias)
-        for m in self.edge_film_mlp.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def forward(self, x, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0, edge_attr: torch.Tensor | None = None):
+    def forward(self, x, edge_index, edge_vec, edge_len, temperature_scale: float = 1.0):
         sender, receiver = edge_index
         num_nodes = x.shape[0]
         if sender.numel() == 0:
@@ -233,7 +181,6 @@ class DenseFlashAttention(nn.Module):
             receiver,
             edge_len,
             temperature_scale=temperature_scale,
-            edge_attr=edge_attr,
         )
 
         out = torch.nan_to_num(out)
@@ -246,18 +193,6 @@ class DenseFlashAttention(nn.Module):
             random_tensor = keep_prob + torch.rand(shape, dtype=out.dtype, device=out.device)
             random_tensor = torch.floor(random_tensor)
             out = out / keep_prob * random_tensor
-        # Scalar gating and normalization on block output
-        if self.scalar_post_norm is not None or self.scalar_gate is not None:
-            out_scalars, out_rest = out[..., : self.hidden_dim], out[..., self.hidden_dim :]
-            if self.scalar_post_norm is not None:
-                out_scalars = self.scalar_post_norm(out_scalars)
-            if self.scalar_gate is not None:
-                gated = self.scalar_gate(out_scalars)
-                out_scalars = out_scalars * torch.sigmoid(gated)
-            if self.tensor_gate is not None and out_rest.numel() > 0:
-                tgate = self.tensor_gate(out_scalars)
-                out_rest = out_rest * torch.sigmoid(tgate)
-            out = torch.cat([out_scalars, out_rest], dim=-1)
         return x + out
 
     def _geometric_decomposition_attention(
@@ -269,7 +204,6 @@ class DenseFlashAttention(nn.Module):
         receiver,
         edge_len,
         temperature_scale: float,
-        edge_attr: torch.Tensor | None = None,
     ):
         # *_proj are shaped (num_heads, num_nodes, feature_dim)
         num_heads = energy_proj.shape[0]
@@ -279,17 +213,6 @@ class DenseFlashAttention(nn.Module):
         radial_delta = radial_proj[:, sender] - radial_proj[:, receiver]
         tangential_delta = tangential_proj[:, sender] - tangential_proj[:, receiver]
 
-        if edge_attr is not None:
-            # Project edge attributes to feature dim and broadcast per head
-            edge_attr_proj = self.edge_attr_proj(edge_attr)  # (edges, feature_dim)
-            if self.edge_film:
-                film = self.edge_film_mlp(edge_attr_proj)
-                gamma, beta = film.split(self.feature_dim, dim=-1)
-                edge_attr_proj = edge_attr_proj * (1.0 + torch.tanh(gamma)) + beta
-            edge_attr_proj = edge_attr_proj.unsqueeze(0).expand(num_heads, -1, -1)
-            energy_delta = energy_delta + edge_attr_proj
-            radial_delta = radial_delta + edge_attr_proj
-            tangential_delta = tangential_delta + edge_attr_proj
 
         # Radial energy penalizes long bonds, tangential is distance agnostic.
         radial_distance_scale = F.softplus(self._radial_distance_log_scale).to(edge_len.dtype)[:, None]
