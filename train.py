@@ -10,7 +10,7 @@ from ase.io import read
 from ase.data import atomic_numbers, chemical_symbols
 from e3nn import o3
 from flashace.model import FlashACE
-from flashace.plotting import plot_training_results
+from flashace.plotting import plot_training_metrics
 from ase.neighborlist import neighbor_list
 from torch.utils.data import DataLoader, Dataset, random_split
 
@@ -499,7 +499,16 @@ def main():
         else:
             return torch.tensor(0.0, device=device)
 
-    history = {'train_loss':[], 'val_loss':[]}
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_energy_mev': [],
+        'val_energy_mev': [],
+        'train_force_rmse': [],
+        'val_force_rmse': [],
+        'train_stress_rmse': [],
+        'val_stress_rmse': [],
+    }
 
     ckpt_interval = int(config.get('checkpoint_interval', 0) or 0)
     ckpt_latest = bool(config.get('checkpoint_latest', False))
@@ -677,6 +686,9 @@ def main():
         avg_train_loss = total_loss / max(1, total_items_seen)
         tr_e, tr_f, tr_s, tr_f_mse, tr_f_mae = train_metrics.get_metrics()
         history['train_loss'].append(avg_train_loss)
+        history['train_energy_mev'].append(tr_e)
+        history['train_force_rmse'].append(tr_f)
+        history['train_stress_rmse'].append(tr_s)
 
         # Validation
         model.eval()
@@ -706,6 +718,9 @@ def main():
         avg_val_loss = val_loss_accum / len(val_atoms)
         val_e, val_f, val_s, val_f_mse, val_f_mae = val_metrics.get_metrics()
         history['val_loss'].append(avg_val_loss)
+        history['val_energy_mev'].append(val_e)
+        history['val_force_rmse'].append(val_f)
+        history['val_stress_rmse'].append(val_s)
         if scheduler_interval == 'epoch':
             scheduler.step()
 
@@ -754,5 +769,7 @@ def main():
         atomic_energy_map,
     )
     print(f"Training Finished. Saved to {config['model_save_path']}")
+    plot_dir = config.get('plot_dir', 'plots')
+    plot_training_metrics(history, save_dir=plot_dir)
 
 if __name__ == "__main__": main()
