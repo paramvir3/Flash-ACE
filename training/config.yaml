@@ -28,6 +28,7 @@ transformer_dropout: 0.0         # Dropout in transformer attention/FFN
 transformer_residual_dropout: 0.0 # Residual dropout for attention/FFN outputs
 transformer_ffn_gated: false     # Use a gated FFN (SwiGLU-style) instead of plain MLP
 transformer_layer_scale_init: null # Optional layer-scale init (e.g., 1e-4) for deep stacks
+transformer_attention_chunk_size: null # Chunked attention over nodes to reduce memory (null = full)
 use_transformer: true            # Enable transformer blocks (disable to rely on message passing only)
 attention_neighbor_mask: false   # Restrict attention to neighbor edges and self
 radial_basis_type: "bessel"       # Options: bessel, gaussian

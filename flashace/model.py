@@ -115,6 +115,7 @@ class TransformerBlock(nn.Module):
         residual_dropout: float = 0.0,
         ffn_gated: bool = False,
         layer_scale_init: float | None = None,
+        attention_chunk_size: int | None = None,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(feature_dim)
@@ -145,19 +146,36 @@ class TransformerBlock(nn.Module):
             if layer_scale_init is not None
             else None
         )
+        self.attention_chunk_size = attention_chunk_size
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         # Treat nodes as the sequence dimension; single batch.
         residual = x
         x_norm = self.norm1(x)
-        attn_out, _ = self.attn(
-            x_norm.unsqueeze(0),
-            x_norm.unsqueeze(0),
-            x_norm.unsqueeze(0),
-            attn_mask=attn_mask,
-            need_weights=False,
-        )
-        attn_out = attn_out.squeeze(0)
+        chunk_size = self.attention_chunk_size
+        if chunk_size is None or x_norm.shape[0] <= chunk_size:
+            attn_out, _ = self.attn(
+                x_norm.unsqueeze(0),
+                x_norm.unsqueeze(0),
+                x_norm.unsqueeze(0),
+                attn_mask=attn_mask,
+                need_weights=False,
+            )
+            attn_out = attn_out.squeeze(0)
+        else:
+            outputs = []
+            for start in range(0, x_norm.shape[0], chunk_size):
+                end = start + chunk_size
+                mask_slice = attn_mask[start:end, :] if attn_mask is not None else None
+                chunk_out, _ = self.attn(
+                    x_norm[start:end].unsqueeze(0),
+                    x_norm.unsqueeze(0),
+                    x_norm.unsqueeze(0),
+                    attn_mask=mask_slice,
+                    need_weights=False,
+                )
+                outputs.append(chunk_out.squeeze(0))
+            attn_out = torch.cat(outputs, dim=0)
         if self.layer_scale_attn is not None:
             attn_out = attn_out * self.layer_scale_attn
         x = residual + self.residual_dropout(attn_out)
@@ -194,6 +212,7 @@ class FlashACE(nn.Module):
         transformer_residual_dropout: float = 0.0,
         transformer_ffn_gated: bool = False,
         transformer_layer_scale_init: float | None = None,
+        transformer_attention_chunk_size: int | None = None,
         use_transformer: bool = True,
         attention_neighbor_mask: bool = False,
         use_aux_force_head: bool = True,
@@ -215,6 +234,7 @@ class FlashACE(nn.Module):
         self.transformer_residual_dropout = float(transformer_residual_dropout)
         self.transformer_ffn_gated = bool(transformer_ffn_gated)
         self.transformer_layer_scale_init = transformer_layer_scale_init
+        self.transformer_attention_chunk_size = transformer_attention_chunk_size
         self.use_transformer = bool(use_transformer)
         self.attention_neighbor_mask = bool(attention_neighbor_mask)
         self.use_aux_force_head = use_aux_force_head
@@ -260,6 +280,7 @@ class FlashACE(nn.Module):
                     residual_dropout=self.transformer_residual_dropout,
                     ffn_gated=self.transformer_ffn_gated,
                     layer_scale_init=self.transformer_layer_scale_init,
+                    attention_chunk_size=self.transformer_attention_chunk_size,
                 )
                 for i in range(num_layers)
             ]

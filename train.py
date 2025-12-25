@@ -78,6 +78,7 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, en
             'transformer_residual_dropout': config.get('transformer_residual_dropout', 0.0),
             'transformer_ffn_gated': config.get('transformer_ffn_gated', False),
             'transformer_layer_scale_init': config.get('transformer_layer_scale_init', None),
+            'transformer_attention_chunk_size': config.get('transformer_attention_chunk_size', None),
             'use_transformer': config.get('use_transformer', True),
             'attention_neighbor_mask': config.get('attention_neighbor_mask', False),
         }
@@ -359,6 +360,7 @@ def main():
         transformer_residual_dropout=config.get('transformer_residual_dropout', 0.0),
         transformer_ffn_gated=config.get('transformer_ffn_gated', False),
         transformer_layer_scale_init=config.get('transformer_layer_scale_init', None),
+        transformer_attention_chunk_size=config.get('transformer_attention_chunk_size', None),
         use_transformer=config.get('use_transformer', True),
         attention_neighbor_mask=config.get('attention_neighbor_mask', False),
         descriptor_passes=config.get('descriptor_passes', 1),
