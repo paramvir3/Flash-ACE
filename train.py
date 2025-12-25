@@ -445,6 +445,12 @@ def main():
 
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+    if not resume_path and config.get('resume_latest', False):
+        ckpt_dir = config.get('checkpoint_dir', 'checkpoints')
+        latest_path = os.path.join(ckpt_dir, 'latest.pt')
+        if os.path.isfile(latest_path):
+            resume_path = latest_path
+
     if resume_path:
         print(f"--- Loading checkpoint from {resume_path} ---")
         checkpoint = torch.load(resume_path, map_location=device)
@@ -496,6 +502,8 @@ def main():
     history = {'train_loss':[], 'val_loss':[]}
 
     ckpt_interval = int(config.get('checkpoint_interval', 0) or 0)
+    ckpt_latest = bool(config.get('checkpoint_latest', False))
+    ckpt_dir = config.get('checkpoint_dir', 'checkpoints')
 
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
@@ -708,10 +716,22 @@ def main():
         )
 
         if ckpt_interval > 0 and (epoch + 1) % ckpt_interval == 0:
-            ckpt_dir = config.get('checkpoint_dir', 'checkpoints')
             ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch+1}.pt")
             save_checkpoint(
                 ckpt_path,
+                epoch + 1,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                config,
+                energy_shift_per_atom,
+                atomic_energy_map,
+            )
+        if ckpt_latest:
+            latest_path = os.path.join(ckpt_dir, "latest.pt")
+            save_checkpoint(
+                latest_path,
                 epoch + 1,
                 model,
                 optimizer,

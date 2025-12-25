@@ -65,6 +65,8 @@ random_rotation: false           # Apply random SO(3) rotations per batch item
 device: "cuda"
 checkpoint_dir: "checkpoints"     # Directory to stash periodic checkpoints
 checkpoint_interval: 0           # Save a checkpoint every N epochs (0 disables)
+checkpoint_latest: false         # Always save a rolling latest.pt checkpoint
+resume_latest: false             # Resume from checkpoint_dir/latest.pt if resume_from is unset
 resume_from: null                # Path to a checkpoint to resume from
 resume_load_optimizer: false     # Load optimizer state when resuming
 resume_load_scheduler: false     # Load LR scheduler state when resuming
