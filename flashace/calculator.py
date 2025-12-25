@@ -57,9 +57,9 @@ class FlashACECalculator(Calculator):
             radial_trainable=conf.get('radial_trainable', False),
             envelope_exponent=conf.get('envelope_exponent', 5),
             gaussian_width=conf.get('gaussian_width', 0.5),
-            attention_message_clip=conf.get('attention_message_clip', None),
-            attention_conditioned_decay=conf.get('attention_conditioned_decay', True),
-            attention_share_qkv=conf.get('attention_share_qkv', "none"),
+            transformer_num_heads=conf.get('transformer_num_heads', 4),
+            transformer_ffn_hidden=conf.get('transformer_ffn_hidden', None),
+            transformer_dropout=conf.get('transformer_dropout', 0.0),
             use_aux_force_head=conf.get('use_aux_force_head', False),
             use_aux_stress_head=conf.get('use_aux_stress_head', False),
         )

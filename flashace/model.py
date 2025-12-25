@@ -1,7 +1,139 @@
 import torch
 import torch.nn as nn
+from e3nn import o3
 from .physics import ACE_Descriptor
-from .attention import DenseFlashAttention
+
+class ScalarMessagePassing(nn.Module):
+    """Lightweight, scalar-only message passing to mimic NequIP-style updates."""
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_len: torch.Tensor) -> torch.Tensor:
+        scalars, rest = h[..., : self.hidden_dim], h[..., self.hidden_dim :]
+        sender, receiver = edge_index
+        if sender.numel() == 0:
+            return h
+
+        msg_in = torch.cat([scalars[sender], scalars[receiver], edge_len.unsqueeze(-1)], dim=-1)
+        msgs = self.mlp(msg_in)
+        if msgs.dtype != scalars.dtype:
+            msgs = msgs.to(scalars.dtype)
+        agg = torch.zeros_like(scalars)
+        agg.index_add_(0, receiver, msgs)
+        scalars = scalars + agg
+        return torch.cat([scalars, rest], dim=-1)
+
+class EdgeUpdate(nn.Module):
+    """Per-layer scalar edge update that refreshes node scalars from current states."""
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_len: torch.Tensor) -> torch.Tensor:
+        scalars, rest = h[..., : self.hidden_dim], h[..., self.hidden_dim :]
+        sender, receiver = edge_index
+        if sender.numel() == 0:
+            return h
+
+        msg_in = torch.cat([scalars[sender], scalars[receiver], edge_len.unsqueeze(-1)], dim=-1)
+        msgs = self.mlp(msg_in)
+        if msgs.dtype != scalars.dtype:
+            msgs = msgs.to(scalars.dtype)
+        agg = torch.zeros_like(scalars)
+        agg.index_add_(0, receiver, msgs)
+        scalars = scalars + agg
+        return torch.cat([scalars, rest], dim=-1)
+
+class EdgeStateInit(nn.Module):
+    """Initialize per-edge embeddings from current node scalars and distances."""
+    def __init__(self, node_dim: int, edge_state_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(node_dim * 2 + 1, edge_state_dim),
+            nn.SiLU(),
+            nn.Linear(edge_state_dim, edge_state_dim),
+        )
+
+    def forward(self, scalars: torch.Tensor, edge_index: torch.Tensor, edge_len: torch.Tensor) -> torch.Tensor:
+        sender, receiver = edge_index
+        if sender.numel() == 0:
+            return torch.zeros((0, self.mlp[-1].out_features), device=scalars.device, dtype=scalars.dtype)
+        msg_in = torch.cat([scalars[sender], scalars[receiver], edge_len.unsqueeze(-1)], dim=-1)
+        return self.mlp(msg_in)
+
+class EdgeStateUpdate(nn.Module):
+    """Update edge embeddings from current node scalars and previous edge state."""
+    def __init__(self, node_dim: int, edge_state_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(node_dim * 2 + edge_state_dim + 1, edge_state_dim),
+            nn.SiLU(),
+            nn.Linear(edge_state_dim, edge_state_dim),
+        )
+
+    def forward(self, scalars: torch.Tensor, edge_index: torch.Tensor, edge_len: torch.Tensor, edge_state: torch.Tensor) -> torch.Tensor:
+        sender, receiver = edge_index
+        if sender.numel() == 0:
+            return edge_state
+        msg_in = torch.cat([scalars[sender], scalars[receiver], edge_state, edge_len.unsqueeze(-1)], dim=-1)
+        return self.mlp(msg_in)
+
+class NodeUpdateMLP(nn.Module):
+    """Irrep-aware node update on scalars only (post-aggregation)."""
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        scalars, rest = h[..., : self.mlp[0].in_features], h[..., self.mlp[0].in_features :]
+        scalars = scalars + self.mlp(scalars)
+        return torch.cat([scalars, rest], dim=-1)
+
+class TransformerBlock(nn.Module):
+    """Full transformer block with pre-norm attention and FFN on all channels."""
+    def __init__(self, feature_dim: int, num_heads: int, ffn_hidden: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(feature_dim)
+        self.attn = nn.MultiheadAttention(
+            feature_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(feature_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(feature_dim, ffn_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_hidden, feature_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Treat nodes as the sequence dimension; single batch.
+        residual = x
+        x_norm = self.norm1(x)
+        attn_out, _ = self.attn(
+            x_norm.unsqueeze(0),
+            x_norm.unsqueeze(0),
+            x_norm.unsqueeze(0),
+            need_weights=False,
+        )
+        x = residual + attn_out.squeeze(0)
+        x_norm = self.norm2(x)
+        return x + self.ffn(x_norm)
 
 class FlashACE(nn.Module):
     def __init__(
@@ -15,27 +147,36 @@ class FlashACE(nn.Module):
         radial_trainable: bool = False,
         envelope_exponent: int = 5,
         gaussian_width: float = 0.5,
-        attention_message_clip: float | None = None,
-        attention_conditioned_decay: bool = True,
-        attention_share_qkv: str | bool = "none",
-        attention_scalar_pre_norm: bool = True,
-        attention_layer_scale_init: float | None = 1e-2,
-        drop_path_rate: float = 0.0,
+        descriptor_passes: int = 1,
+        descriptor_residual: bool = True,
+        radial_mlp_hidden: int = 64,
+        radial_mlp_layers: int = 2,
+        transformer_num_heads: int = 4,
+        transformer_ffn_hidden: int | None = None,
+        transformer_dropout: float = 0.0,
         use_aux_force_head: bool = True,
         use_aux_stress_head: bool = True,
+        message_passing_layers: int = 0,
+        interleave_descriptor: bool = False,
+        edge_update_per_layer: bool = False,
+        node_update_mlp: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.r_max = r_max
         self.l_max = l_max
-        self.attention_message_clip = attention_message_clip
-        self.attention_conditioned_decay = attention_conditioned_decay
-        self.attention_share_qkv = attention_share_qkv
-        self.attention_scalar_pre_norm = attention_scalar_pre_norm
-        self.attention_layer_scale_init = attention_layer_scale_init
-        self.drop_path_rate = drop_path_rate
+        self.descriptor_passes = max(1, int(descriptor_passes))
+        self.descriptor_residual = bool(descriptor_residual)
+        self.transformer_num_heads = max(1, int(transformer_num_heads))
+        self.transformer_ffn_hidden = transformer_ffn_hidden
+        self.transformer_dropout = float(transformer_dropout)
         self.use_aux_force_head = use_aux_force_head
         self.use_aux_stress_head = use_aux_stress_head
+        self.message_passing_layers = max(0, int(message_passing_layers))
+        self.interleave_descriptor = bool(interleave_descriptor)
+        self.edge_update_per_layer = bool(edge_update_per_layer)
+        self.node_update_mlp = bool(node_update_mlp)
+        self.node_scalar_irreps = o3.Irreps(f"{hidden_dim}x0e")
 
         self.emb = nn.Embedding(118, hidden_dim)
         self.ace = ACE_Descriptor(
@@ -47,19 +188,27 @@ class FlashACE(nn.Module):
             radial_trainable=radial_trainable,
             envelope_exponent=envelope_exponent,
             gaussian_width=gaussian_width,
+            radial_mlp_hidden=radial_mlp_hidden,
+            radial_mlp_layers=radial_mlp_layers,
         )
-        
-        dpr_values = torch.linspace(0, drop_path_rate, num_layers) if num_layers > 0 else torch.tensor([])
+        self.attention_irreps = self.ace.irreps_out
+
+        self.mp_layers = nn.ModuleList(
+            [ScalarMessagePassing(hidden_dim) for _ in range(self.message_passing_layers)]
+        )
+        self.edge_updates = nn.ModuleList(
+            [EdgeUpdate(hidden_dim) for _ in range(num_layers)] if self.edge_update_per_layer else []
+        )
+        self.node_updates = nn.ModuleList(
+            [NodeUpdateMLP(hidden_dim) for _ in range(num_layers)] if self.node_update_mlp else []
+        )
+        ffn_hidden = self.transformer_ffn_hidden or self.attention_irreps.dim * 4
         self.layers = nn.ModuleList([
-            DenseFlashAttention(
-                self.ace.irreps_out,
-                hidden_dim,
-                message_clip=attention_message_clip,
-                use_conditioned_decay=attention_conditioned_decay,
-                share_qkv_mode=attention_share_qkv,
-                scalar_pre_norm=attention_scalar_pre_norm,
-                layer_scale_init_value=attention_layer_scale_init,
-                drop_path_rate=float(dpr_values[i]) if len(dpr_values) > 0 else 0.0,
+            TransformerBlock(
+                self.attention_irreps.dim,
+                self.transformer_num_heads,
+                ffn_hidden,
+                dropout=self.transformer_dropout,
             )
             for i in range(num_layers)
         ])
@@ -118,12 +267,30 @@ class FlashACE(nn.Module):
 
         edge_vec = pos[edge_index[0]] - pos[edge_index[1]]
         edge_len = torch.norm(edge_vec, dim=1)
-        
-        # 1. Pipeline (No checkpoints)
+
+        # 1. Descriptor iterations (optionally residual) before message passing / attention.
         h = self.emb(z)
-        h = self.ace(h, edge_index, edge_vec, edge_len)
-        for layer in self.layers:
-            h = layer(h, edge_index, edge_vec, edge_len, temperature_scale=temperature_scale)
+        for i in range(self.descriptor_passes):
+            scalars = h[..., : self.hidden_dim]
+            desc = self.ace(scalars, edge_index, edge_vec, edge_len)
+            if i == 0 or not self.descriptor_residual:
+                h = desc
+            else:
+                h = h + desc
+
+        for mp_layer in self.mp_layers:
+            h = mp_layer(h, edge_index, edge_len)
+
+        for idx, layer in enumerate(self.layers):
+            if self.interleave_descriptor:
+                scalars = h[..., : self.hidden_dim]
+                desc = self.ace(scalars, edge_index, edge_vec, edge_len)
+                h = h + desc if self.descriptor_residual else desc
+            if self.edge_update_per_layer and len(self.edge_updates) > 0:
+                h = self.edge_updates[idx](h, edge_index, edge_len)
+            h = layer(h)
+            if self.node_update_mlp and len(self.node_updates) > 0:
+                h = self.node_updates[idx](h)
             
         # 2. Readout
         # Note: We extract only the scalar (L=0) features for energy
