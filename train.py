@@ -64,6 +64,23 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, en
             'use_amp': config.get('use_amp', False),
             'grad_accum_steps': max(1, int(config.get('grad_accum_steps', 1))),
             'precompute_neighbors': config.get('precompute_neighbors', False),
+            'descriptor_passes': config.get('descriptor_passes', 1),
+            'descriptor_residual': config.get('descriptor_residual', True),
+            'radial_mlp_hidden': config.get('radial_mlp_hidden', 64),
+            'radial_mlp_layers': config.get('radial_mlp_layers', 2),
+            'message_passing_layers': config.get('message_passing_layers', 0),
+            'interleave_descriptor': config.get('interleave_descriptor', False),
+            'edge_update_per_layer': config.get('edge_update_per_layer', False),
+            'node_update_mlp': config.get('node_update_mlp', False),
+            'transformer_num_heads': config.get('transformer_num_heads', 4),
+            'transformer_ffn_hidden': config.get('transformer_ffn_hidden', None),
+            'transformer_dropout': config.get('transformer_dropout', 0.0),
+            'transformer_residual_dropout': config.get('transformer_residual_dropout', 0.0),
+            'transformer_ffn_gated': config.get('transformer_ffn_gated', False),
+            'transformer_layer_scale_init': config.get('transformer_layer_scale_init', None),
+            'transformer_attention_chunk_size': config.get('transformer_attention_chunk_size', None),
+            'use_transformer': config.get('use_transformer', True),
+            'attention_neighbor_mask': config.get('attention_neighbor_mask', False),
         }
     }
     torch.save(checkpoint, path)
@@ -254,6 +271,19 @@ def main():
     use_amp = config.get('use_amp', False) and device_type == 'cuda'
     amp_dtype = torch.float16 if config.get('amp_dtype', 'float16') == 'float16' else torch.bfloat16
     grad_accum_steps = max(1, int(config.get('grad_accum_steps', 1)))
+
+    if device_type == "cuda":
+        sdp_backend = str(config.get('sdp_backend', 'auto')).lower()
+        if sdp_backend not in {'auto', 'flash', 'mem_efficient', 'math'}:
+            raise ValueError("sdp_backend must be one of {'auto', 'flash', 'mem_efficient', 'math'}")
+        if sdp_backend == "auto":
+            sdp_backend = "math"
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(sdp_backend == "flash")
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(sdp_backend == "mem_efficient")
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(sdp_backend == "math")
     
 
     print(f"Reading data from {config['train_file']}...")
@@ -325,9 +355,23 @@ def main():
         radial_trainable=config.get('radial_trainable', False),
         envelope_exponent=config.get('envelope_exponent', 5),
         gaussian_width=config.get('gaussian_width', 0.5),
-        attention_message_clip=config.get('attention_message_clip', None),
-        attention_conditioned_decay=config.get('attention_conditioned_decay', True),
-        attention_share_qkv=config.get('attention_share_qkv', "none"),
+        transformer_num_heads=config.get('transformer_num_heads', 4),
+        transformer_ffn_hidden=config.get('transformer_ffn_hidden', None),
+        transformer_dropout=config.get('transformer_dropout', 0.0),
+        transformer_residual_dropout=config.get('transformer_residual_dropout', 0.0),
+        transformer_ffn_gated=config.get('transformer_ffn_gated', False),
+        transformer_layer_scale_init=config.get('transformer_layer_scale_init', None),
+        transformer_attention_chunk_size=config.get('transformer_attention_chunk_size', None),
+        use_transformer=config.get('use_transformer', True),
+        attention_neighbor_mask=config.get('attention_neighbor_mask', False),
+        descriptor_passes=config.get('descriptor_passes', 1),
+        descriptor_residual=config.get('descriptor_residual', True),
+        radial_mlp_hidden=config.get('radial_mlp_hidden', 64),
+        radial_mlp_layers=config.get('radial_mlp_layers', 2),
+        message_passing_layers=config.get('message_passing_layers', 0),
+        interleave_descriptor=config.get('interleave_descriptor', False),
+        edge_update_per_layer=config.get('edge_update_per_layer', False),
+        node_update_mlp=config.get('node_update_mlp', False),
         use_aux_force_head=config.get('use_aux_force_head', True),
         use_aux_stress_head=config.get('use_aux_stress_head', True),
     ).to(device)
@@ -336,13 +380,63 @@ def main():
         model.parameters(), lr=config['learning_rate'], amsgrad=True,
         weight_decay=config.get('weight_decay', 0.0)
     )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=config.get('lr_scheduler_factor', 0.8),
-        patience=config.get('lr_scheduler_patience', 15),
-        min_lr=config.get('lr_min', 0.0),
-    )
+    warmup_epochs = max(0, int(config.get('lr_warmup_epochs', 0)))
+    warmup_start = float(config.get('lr_warmup_start_factor', 0.1))
+    scheduler_interval = str(config.get('lr_scheduler_interval', 'epoch')).lower()
+    if warmup_start <= 0.0:
+        raise ValueError("lr_warmup_start_factor must be > 0.0")
+    if scheduler_interval not in {'epoch', 'step'}:
+        raise ValueError("lr_scheduler_interval must be 'epoch' or 'step'")
+
+    steps_per_epoch = max(1, len(train_loader))
+    configured_t_max = int(config.get('lr_scheduler_t_max', config['epochs']))
+    if scheduler_interval == 'step':
+        warmup_iters = warmup_epochs * steps_per_epoch
+        total_iters = max(warmup_iters + 1, configured_t_max * steps_per_epoch)
+    else:
+        warmup_iters = warmup_epochs
+        total_iters = max(warmup_epochs + 1, configured_t_max)
+    cosine_t_max = max(1, total_iters - warmup_iters)
+
+    use_restarts = bool(config.get('lr_scheduler_use_restarts', False))
+    restart_mult = float(config.get('lr_restart_mult', 1.0))
+    if use_restarts:
+        cosine = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=cosine_t_max,
+            T_mult=max(1.0, restart_mult),
+            eta_min=config.get('lr_min', 0.0),
+        )
+    else:
+        cosine = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cosine_t_max,
+            eta_min=config.get('lr_min', 0.0),
+        )
+    if warmup_iters > 0:
+        warmup = optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=warmup_start,
+            total_iters=warmup_iters,
+        )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[warmup_iters],
+        )
+    else:
+        scheduler = cosine
+
+    # Optional force-weight annealing to ease optimization toward energies.
+    force_w_start = float(config.get('forces_weight', 10.0))
+    force_w_final = float(config.get('forces_weight_final', force_w_start))
+    force_w_decay_epochs = int(config.get('forces_weight_decay_epochs', 0))
+
+    def _force_weight(epoch_idx: int) -> float:
+        if force_w_decay_epochs <= 0 or force_w_start == force_w_final:
+            return force_w_start
+        frac = min(1.0, epoch_idx / max(1, force_w_decay_epochs))
+        return force_w_start + frac * (force_w_final - force_w_start)
 
     resume_path = config.get('resume_from')
     start_epoch = 0
@@ -436,6 +530,7 @@ def main():
     
     force_loss_ema = None
     for epoch in range(start_epoch, config['epochs']):
+        force_weight = _force_weight(epoch)
         model.train()
         train_metrics = MetricTracker()
         total_loss = 0.0
@@ -488,9 +583,9 @@ def main():
                     if torch.norm(item['t_S']) > 1e-6:
                         loss_s = torch.mean((p_S - item['t_S'])**2)
 
-                    loss_item = (config['energy_weight']*loss_e) + \
-                                (config['forces_weight']*loss_f) + \
-                                (config['stress_weight']*loss_s)
+                        loss_item = (config['energy_weight']*loss_e) + \
+                                    (force_weight*loss_f) + \
+                                    (config['stress_weight']*loss_s)
 
                     if aux_force_weight > 0.0 and 'force' in aux:
                         loss_item = loss_item + aux_force_weight * torch.mean((aux['force'] - item['t_F'])**2)
@@ -552,6 +647,8 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                if scheduler_interval == 'step':
+                    scheduler.step()
             total_loss += batch_loss
 
         # Flush any residual gradients if the last batch didn't trigger a step
@@ -564,6 +661,8 @@ def main():
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            if scheduler_interval == 'step':
+                scheduler.step()
 
         avg_train_loss = total_loss / max(1, total_items_seen)
         tr_e, tr_f, tr_s, tr_f_mse, tr_f_mae = train_metrics.get_metrics()
@@ -589,7 +688,7 @@ def main():
                     target_E = item['t_E'] - baseline_energy(item['z'])
                     loss_e = ((p_E - target_E) / n_ats)**2
                     loss_f = torch.mean((p_F - item['t_F'])**2)
-                    val_loss_accum += (config['energy_weight']*loss_e) + (config['forces_weight']*loss_f)
+                    val_loss_accum += (config['energy_weight']*loss_e) + (force_weight*loss_f)
 
                 pred_E_abs = p_E + baseline_energy(item['z'])
                 val_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
@@ -597,7 +696,8 @@ def main():
         avg_val_loss = val_loss_accum / len(val_atoms)
         val_e, val_f, val_s, val_f_mse, val_f_mae = val_metrics.get_metrics()
         history['val_loss'].append(avg_val_loss)
-        scheduler.step(avg_val_loss)
+        if scheduler_interval == 'epoch':
+            scheduler.step()
 
         print(
             f"{epoch+1:5d} | "
