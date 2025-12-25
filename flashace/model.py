@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from e3nn import o3
 from .physics import ACE_Descriptor
 
@@ -182,7 +183,7 @@ class TransformerBlock(nn.Module):
         x_norm = self.norm2(x)
         if self.ffn_gated:
             gate, value = self.ffn_in(x_norm).chunk(2, dim=-1)
-            ffn_out = self.ffn_out(torch.silu(gate) * value)
+            ffn_out = self.ffn_out(F.silu(gate) * value)
         else:
             ffn_out = self.ffn(x_norm)
         ffn_out = self.dropout(ffn_out)
