@@ -254,6 +254,14 @@ def main():
     use_amp = config.get('use_amp', False) and device_type == 'cuda'
     amp_dtype = torch.float16 if config.get('amp_dtype', 'float16') == 'float16' else torch.bfloat16
     grad_accum_steps = max(1, int(config.get('grad_accum_steps', 1)))
+
+    if device_type == "cuda":
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(True)
     
 
     print(f"Reading data from {config['train_file']}...")
