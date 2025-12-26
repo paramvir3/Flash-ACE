@@ -21,3 +21,5 @@ python train.py --config training/config.yaml
 Energies converge, not forces
 
 Transfomer block improves force learning
+
+Transformer brings overfitting problem
