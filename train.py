@@ -719,7 +719,6 @@ def main():
 
         # Validation
         model.eval()
-        temp_scale = _temperature_scale(epoch, force_loss_ema)
         val_metrics = MetricTracker()
         val_loss_accum = 0.0
 
@@ -737,7 +736,6 @@ def main():
                     p_E, p_F, p_S, _ = model(
                         item,
                         training=False,
-                        temperature_scale=temp_scale,
                         compute_stress=stress_target,
                     )
                     n_ats = len(item['z'])
