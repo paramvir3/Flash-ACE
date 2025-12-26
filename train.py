@@ -732,13 +732,18 @@ def main():
                 # still avoid higher-order graphs with ``create_graph=False``
                 # inside the model during validation.
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-                    p_E, p_F, p_S, _ = model(item, training=False)
+                    stress_target = torch.norm(item['t_S']) > 1e-6
+                    p_E, p_F, p_S, _ = model(
+                        item,
+                        training=False,
+                        compute_stress=stress_target,
+                    )
                     n_ats = len(item['z'])
                     target_E = item['t_E'] - baseline_energy(item['z'])
                     loss_e = ((p_E - target_E) / n_ats)**2
                     loss_f = torch.mean((p_F - item['t_F'])**2)
                     loss_s = torch.tensor(0.0, device=device)
-                    if torch.norm(item['t_S']) > 1e-6:
+                    if stress_target:
                         loss_s = torch.mean((p_S - item['t_S'])**2)
                     val_loss_accum += (config['energy_weight']*loss_e) + (force_weight*loss_f) + (config['stress_weight']*loss_s)
 

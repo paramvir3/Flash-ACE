@@ -375,9 +375,19 @@ class FlashACE(nn.Module):
                 nn.Linear(hidden_dim, 6),
             )
 
-    def forward(self, data, training=False, temperature_scale: float = 1.0, detach_pos: bool = True):
+    def forward(
+        self,
+        data,
+        training: bool = False,
+        temperature_scale: float = 1.0,
+        detach_pos: bool = True,
+        compute_stress: bool | None = None,
+    ):
         z, pos, edge_index = data['z'], data['pos'], data['edge_index']
         cell_volume = data.get('volume', None)
+
+        if compute_stress is None:
+            compute_stress = training
 
         # We always need gradients w.r.t. atomic positions to compute forces.
         # Detach to ensure we work with a leaf tensor before enabling grads.
@@ -385,7 +395,7 @@ class FlashACE(nn.Module):
             pos = pos.detach()
         pos.requires_grad_(True)
 
-        if training and cell_volume is not None:
+        if compute_stress and cell_volume is not None:
             # Parameterize the small-strain tensor symmetrically so the stress
             # we backpropagate through corresponds to the symmetric Cauchy
             # stress and does not pick up spurious rotational components. This
@@ -489,14 +499,14 @@ class FlashACE(nn.Module):
         F = -grads if grads is not None else torch.zeros_like(pos)
         
         S = torch.zeros(3, 3, device=pos.device)
-        if training and epsilon is not None:
+        if compute_stress and epsilon is not None:
             # Retain the graph so the outer loss.backward() can still traverse
             # the computation graph built when taking the strain derivative.
             g_eps = torch.autograd.grad(
                 E,
                 strain_params,
-                create_graph=True,
-                retain_graph=True,
+                create_graph=training,
+                retain_graph=training,
                 allow_unused=True,
             )[0]
             if g_eps is not None:
