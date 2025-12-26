@@ -6,6 +6,8 @@
 train_file: "data_2.extxyz"    # Your full dataset
 valid_file: null                  # Leave null to use random split
 val_split: 0.1                    # 10% of data used for validation (randomly selected)
+split_seed: 42                    # RNG seed for train/val splitting
+stratified_val_bins: 0           # >0 enables energy-stratified split with N bins
 model_save_path: "model.pt"
 
 # ------------------------------------------------------------------------------

@@ -299,11 +299,32 @@ def main():
     else:
         val_len = max(1, int(len(all_atoms) * config.get('val_split', 0.1)))
         train_len = len(all_atoms) - val_len
-        train_atoms, val_atoms = random_split(
-            all_atoms, [train_len, val_len],
-            generator=torch.Generator().manual_seed(42)
-        )
-        print(f"Random Split: {train_len} Training | {val_len} Validation")
+        split_seed = int(config.get('split_seed', 42))
+        strat_bins = int(config.get('stratified_val_bins', 0))
+        if strat_bins > 0 and len(all_atoms) > strat_bins:
+            energies = np.array([atoms.get_potential_energy() for atoms in all_atoms], dtype=float)
+            edges = np.quantile(energies, np.linspace(0, 1, strat_bins + 1))
+            indices = np.arange(len(all_atoms))
+            val_indices = []
+            rng = np.random.default_rng(split_seed)
+            for i in range(strat_bins):
+                in_bin = indices[(energies >= edges[i]) & (energies <= edges[i + 1])]
+                if len(in_bin) == 0:
+                    continue
+                rng.shuffle(in_bin)
+                take = max(1, int(len(in_bin) * config.get('val_split', 0.1)))
+                val_indices.extend(in_bin[:take].tolist())
+            val_indices = np.unique(val_indices)
+            train_indices = np.setdiff1d(indices, val_indices)
+            train_atoms = torch.utils.data.Subset(all_atoms, train_indices.tolist())
+            val_atoms = torch.utils.data.Subset(all_atoms, val_indices.tolist())
+            print(f"Stratified Split: {len(train_indices)} Training | {len(val_indices)} Validation")
+        else:
+            train_atoms, val_atoms = random_split(
+                all_atoms, [train_len, val_len],
+                generator=torch.Generator().manual_seed(split_seed)
+            )
+            print(f"Random Split: {train_len} Training | {val_len} Validation")
 
     atomic_energy_map = parse_atomic_energy_table(config.get('atomic_energies'))
 
