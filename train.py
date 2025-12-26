@@ -608,9 +608,9 @@ def main():
                     if torch.norm(item['t_S']) > 1e-6:
                         loss_s = torch.mean((p_S - item['t_S'])**2)
 
-                        loss_item = (config['energy_weight']*loss_e) + \
-                                    (force_weight*loss_f) + \
-                                    (config['stress_weight']*loss_s)
+                    loss_item = (config['energy_weight']*loss_e) + \
+                                (force_weight*loss_f) + \
+                                (config['stress_weight']*loss_s)
 
                     if aux_force_weight > 0.0 and 'force' in aux:
                         loss_item = loss_item + aux_force_weight * torch.mean((aux['force'] - item['t_F'])**2)
@@ -716,7 +716,10 @@ def main():
                     target_E = item['t_E'] - baseline_energy(item['z'])
                     loss_e = ((p_E - target_E) / n_ats)**2
                     loss_f = torch.mean((p_F - item['t_F'])**2)
-                    val_loss_accum += (config['energy_weight']*loss_e) + (force_weight*loss_f)
+                    loss_s = torch.tensor(0.0, device=device)
+                    if torch.norm(item['t_S']) > 1e-6:
+                        loss_s = torch.mean((p_S - item['t_S'])**2)
+                    val_loss_accum += (config['energy_weight']*loss_e) + (force_weight*loss_f) + (config['stress_weight']*loss_s)
 
                 pred_E_abs = p_E + baseline_energy(item['z'])
                 val_metrics.update(pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'], n_ats)
