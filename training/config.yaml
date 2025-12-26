@@ -32,6 +32,9 @@ transformer_attention_chunk_size: null # Chunked attention over nodes to reduce 
 use_transformer: true            # Enable transformer blocks (disable to rely on message passing only)
 transformer_scalar_only: false   # Apply transformer attention only on scalar channels
 attention_neighbor_mask: false   # Restrict attention to neighbor edges and self
+attention_short_range: false     # Run a second short-range attention pass and fuse
+attention_short_range_ratio: 0.5 # Short-range cutoff ratio of r_max (0-1]
+attention_short_range_gate: true # Gate short vs long attention outputs per node
 radial_basis_type: "bessel"       # Options: bessel, gaussian
 radial_trainable: false           # Make radial frequencies/centers learnable
 envelope_exponent: 5              # Polynomial cutoff exponent (higher = steeper)

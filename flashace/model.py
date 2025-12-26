@@ -248,6 +248,9 @@ class FlashACE(nn.Module):
         use_transformer: bool = True,
         transformer_scalar_only: bool = False,
         attention_neighbor_mask: bool = False,
+        attention_short_range: bool = False,
+        attention_short_range_ratio: float = 0.5,
+        attention_short_range_gate: bool = True,
         use_aux_force_head: bool = True,
         use_aux_stress_head: bool = True,
         message_passing_layers: int = 0,
@@ -271,6 +274,9 @@ class FlashACE(nn.Module):
         self.use_transformer = bool(use_transformer)
         self.transformer_scalar_only = bool(transformer_scalar_only)
         self.attention_neighbor_mask = bool(attention_neighbor_mask)
+        self.attention_short_range = bool(attention_short_range)
+        self.attention_short_range_ratio = float(attention_short_range_ratio)
+        self.attention_short_range_gate = bool(attention_short_range_gate)
         self.use_aux_force_head = use_aux_force_head
         self.use_aux_stress_head = use_aux_stress_head
         self.message_passing_layers = max(0, int(message_passing_layers))
@@ -340,6 +346,14 @@ class FlashACE(nn.Module):
                 )
         else:
             self.layers = nn.ModuleList()
+        self.short_range_gate = None
+        if self.use_transformer and self.attention_short_range and self.attention_short_range_gate:
+            self.short_range_gate = nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.hidden_dim, 1),
+                nn.Sigmoid(),
+            )
         
         self.readout = nn.Sequential(
             nn.Linear(hidden_dim, 64), 
@@ -410,12 +424,22 @@ class FlashACE(nn.Module):
             h = mp_layer(h, edge_index, edge_len)
 
         attn_mask = None
+        attn_mask_short = None
         if self.use_transformer and self.attention_neighbor_mask:
             num_nodes = h.shape[0]
             attn_mask = torch.ones((num_nodes, num_nodes), device=h.device, dtype=torch.bool)
             idx = torch.arange(num_nodes, device=h.device)
             attn_mask[idx, idx] = False
             attn_mask[edge_index[0], edge_index[1]] = False
+            if self.attention_short_range:
+                if not (0.0 < self.attention_short_range_ratio <= 1.0):
+                    raise ValueError("attention_short_range_ratio must be in (0, 1]")
+                cutoff = self.r_max * self.attention_short_range_ratio
+                short_edges = edge_len <= cutoff
+                attn_mask_short = torch.ones((num_nodes, num_nodes), device=h.device, dtype=torch.bool)
+                attn_mask_short[idx, idx] = False
+                if short_edges.any():
+                    attn_mask_short[edge_index[0][short_edges], edge_index[1][short_edges]] = False
 
         for idx, layer in enumerate(self.layers):
             if self.interleave_descriptor:
@@ -424,7 +448,16 @@ class FlashACE(nn.Module):
                 h = h + desc if self.descriptor_residual else desc
             if self.edge_update_per_layer and len(self.edge_updates) > 0:
                 h = self.edge_updates[idx](h, edge_index, edge_len)
-            h = layer(h, attn_mask=attn_mask)
+            if attn_mask_short is not None:
+                long_out = layer(h, attn_mask=attn_mask)
+                short_out = layer(h, attn_mask=attn_mask_short)
+                if self.short_range_gate is None:
+                    h = 0.5 * (short_out + long_out)
+                else:
+                    gate = self.short_range_gate(h[..., : self.hidden_dim])
+                    h = gate * short_out + (1.0 - gate) * long_out
+            else:
+                h = layer(h, attn_mask=attn_mask)
             if self.node_update_mlp and len(self.node_updates) > 0:
                 h = self.node_updates[idx](h)
             

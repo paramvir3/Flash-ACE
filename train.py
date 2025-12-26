@@ -82,6 +82,9 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, en
             'use_transformer': config.get('use_transformer', True),
             'transformer_scalar_only': config.get('transformer_scalar_only', False),
             'attention_neighbor_mask': config.get('attention_neighbor_mask', False),
+            'attention_short_range': config.get('attention_short_range', False),
+            'attention_short_range_ratio': config.get('attention_short_range_ratio', 0.5),
+            'attention_short_range_gate': config.get('attention_short_range_gate', True),
         }
     }
     torch.save(checkpoint, path)
@@ -366,6 +369,9 @@ def main():
         use_transformer=config.get('use_transformer', True),
         transformer_scalar_only=config.get('transformer_scalar_only', False),
         attention_neighbor_mask=config.get('attention_neighbor_mask', False),
+        attention_short_range=config.get('attention_short_range', False),
+        attention_short_range_ratio=config.get('attention_short_range_ratio', 0.5),
+        attention_short_range_gate=config.get('attention_short_range_gate', True),
         descriptor_passes=config.get('descriptor_passes', 1),
         descriptor_residual=config.get('descriptor_residual', True),
         radial_mlp_hidden=config.get('radial_mlp_hidden', 64),
