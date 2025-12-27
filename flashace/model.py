@@ -309,6 +309,7 @@ class FlashACE(nn.Module):
         equivariant_mix_per_layer: bool = False,
         edge_state_dim: int | None = None,
         edge_attention: bool = False,
+        readout_hidden_dims: list[int] | None = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -338,6 +339,7 @@ class FlashACE(nn.Module):
         self.equivariant_mix_per_layer = bool(equivariant_mix_per_layer)
         self.edge_attention = bool(edge_attention)
         self.edge_state_dim = edge_state_dim or hidden_dim
+        self.readout_hidden_dims = readout_hidden_dims
         self.node_scalar_irreps = o3.Irreps(f"{hidden_dim}x0e")
 
         self.emb = nn.Embedding(118, hidden_dim)
@@ -432,11 +434,15 @@ class FlashACE(nn.Module):
                 nn.Sigmoid(),
             )
         
-        self.readout = nn.Sequential(
-            nn.Linear(hidden_dim, 64), 
-            nn.SiLU(), 
-            nn.Linear(64, 1)
-        )
+        readout_layers = []
+        readout_dims = [hidden_dim]
+        if self.readout_hidden_dims:
+            readout_dims.extend([int(d) for d in self.readout_hidden_dims])
+        for in_dim, out_dim in zip(readout_dims, readout_dims[1:]):
+            readout_layers.append(nn.Linear(in_dim, out_dim))
+            readout_layers.append(nn.SiLU())
+        readout_layers.append(nn.Linear(readout_dims[-1], 1))
+        self.readout = nn.Sequential(*readout_layers)
         self.aux_force_head = None
         self.aux_stress_head = None
         if self.use_aux_force_head:

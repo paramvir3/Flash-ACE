@@ -404,6 +404,7 @@ def main():
         equivariant_mix_per_layer=config.get('equivariant_mix_per_layer', False),
         edge_state_dim=config.get('edge_state_dim', None),
         edge_attention=config.get('edge_attention', False),
+        readout_hidden_dims=config.get('readout_hidden_dims', None),
         use_aux_force_head=config.get('use_aux_force_head', True),
         use_aux_stress_head=config.get('use_aux_stress_head', True),
     ).to(device)

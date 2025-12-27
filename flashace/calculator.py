@@ -81,6 +81,7 @@ class FlashACECalculator(Calculator):
             equivariant_mix_per_layer=conf.get('equivariant_mix_per_layer', False),
             edge_state_dim=conf.get('edge_state_dim', None),
             edge_attention=conf.get('edge_attention', False),
+            readout_hidden_dims=conf.get('readout_hidden_dims', None),
             use_aux_force_head=conf.get('use_aux_force_head', False),
             use_aux_stress_head=conf.get('use_aux_stress_head', False),
         )
