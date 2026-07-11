@@ -257,6 +257,28 @@ def test_attention_does_not_read_updated_sender_hidden_states():
     torch.testing.assert_close(first[0], second[0])
 
 
+def test_irrepwise_attention_layer_scale_preserves_equivariance_after_training():
+    model = _model()
+    # Deliberately make the stored legacy componentwise parameter anisotropic.
+    # The forward path must average within each irrep copy before applying it.
+    with torch.no_grad():
+        scale = model.layers[0].layer_scale_attn
+        scale.copy_(torch.linspace(-0.2, 0.3, scale.numel()))
+
+    positions = torch.tensor(
+        [[0.1, 0.2, 0.3], [1.2, 0.4, 0.7], [0.5, 1.3, 0.8], [0.8, 0.7, 1.7]]
+    )
+    rotation = torch.tensor([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    energy, forces, _, _ = model(_data(positions), training=False, compute_stress=False)
+    rotated_energy, rotated_forces, _, _ = model(
+        _data(positions @ rotation.T), training=False, compute_stress=False
+    )
+    torch.testing.assert_close(rotated_energy, energy, atol=3e-5, rtol=3e-5)
+    torch.testing.assert_close(
+        rotated_forces, forces @ rotation.T, atol=3e-4, rtol=3e-4
+    )
+
+
 def test_new_model_is_compact_and_legacy_checkpoints_remain_versioned():
     model = TransformersACE(
         r_max=6.0,
