@@ -1,0 +1,13 @@
+.download_cache/
+__pycache__/
+**/__pycache__/
+**/checkpoints/
+**/data/
+**/evaluation/
+**/models/
+**/plots/
+**/results/
+**/wtmetad/
+**/*.traj
+**/trajectory*.xyz
+**/structures/*_irc.xyz

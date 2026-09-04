@@ -1,0 +1,219 @@
+{
+  "figshare_article": "https://doi.org/10.6084/m9.figshare.28631591.v4",
+  "energy_label_convention": "E_true - energy_reference_eV",
+  "energy_reference_eV": -11580.602905237623,
+  "charge": 0,
+  "multiplicity": 1,
+  "coordinate_names": [
+    "r1_C_C_A",
+    "r2_C_C_A",
+    "cv_r1_minus_r2_A"
+  ],
+  "primary_coordinate": "cv_r1_minus_r2_A",
+  "source_files": {
+    "wtmetad": {
+      "file_id": 59117249,
+      "filename": "r2_wtmetad_al.npz",
+      "md5": "f467b7ae9f2f395af500083876ced250"
+    },
+    "downhill": {
+      "file_id": 59117315,
+      "filename": "r2_downhill_al.npz",
+      "md5": "65023cab1ad7eb53e26abc11b41952d2"
+    },
+    "us_test": {
+      "file_id": 59117237,
+      "filename": "r2_wtmetad_us_test.npz",
+      "md5": "d2149e652b6fc4f7bed972a5d513e512"
+    },
+    "reactant": {
+      "file_id": 59117264,
+      "filename": "r_r2.xyz",
+      "md5": "338cad0bc2c6019e9f1755f4167b8d2b"
+    },
+    "transition_state": {
+      "file_id": 59117267,
+      "filename": "ts_r2.xyz",
+      "md5": "ee904f5d503d01e03c0994d85d0c2cb5"
+    },
+    "product": {
+      "file_id": 59117261,
+      "filename": "p_r2.xyz",
+      "md5": "2288c865a32ffee5a52faa507f27e44c"
+    },
+    "irc_coordinates": {
+      "file_id": 59117297,
+      "filename": "r2_irc.xyz",
+      "md5": "4d4a6b56ce4e59fc6d2ee52ab0331c4a"
+    }
+  },
+  "duplicates_removed_from_combined_pool": 0,
+  "statistics": {
+    "combined_all": {
+      "frames": 323,
+      "atoms_per_frame": [
+        23
+      ],
+      "chemical_formulas": [
+        "C11H12"
+      ],
+      "relative_energy_min_eV": 0.0,
+      "relative_energy_max_eV": 4.574837142774413,
+      "coordinate_min_A": -2.0049855966229724,
+      "coordinate_max_A": 2.302990830509212,
+      "maximum_atomic_force_eV_per_A": 9.643004671462213,
+      "maximum_net_force_eV_per_A": 0.018611363163729137
+    },
+    "combined_train": {
+      "frames": 274,
+      "atoms_per_frame": [
+        23
+      ],
+      "chemical_formulas": [
+        "C11H12"
+      ],
+      "relative_energy_min_eV": 0.0,
+      "relative_energy_max_eV": 4.574837142774413,
+      "coordinate_min_A": -2.0049855966229724,
+      "coordinate_max_A": 2.302990830509212,
+      "maximum_atomic_force_eV_per_A": 9.643004671462213,
+      "maximum_net_force_eV_per_A": 0.018611363163729137
+    },
+    "combined_valid": {
+      "frames": 49,
+      "atoms_per_frame": [
+        23
+      ],
+      "chemical_formulas": [
+        "C11H12"
+      ],
+      "relative_energy_min_eV": 0.6863280706566002,
+      "relative_energy_max_eV": 3.471463508283705,
+      "coordinate_min_A": -1.6641206397538546,
+      "coordinate_max_A": 2.0153149962749453,
+      "maximum_atomic_force_eV_per_A": 8.235924277571106,
+      "maximum_net_force_eV_per_A": 0.014550368931095882
+    },
+    "wtmetad_all": {
+      "frames": 192,
+      "atoms_per_frame": [
+        23
+      ],
+      "chemical_formulas": [
+        "C11H12"
+      ],
+      "relative_energy_min_eV": 0.0,
+      "relative_energy_max_eV": 4.574837142774413,
+      "coordinate_min_A": -2.0049855966229724,
+      "coordinate_max_A": 2.302990830509212,
+      "maximum_atomic_force_eV_per_A": 9.643004671462213,
+      "maximum_net_force_eV_per_A": 0.018611363163729137
+    },
+    "wtmetad_train": {
+      "frames": 163,
+      "atoms_per_frame": [
+        23
+      ],
+      "chemical_formulas": [
+        "C11H12"
+      ],
+      "relative_energy_min_eV": 0.0,
+      "relative_energy_max_eV": 4.574837142774413,
+      "coordinate_min_A": -2.0049855966229724,
+      "coordinate_max_A": 2.302990830509212,
+      "maximum_atomic_force_eV_per_A": 9.643004671462213,
+      "maximum_net_force_eV_per_A": 0.018611363163729137
+    },
+    "wtmetad_valid": {
+      "frames": 29,
+      "atoms_per_frame": [
+        23
+      ],
+      "chemical_formulas": [
+        "C11H12"
+      ],
+      "relative_energy_min_eV": 0.6863280706566002,
+      "relative_energy_max_eV": 3.471463508283705,
+      "coordinate_min_A": -1.6641206397538546,
+      "coordinate_max_A": 2.0153149962749453,
+      "maximum_atomic_force_eV_per_A": 8.235924277571106,
+      "maximum_net_force_eV_per_A": 0.014550368931095882
+    },
+    "downhill_all": {
+      "frames": 131,
+      "atoms_per_frame": [
+        23
+      ],
+      "chemical_formulas": [
+        "C11H12"
+      ],
+      "relative_energy_min_eV": 0.3234541633155459,
+      "relative_energy_max_eV": 3.280612813494372,
+      "coordinate_min_A": -1.1260000270844215,
+      "coordinate_max_A": 1.3536475415767146,
+      "maximum_atomic_force_eV_per_A": 8.937382510193318,
+      "maximum_net_force_eV_per_A": 0.01789619660215458
+    },
+    "downhill_train": {
+      "frames": 111,
+      "atoms_per_frame": [
+        23
+      ],
+      "chemical_formulas": [
+        "C11H12"
+      ],
+      "relative_energy_min_eV": 0.3234541633155459,
+      "relative_energy_max_eV": 3.280612813494372,
+      "coordinate_min_A": -1.1260000270844215,
+      "coordinate_max_A": 1.3536475415767146,
+      "maximum_atomic_force_eV_per_A": 8.937382510193318,
+      "maximum_net_force_eV_per_A": 0.01789619660215458
+    },
+    "downhill_valid": {
+      "frames": 20,
+      "atoms_per_frame": [
+        23
+      ],
+      "chemical_formulas": [
+        "C11H12"
+      ],
+      "relative_energy_min_eV": 0.7437330518132512,
+      "relative_energy_max_eV": 3.0166324525362143,
+      "coordinate_min_A": -1.0049254433275845,
+      "coordinate_max_A": 1.255581290443907,
+      "maximum_atomic_force_eV_per_A": 7.160854747790269,
+      "maximum_net_force_eV_per_A": 0.012513688114401489
+    },
+    "us_test": {
+      "frames": 326,
+      "atoms_per_frame": [
+        23
+      ],
+      "chemical_formulas": [
+        "C11H12"
+      ],
+      "relative_energy_min_eV": -0.8215426905553613,
+      "relative_energy_max_eV": 2.4117928975501854,
+      "coordinate_min_A": -1.009011392127416,
+      "coordinate_max_A": 1.082681404338911,
+      "maximum_atomic_force_eV_per_A": 5.793272360363471,
+      "maximum_net_force_eV_per_A": 0.019690785845382697
+    }
+  },
+  "sha256": {
+    "data/combined_all.xyz": "987cf47e9edb9b7da9e392735f6b213f43a0034fcbcfc57179bf53b3004e54bd",
+    "data/combined_train.xyz": "09d367980d584d7917fa9331ed9950a675276b3384e3b29b7515cb1b753851d2",
+    "data/combined_valid.xyz": "5a7e7033adf1585c93559d8e1196730e97ad9acae91c9e9994fac5cda6c77fbb",
+    "data/downhill_all.xyz": "025ae33202d1ac1024d9b884bf03b5ea7be03b3ba933ce95bf4a4f2554460ed7",
+    "data/downhill_train.xyz": "d9975eb816d21651a59d745463a6e42f81eb9bade3f2d0ac8d8f3556d2e85ba0",
+    "data/downhill_valid.xyz": "1e2e805052e1bbfe22bba4cc42c3f6da987c71431f98e8c406e5a5d8a0910bc2",
+    "data/us_test.xyz": "43fef1c1ffffc6231ecac6c8a8a7536c073e67a8c553ed22df6965b070ceecb5",
+    "data/wtmetad_all.xyz": "0f143ac208a934eee71f8177c05cb967abf2c47bc470030a6dd7be9df55725cd",
+    "data/wtmetad_train.xyz": "6c4eaf7e03afdba24dcd57123c227c6928a0d9aed3ac90897b04c2231d4768d5",
+    "data/wtmetad_valid.xyz": "5092f72ba3120205df0aa147c89a32e347e212e4cfd28cb0d07c1f1ba7be9f03",
+    "structures/p_r2.xyz": "35e723d3c84e1ead440d6b7b2300a34813a5e6bb7b9c670a04fd1bc65e4731a4",
+    "structures/r2_irc.xyz": "49912100c52cd372a64bafd4713f2a524ce6536679b000787bd3b4ce9baf60f0",
+    "structures/r_r2.xyz": "a6ec46a357226d18d850742d6b2222eae2709239ded11efa682fdeb57bafdaba",
+    "structures/ts_r2.xyz": "0a0399cba2a44d8ea3728923b2fb374e396ddcb3e0d498f55511b997313e0204"
+  }
+}

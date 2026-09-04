@@ -1,0 +1,31 @@
+Water RDF analysis
+==================
+RDF file: tests/run_lammps/water_ccsd/h2o.rdf
+Complete RDF blocks parsed: 2705
+First RDF timestep: 0
+Final RDF timestep: 270400
+Time step: 0.0005 ps
+Final sampled time: 135.2 ps
+
+Trajectory summary
+Dump file: tests/run_lammps/water_ccsd/h2o.xyz
+Frames parsed: 2705
+Atoms: 432
+Type counts from first frame: {1: 288, 2: 144}
+Water molecules inferred from type 1=H, type 2=O: 144
+
+RDF column mapping
+type 1 = H, type 2 = O
+g_HH = c_myRDF[2], g_HO = c_myRDF[4], g_OO = c_myRDF[6]
+Because the LAMMPS input uses 'ave running', the final RDF block is the cumulative average.
+
+O-O RDF diagnostics
+TRACE/LAMMPS first O-O peak: r = 2.8500 A, g = 2.5194
+Experimental file: tests/run_lammps/water_ccsd/experimental_goo_skinner_295K.csv
+Experimental first O-O peak: r = 2.8000 A, g = 2.5752
+O-O RDF RMSE over common 2.2-6.0 A interval: 0.216580
+
+Wrote: tests/run_lammps/water_ccsd/rdf_analysis/rdf_trace_final.csv
+Wrote: tests/run_lammps/water_ccsd/rdf_analysis/rdf_oo_trace_vs_experiment.png
+O-H reference file: tests/run_lammps/water_ccsd/experimental_digitized/experimental_goh_soper_298K_digitized.csv
+H-H reference file: tests/run_lammps/water_ccsd/experimental_digitized/experimental_ghh_soper_298K_digitized.csv

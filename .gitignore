@@ -87,3 +87,10 @@ tests/run_lammps/benchmark_aot/log.*
 experiments/**/runs/
 experiments/**/logs/
 experiments/**/smoke/
+output/pdf/*.bbl
+output/pdf/*.blg
+output/pdf/*.fdb_latexmk
+output/pdf/*.fls
+output/pdf/*Notes.bib
+# Generated thermodynamic-integration and enhanced-sampling trajectories
+tests/cspbi3/free_energy_ti*/runs/

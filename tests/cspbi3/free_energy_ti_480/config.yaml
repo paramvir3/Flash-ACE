@@ -1,0 +1,86 @@
+system:
+  checkpoint: training/model.pt
+  type_map: [Cs, Pb, I]
+  expected_natoms: 480
+  pressure_bar: 1.01325
+  anchor_temperature_K: 450.0
+  timestep_ps: 0.001
+  lammps_executable: auto
+  torch_threads: 10
+  seed: 1949
+
+phases:
+  delta:
+    label: non-perovskite delta
+    structure: tests/cspbi3/results/relaxed/edge_sharing_delta_phase.vasp
+    repeat: [2, 6, 2]
+    barostat: aniso
+  cubic:
+    label: cubic alpha perovskite
+    structure: tests/cspbi3/results/relaxed/cubic_alpha_phase.vasp
+    repeat: [3, 4, 2]
+    barostat: iso
+
+profiles:
+  pilot:
+    temperatures_K: [450]
+    npt_equil_steps: 20
+    npt_sample_steps: 40
+    npt_sample_every: 1
+    msd_equil_steps: 20
+    msd_sample_steps: 40
+    msd_sample_every: 1
+    ti_equil_steps: 20
+    ti_switch_steps: 50
+    ti_replicas: 1
+    block_length_ps: 0.01
+    bootstrap_samples: 200
+
+  screening:
+    temperatures_K: [300, 350, 400, 450, 500, 550, 600, 650]
+    npt_equil_steps: 1000
+    npt_sample_steps: 4000
+    npt_sample_every: 10
+    msd_equil_steps: 1000
+    msd_sample_steps: 4000
+    msd_sample_every: 10
+    ti_equil_steps: 1000
+    ti_switch_steps: 5000
+    ti_replicas: 2
+    block_length_ps: 0.5
+    bootstrap_samples: 2000
+
+  production:
+    temperatures_K: [300, 350, 400, 450, 500, 550, 600, 650]
+    npt_equil_steps: 10000
+    npt_sample_steps: 40000
+    npt_sample_every: 10
+    msd_equil_steps: 5000
+    msd_sample_steps: 15000
+    msd_sample_every: 10
+    ti_equil_steps: 5000
+    ti_switch_steps: 30000
+    ti_replicas: 5
+    block_length_ps: 2.0
+    bootstrap_samples: 5000
+
+thermostat:
+  langevin_damping_ps: 0.1
+  npt_temperature_damping_ps: 0.1
+  npt_pressure_damping_ps: 1.0
+
+einstein_reference:
+  minimum_spring_eV_A2: 0.1
+  maximum_spring_eV_A2: 50.0
+  default_spring_eV_A2: 2.0
+
+analysis:
+  confidence_level: 0.95
+  formula_atoms: 5
+  rdf_cutoff_A: 8.0
+  rdf_bin_width_A: 0.05
+  pb_i_coordination_cutoff_A: 3.8
+  minimum_independent_blocks: 5
+  temperature_relative_tolerance: 0.05
+  pressure_mean_tolerance_bar: 500.0
+  maximum_switching_hysteresis_meV_atom: 1.0

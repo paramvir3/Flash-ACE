@@ -1,0 +1,121 @@
+# config.yaml
+
+# ------------------------------------------------------------------------------
+# 1. DATASETS
+# ------------------------------------------------------------------------------
+train_file: "./train.xyz"   # Resolved from the training working directory
+valid_file: null                  # Leave null to use the blocked split below
+val_split: 0.1                    # Fraction of data used for validation
+split_mode: "blocked"             # Keep correlated trajectory frames together
+split_block_size: 25              # Contiguous frames per validation-selection block
+split_gap: 2                      # Exclude nearby boundary frames from training
+seed: 42                          # Model initialization, split, and DataLoader shuffling
+model_save_path: "model.pt"
+save_last_checkpoint: true        # Also write model_last.pt; model.pt remains the best epoch
+plot_training_curves: true       # Save loss/error curves automatically after training
+plot_dir: "plots"                # training_curves.png and training_history.csv
+
+# ------------------------------------------------------------------------------
+# 2. MODEL ARCHITECTURE
+# ------------------------------------------------------------------------------
+r_max: 6
+l_max: 2
+num_radial: 12
+hidden_dim: 64
+num_layers: 1                    # One strictly local neighbor-set attention block
+architecture_version: 2
+correlation_order: 4             # Density, 3-body, and 4-body ACE correlations
+correlation_channels: 16         # Compact independent CG contraction channels
+attention_num_heads: 2           # Local invariant attention heads over cutoff neighbors
+attention_key_dim: null          # Per-head scalar key width (null chooses a conservative default)
+attention_ffn_hidden: null       # Scalar FFN width after equivariant attention
+attention_dropout: 0.03          # Light regularization for the small correlated dataset
+attention_layer_scale_init: 0.01 # Small residual scale for stable deep local attention
+attention_distance_penalty: true # Penalize long local edges in attention logits
+radial_basis_type: "bessel"       # Options: bessel, gaussian
+radial_trainable: false           # Make radial frequencies/centers learnable
+gaussian_width: 0.5              # Relative Gaussian width multiplier (only used if basis=gaussian)
+radial_mlp_hidden: 32           # Factorized compact radial mixing
+radial_mlp_layers: 2            # Layers for the radial mixing MLP
+
+# ------------------------------------------------------------------------------
+# 3. TRAINING PARAMETERS
+# ------------------------------------------------------------------------------
+epochs: 200
+batch_size: 8
+# Higher force focus with stable LR schedule
+learning_rate: 0.001
+# Optional optimizer and scheduler tweaks
+optimizer: "muon"                # Options: adam, adamw, muon
+weight_decay: 0.00001
+amsgrad: true
+muon_momentum: 0.95
+muon_ns_steps: 5
+muon_ns_dtype: "auto"            # CUDA uses BF16 like the Muon reference; CPU keeps FP32
+muon_nesterov: true
+muon_parameter_mode: "hidden"    # Muon for transformer hidden matrices only
+muon_include: []
+muon_exclude: []
+muon_aux_betas: [0.9, 0.95]
+muon_aux_eps: 1.0e-10
+# muon_learning_rate: 0.005
+# muon_aux_learning_rate: 0.001
+lr_scheduler_t_max: 100          # One cosine decay over the requested training length
+lr_warmup_epochs: 0              # Linear warmup steps before cosine annealing
+lr_warmup_start_factor: 0.1      # Starting LR factor for warmup (fraction of base LR, must be > 0)
+lr_scheduler_interval: "epoch"   # Apply LR schedule per 'epoch' or per 'step' for faster ramping
+lr_scheduler_use_restarts: false # Use cosine annealing with warm restarts instead of a single cycle
+lr_restart_mult: 1.0             # Restart period multiplier for CosineAnnealingWarmRestarts
+lr_min: 0.00005
+clip_grad_norm: 1.0
+use_amp: false                   # CPU training uses full precision
+amp_dtype: "bfloat16"            # Prefer bf16 for stability; use float16 if unavailable
+grad_accum_steps: 1              # Gradient accumulation steps before optimizer step
+precompute_neighbors: true       # Cache neighbor lists to cut CPU overhead
+random_rotation: false           # Apply random SO(3) rotations per batch item
+device: "cpu"
+torch_num_threads: 10            # Use all 10 Apple Silicon CPU cores for tensor operations
+torch_num_interop_threads: 1     # Avoid nested parallel work competing for the same cores
+num_workers: 0                   # Stable on macOS; model math still uses all CPU threads
+checkpoint_dir: "checkpoints"     # Directory to stash periodic checkpoints
+checkpoint_interval: 0           # Save a checkpoint every N epochs (0 disables)
+early_stopping_patience: 20      # Stop after sustained validation non-improvement
+early_stopping_min_epoch: 25     # Begin monitoring after the stress ramp settles
+early_stopping_min_delta: 0.0001
+resume_from: null                # Path to a checkpoint to resume from
+resume_load_optimizer: false     # Load optimizer state when resuming
+resume_load_scheduler: false     # Load LR scheduler state when resuming
+resume_load_scaler: false        # Load AMP GradScaler state when resuming
+use_checkpoint_energy_shift: true # Use the energy shift stored in the checkpoint when resuming
+energy_shift_per_atom: null       # Constant shift to subtract during training (eV/atom)
+atomic_energies: null             # Map of species reference energies, e.g. {H: -0.5, O: -17.0}
+solve_atomic_energies: false      # Fit per-species reference energies from the training set
+
+# ------------------------------------------------------------------------------
+# 4. LOSS WEIGHTS
+# ------------------------------------------------------------------------------
+energy_weight: 1.0               # Energy term uses squared error per atom
+forces_weight: 1.0              # Emphasize forces early
+forces_weight_final: 1.0        # Optional target force weight to anneal toward
+forces_weight_decay_epochs: 0    # Epochs to linearly decay force weight (0 = no decay)
+stress_weight: 100.0            # Initial energy-derived stress weight
+stress_weight_final: 100.0    # Balances ~1e-3 eV/Angstrom^3 stresses with force loss
+stress_weight_ramp_epochs: 20    # Avoid abrupt second-derivative gradients at initialization
+
+# Auxiliary and regularization weights
+aux_force_weight: 0.0            # Direct force heads are disabled to keep forces conservative
+aux_stress_weight: 0.0           # Disable aux stress by default
+force_consistency_weight: 0.0    # Forces already come from -dE/dr
+sobolev_weight: 0.001            # Very light perturbation regularization
+sobolev_sigma: 0.02
+
+# Small-displacement augmentation
+displacement_prob: 0.0           # Requires newly evaluated labels; do not reuse original DFT labels
+displacement_sigma: 0.0
+
+# Attention controls
+temperature_scale_start: 1.3
+temperature_scale_end: 1.0
+temperature_scale_epochs: 15
+temperature_force_ref: 0.5
+temperature_force_exponent: -0.25

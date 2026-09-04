@@ -1,0 +1,3 @@
+kind,label,barrier_kcal_per_mol,uncertainty_kcal_per_mol,temperature_K,display_coordinate_A,source
+experiment,Experiment,29.2,1.1,365.6,-0.10327227367991121,"Vitartas et al., Digital Discovery 5, 108-122 (2026), citing refs. 62 and 63"
+dft,PBE0-D3BJ/def2-SVP qRRHO,26.6,0.0,365.6,-0.08327227367991121,"Vitartas et al., Digital Discovery 5, 108-122 (2026), Fig. 4 and Computational Methods"
