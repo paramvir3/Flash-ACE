@@ -1,0 +1,385 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage[colorlinks=true,linkcolor=NavyBlue,urlcolor=NavyBlue]{hyperref}
+\usepackage{titlesec}
+\usepackage{needspace}
+
+\definecolor{codebg}{RGB}{247,249,252}
+\definecolor{codeframe}{RGB}{200,210,225}
+\definecolor{kw}{RGB}{20,80,190}
+\definecolor{cmt}{RGB}{0,120,60}
+\definecolor{str}{RGB}{170,60,20}
+\definecolor{note}{RGB}{200,105,0}
+
+\lstdefinestyle{py}{
+  language=Python,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  stringstyle=\color{str},
+  numbers=none,
+  breaklines=true,
+  showstringspaces=false,
+  columns=fullflexible,
+  xleftmargin=4pt,
+  framexleftmargin=4pt,
+  aboveskip=6pt,
+  belowskip=6pt,
+}
+\lstset{style=py}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\NOTE}[1]{\textcolor{note}{#1}}
+
+\title{\vspace{-1.3cm}\textbf{Construction of the ACE Descriptor in TRACE-v2}\\[3pt]
+\large A stage-by-stage walkthrough of \code{flashace/physics.py}}
+\author{Implementation notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-0.5cm}
+
+\begin{abstract}
+\noindent
+This note documents how the atomic cluster expansion (ACE) descriptor is built in
+the TRACE-v2 code, mapping each block of \code{ACEV2Descriptor} in
+\code{flashace/physics.py} onto the corresponding equation of the manuscript and,
+where relevant, onto Varshalovich, Moskalev \& Khersonskii, \emph{Quantum Theory of
+Angular Momentum} (cited as VMK\,ch.sec(eq)). Concrete tensor shapes are given for
+the production configuration
+($r_{\mathrm c}=6$~\AA, $\ell_{\max}=2$, $N_r=12$, hidden $=64$,
+correlation channels $=16$, correlation order $=4$).
+\end{abstract}
+
+% ============================================================
+\section{Overview}
+
+The descriptor runs in six stages. Stages 1--3 are per \emph{edge}; stage 4
+reduces edges to atoms; stages 5--6 build the per-atom centre state that the
+attention block later refines.
+
+\begin{center}\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+Stage & Object & Manuscript & Output shape \\
+\midrule
+0 & irrep bookkeeping            & ---            & --- \\
+1 & radial basis $B_n(d)$        & Eqs.~(7)--(9)  & $[L,12]$ \\
+2 & spherical harmonics $Y_{\ell m}$ & Eq.~(11)   & $[L,9]$ \\
+3 & edge tensor $\bm a_{ij}$     & Eqs.~(11)--(12)& $[L,60]$ \\
+4 & neighbour density $\bm A_i$  & Eq.~(14)       & $[N,60]$ \\
+5 & correlations $\bm C^{[q]}_i$ & Eqs.~(15)--(16)& $[N,60]$ \\
+6 & centre state $\bm h^{(0)}_i$ & Eq.~(17)       & $[N,240]$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Here $L$ is the number of directed edges and $N$ the number of atoms.
+
+% ============================================================
+\section{Stage 0 --- Irrep bookkeeping}
+
+\begin{lstlisting}
+for l in range(l_max + 1):
+    output_mul = hidden_dim if l == 0 else hidden_dim // (2 if l == 1 else 4)
+    corr_mul  = correlation_channels if l == 0 else correlation_channels // (2 if l == 1 else 4)
+    output_irreps.append((max(1, output_mul), (l, (-1) ** l)))
+    correlation_irreps.append((max(1, corr_mul), (l, (-1) ** l)))
+\end{lstlisting}
+
+The parity assignment $(\ell,(-1)^\ell)$ is the \emph{natural-parity} choice:
+$\ell=0$ even, $\ell=1$ odd, $\ell=2$ even. In VMK's terminology these are the
+\emph{polar} (true) irreducible tensors, VMK 5.5(2); pseudotensors are discarded.
+Channel multiplicities taper with $\ell$ (16/8/4), because high-$\ell$ channels
+carry less signal per channel.
+
+\NOTE{This truncation is not an arbitrary economy.} It coincides exactly with the
+Gaunt selection rule $C^{L0}_{\ell_1 0\,\ell_2 0}=0$ unless $\ell_1+\ell_2+L$ is
+even (VMK 5.6(9)): natural parity keeps precisely the couplings that survive for
+spherical harmonics of a single direction.
+
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Object & Irreps & Dim \\
+\midrule
+\code{irreps\_node} (species embedding)      & \code{64x0e}            & 64 \\
+\code{irreps\_sh} (harmonics)                & \code{1x0e+1x1o+1x2e}   & 9 \\
+\code{irreps\_correlation} ($\bm A$, $\bm C$)& \code{16x0e+8x1o+4x2e}  & 60 \\
+\code{irreps\_out} (centre state)            & \code{64x0e+32x1o+16x2e}& 240 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{Stage 1 --- Radial basis \texorpdfstring{$B_n(d)$}{Bn(d)}}
+
+\code{SmoothACERadialBasis} is the product of a compact envelope and a Bessel
+basis, manuscript Eqs.~(7)--(9):
+
+\begin{lstlisting}
+def forward(self, distances):
+    return self.cutoff(distances).unsqueeze(-1) * self.basis(distances)
+\end{lstlisting}
+
+The envelope is the quintic smoothstep, written in factored form to avoid
+catastrophic cancellation in float32 just inside $x=1$:
+
+\begin{lstlisting}
+envelope = (1.0 - x).pow(3) * (1.0 + 3.0 * x + 6.0 * x.pow(2))
+return torch.where(distances < self.r_max, envelope, torch.zeros_like(envelope))
+\end{lstlisting}
+
+Algebraically this is
+\begin{equation}
+f_{\mathrm c}(d) = 1 - 10x^3 + 15x^4 - 6x^5 \equiv (1-x)^3(1+3x+6x^2),
+\qquad x = d/r_{\mathrm c},
+\end{equation}
+with $f_{\mathrm c}(r_{\mathrm c}) = f_{\mathrm c}'(r_{\mathrm c}) =
+f_{\mathrm c}''(r_{\mathrm c}) = 0$. This $C^2$ property is what keeps forces
+continuous as a neighbour enters or leaves the list.
+
+The Bessel part handles the $d\to0$ limit analytically:
+
+\begin{lstlisting}
+bessel = torch.sin(scaled) / safe_dist
+bessel = torch.where(distances.unsqueeze(-1) == 0, self.freq / self.r_max, bessel)
+return self.norm * bessel          # norm = sqrt(2/r_max)
+\end{lstlisting}
+
+giving
+\begin{equation}
+B_n(d) = f_{\mathrm c}(d)\,\sqrt{\tfrac{2}{r_{\mathrm c}}}\;
+\frac{\sin(n\pi d/r_{\mathrm c})}{d},
+\qquad
+\lim_{d\to0}\frac{\sin(n\pi d/r_{\mathrm c})}{d} = \frac{n\pi}{r_{\mathrm c}} .
+\end{equation}
+The normalisation satisfies $\int_0^{r_{\mathrm c}} B_n^2\,d^2\,\mathrm dd = 1$.
+Output shape $[L,12]$.
+
+% ============================================================
+\section{Stage 2 --- Spherical harmonics \texorpdfstring{$Y_{\ell m}(\hat{\bm r}_{ij})$}{Ylm}}
+
+\begin{lstlisting}
+self.sh = o3.SphericalHarmonics(self.irreps_sh, normalize=True,
+                                normalization="component")
+\end{lstlisting}
+
+\code{normalize=True} divides by $|\bm r|$, so the result is a pure function of
+direction; the radial dependence lives entirely in stage 1. The
+\code{"component"} convention means $\sum_m |Y_{\ell m}|^2 = 2\ell+1$, which
+relates to VMK 5.10(1) by
+\begin{equation}
+Y^{\text{e3nn}}_{\ell m} = \sqrt{4\pi}\; Y^{\text{VMK}}_{\ell m}.
+\end{equation}
+Output shape $[L,9]$.
+
+% ============================================================
+\section{Stage 3 --- The edge tensor \texorpdfstring{$\bm a_{ij}$}{a\_ij}}
+
+\needspace{12\baselineskip}
+This is the core of the descriptor (\code{\_density}):
+
+\begin{lstlisting}
+sender   = edge_index[0]
+receiver = edge_index[1]
+radial    = self.radial_basis(edge_len)       # [L, 12]
+harmonics = self.sh(edge_vec)                 # [L, 9]
+weights   = self.radial_net(radial)           # [L, 1792]  <- per-edge TP weights
+edge_features = self.tp_density(node_attrs[sender], harmonics, weights)  # [L, 60]
+\end{lstlisting}
+
+Three points deserve emphasis.
+
+\textbf{(a) The edge carries the \emph{neighbour's} species.}
+\code{node\_attrs[sender]} is $\bm e_j$, not $\bm e_i$. The central species enters
+separately in stage 6.
+
+\textbf{(b) \code{radial\_net} produces tensor-product \emph{weights}, not features.}
+It maps the 12 Bessel coefficients to all 1792 weights of \code{tp\_density},
+\emph{per edge}. The radial dependence therefore enters as a learned,
+distance-dependent coupling $R^{(\ell)}_{cq}[\bm B(d_{ij})]$. \code{FullyConnectedNet}
+is bias-free, so $\bm B \to 0$ at the cutoff forces $\bm a_{ij}\to0$.
+
+\textbf{(c) Only three coupling paths exist,} because the first input is all scalars:
+
+\begin{center}\small
+\begin{tabular}{@{}lc@{}}
+\toprule
+path & \code{path\_shape} \\
+\midrule
+\code{0e x 0e -> 0e} & $(64,1,16)$ \\
+\code{0e x 1o -> 1o} & $(64,1,8)$ \\
+\code{0e x 2e -> 2e} & $(64,1,4)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Scalar $\otimes\,\ell \to \ell$ is the trivial coupling, so the whole operation
+collapses to manuscript Eq.~(12),
+\begin{equation}
+a^{(\ell,(-1)^\ell)}_{ij,cm}
+= Y_{\ell m}(\hat{\bm r}_{ij}) \sum_q R^{(\ell)}_{cq}\!\left[\bm B(d_{ij})\right] e_{j,q}.
+\label{eq:edge}
+\end{equation}
+
+\NOTE{Verified numerically:} for every edge and every $\ell>0$ the $(c,m)$ matrix
+of \code{edge\_features} has \textbf{rank 1} (largest ratio of second to first
+singular value $3.4\times10^{-16}$ over 608 edges), and the recovered
+per-block constant is exactly $1/\sqrt{2\ell+1}$ --- the Clebsch--Gordan factor
+$C^{L0}_{\ell_1 0 \ell_2 0}$ of VMK 5.6(14).
+
+% ============================================================
+\section{Stage 4 --- The neighbour density \texorpdfstring{$\bm A_i$}{A\_i}}
+
+\begin{lstlisting}
+density = torch.zeros(node_attrs.shape[0], self.irreps_correlation_dim, ...)
+density.index_add_(0, receiver, edge_features)
+\end{lstlisting}
+
+A single scatter-add sums every incoming edge onto its receiver,
+$[L,60] \to [N,60]$:
+\begin{equation}
+\bm A_i = \sum_{j\in\mathcal N(i)} \bm a_{ij}.
+\end{equation}
+Permutation invariance is automatic: addition does not depend on neighbour order.
+This object is the ACE \emph{$A$-basis}.
+
+% ============================================================
+\section{Stage 5 --- The correlation ladder}
+
+\begin{lstlisting}
+correlation = density
+output = center + self.order_mix[0](correlation)
+if self.correlation_order >= 3:
+    correlation = self.contractions[0](correlation, density)
+    output = output + self.order_mix[1](correlation)
+if self.correlation_order >= 4:
+    correlation = self.contractions[1](correlation, density)
+    output = output + self.order_mix[2](correlation)
+\end{lstlisting}
+
+This is the left-associated recursion of Eqs.~(15)--(16),
+$\bm C^{[1]}_i = \bm A_i$ and
+$\bm C^{[q+1]}_i = \mathrm{TP}_{q+1}(\bm C^{[q]}_i, \bm A_i)$:
+
+\begin{center}\small
+\begin{tabular}{@{}ccc@{}}
+\toprule
+$q$ & expression & nominal body order \\
+\midrule
+1 & $\bm A$ & 2 \\
+2 & $\mathrm{TP}(\bm A,\bm A)$ & 3 \\
+3 & $\mathrm{TP}(\mathrm{TP}(\bm A,\bm A),\bm A)$ & 4 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each \code{contractions[k]} is a \code{FullyConnectedTensorProduct} on
+$60\to60$ with 8768 \emph{shared} weights --- model parameters, in contrast to
+\code{tp\_density}, whose weights are generated per edge. Each
+\code{order\_mix[q]} is an \code{o3.Linear} projecting one order into the 240-dim
+output space, and the orders are \emph{summed}, so the model can weight body
+orders freely.
+
+Two structural facts about this ladder:
+
+\begin{itemize}\itemsep2pt
+\item \code{contractions[0]} is $\mathrm{TP}(\bm A,\bm A)$ --- the \emph{same}
+tensor in both slots. By VMK 3.1(27),
+$\{\bm{\mathfrak M}_{J_1}\!\otimes\bm{\mathfrak N}_{J_2}\}_{JM}
+=(-1)^{J_1+J_2-J}\{\bm{\mathfrak N}_{J_2}\!\otimes\bm{\mathfrak M}_{J_1}\}_{JM}$,
+which renders $47.2\%$ of its weights (4136 of 8768) structurally
+unidentifiable. Confirmed: a large purely antisymmetric perturbation changes the
+output by $2\times10^{-14}$.
+\item Because indices repeat in $\sum_j \bm a_{ij}$, $\bm C^{[q]}$ is \emph{not} a
+pure $(q{+}1)$-body term. VMK 3.2(22) makes this exact: for a single neighbour the
+entire ladder collapses to one $Y_{\ell m}$, so expressive gain from higher
+$q_{\max}$ requires at least two distinct neighbours.
+\end{itemize}
+
+% ============================================================
+\section{Stage 6 --- The centre state \texorpdfstring{$\bm h^{(0)}_i$}{h(0)\_i}}
+
+\begin{lstlisting}
+center = torch.cat((
+    self.center_proj(node_attrs),                               # [N, 64] scalars
+    node_attrs.new_zeros((node_attrs.shape[0], non_scalar_dim)) # [N, 176] zeros
+), dim=-1)
+\end{lstlisting}
+
+The central species enters \emph{only} through the $\ell=0$ block: a linear map of
+$\bm e_i$, zero-padded for $\ell>0$. This is physically necessary --- a species
+label is a scalar and cannot seed an $\ell>0$ feature without a direction --- and
+it is what makes two atoms with identical neighbour densities but different
+central species distinguishable. The result is manuscript Eq.~(17),
+\begin{equation}
+\bm h^{(0)}_i = \mathrm{Center}(\bm e_i)
++ \sum_{q=1}^{q_{\max}} \mathrm{Linear}_q\!\left(\bm C^{[q]}_i\right),
+\qquad [N,240].
+\end{equation}
+
+% ============================================================
+\section{Full data flow}
+
+\begin{lstlisting}[language=,basicstyle=\ttfamily\scriptsize]
+edge_len [L] --> radial_basis --> [L,12] --> radial_net --> [L,1792]  (TP weights)
+                                                                |
+edge_vec [L,3] --> sph. harmonics --> [L,9] --------------------+
+                                                                +--> tp_density --> a_ij [L,60]
+z [N] --> emb --> [N,64] --> node_attrs[sender] ----------------+                      |
+                    |                                              index_add_          v
+                    |                                                          A_i  [N,60]
+                    |                                                                  |
+                    |                        +-- order_mix[0] <-- C^[1] = A -----------+
+                    |                        +-- order_mix[1] <-- C^[2] = TP(A,A)
+                    |                        +-- order_mix[2] <-- C^[3] = TP(C^[2],A)
+                    v                                     |
+             center_proj -----------------> + <-----------+
+                                            |
+                                      h^(0) [N,240]
+\end{lstlisting}
+
+\code{forward} additionally returns \code{edge\_features} and \code{cutoff}
+unchanged. These become the frozen keys and values of the attention block: the
+edge tensors are computed once and never updated, which is precisely what makes
+TRACE a \emph{fixed-environment} architecture.
+
+% ============================================================
+\section{Two design consequences}
+
+\textbf{Parameter concentration.} The final layer of \code{radial\_net} is
+$32\times1792 = 57{,}344$ parameters, \textbf{43\% of the model}. Because
+\code{emb[sender]} takes only $n_{\mathrm{spec}}$ distinct values, the model
+depends on that layer and the species embedding only through
+$M[s,h,c] = \sum_q W_2[h,q,c]\,E[s,q]$, which has just
+$n_{\mathrm{spec}}\times32\times28$ degrees of freedom --- $95.3\%$ redundant for
+the three-species CsPbI$_3$ system.
+
+\textbf{Selection rule.} The natural-parity truncation is exactly the Gaunt rule
+$\ell_1+\ell_2+L$ even. Every odd combination
+($1,1\!\to\!1$; $1,2\!\to\!2$; $2,2\!\to\!1$; $2,2\!\to\!3$) was verified to
+evaluate to identically zero in e3nn's real basis.
+
+\vfill
+\begin{center}\footnotesize\color{black!60}
+Source: \code{flashace/physics.py}, class \code{ACEV2Descriptor}.
+Companion documents: \code{docs/TRACE\_EQUATION\_LEDGER.pdf} (equation status),
+\code{docs/ANGULAR\_MOMENTUM\_REFERENCE.md} (VMK derivations),
+\code{docs/PEER\_REVIEW.md} (defect analysis).
+\end{center}
+
+\end{document}

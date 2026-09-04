@@ -262,3 +262,27 @@ def test_default_muon_grouping_uses_only_transformer_hidden_matrices():
     assert "layers.0.k_proj.weight" in muon_names
     assert "layers.0.scalar_ffn.0.weight" in muon_names
     assert "layers.0.scalar_ffn.3.weight" in muon_names
+
+
+def test_default_muon_grouping_covers_v3_and_v4_scalar_query_key_matrices():
+    from flashace.model import TransformersACEV3, TransformersACEV4
+
+    for model_class in (TransformersACEV3, TransformersACEV4):
+        model = model_class(
+            r_max=3.0,
+            l_max=1,
+            num_radial=3,
+            hidden_dim=8,
+            num_layers=1,
+            correlation_channels=4,
+            attention_num_heads=2,
+        )
+        groups = get_muon_param_groups(model, learning_rate=1.0e-3, weight_decay=1.0e-4)
+        muon_group = next(group for group in groups if group["use_muon"])
+        by_id = {id(param): name for name, param in model.named_parameters()}
+        muon_names = {by_id[id(param)] for param in muon_group["params"]}
+
+        assert "layers.0.q_scalar.weight" in muon_names
+        assert "layers.0.k_scalar.weight" in muon_names
+        assert "layers.0.scalar_ffn.0.weight" in muon_names
+        assert "layers.0.scalar_ffn.3.weight" in muon_names

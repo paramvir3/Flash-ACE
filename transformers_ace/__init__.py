@@ -10,12 +10,16 @@ from flashace import (
     MuonWithAuxAdamW,
     SingleDeviceMuonWithAuxAdam,
     TransformersACE,
+    TransformersACEV3,
+    TransformersACEV4,
     TransformersACECalculator,
     get_muon_param_groups,
 )
 
 __all__ = [
     "TransformersACE",
+    "TransformersACEV3",
+    "TransformersACEV4",
     "TransformersACECalculator",
     "FlashACE",
     "FlashACECalculator",

@@ -266,7 +266,11 @@ class SmoothPolynomialCutoff(nn.Module):
 
     def forward(self, distances: torch.Tensor) -> torch.Tensor:
         x = torch.clamp(distances / self.r_max, min=0.0, max=1.0)
-        envelope = 1.0 - 10.0 * x.pow(3) + 15.0 * x.pow(4) - 6.0 * x.pow(5)
+        # This is algebraically identical to
+        # 1 - 10 x^3 + 15 x^4 - 6 x^5, but the factored form avoids
+        # catastrophic cancellation just inside x=1 in float32.  A negative
+        # cutoff would invalidate the non-negative attention normalization.
+        envelope = (1.0 - x).pow(3) * (1.0 + 3.0 * x + 6.0 * x.pow(2))
         return torch.where(distances < self.r_max, envelope, torch.zeros_like(envelope))
 
 
@@ -471,3 +475,236 @@ class ACEV2Descriptor(nn.Module):
         if return_edge_features:
             return output, edge_features, cutoff
         return output
+
+
+class ACEV3TokenDescriptor(ACEV2Descriptor):
+    """Fixed local ACE environment encoder for TRACE v3.
+
+    The descriptor creates two immutable token families for every center atom:
+    directed neighbor-density edge tokens and one projected ACE correlation token
+    for each retained body order.  Both depend only on the input species and
+    geometry inside the cutoff.  They never depend on a state updated by an
+    attention block, which is the locality constraint used by TRACE v3.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_moment_tokens = self.correlation_order - 1
+        self.moment_token_proj = nn.ModuleList(
+            [
+                o3.Linear(self.irreps_out, self.irreps_correlation)
+                for _ in range(self.num_moment_tokens)
+            ]
+        )
+
+    def forward(
+        self,
+        node_attrs: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_len: torch.Tensor,
+    ):
+        density, edge_features, cutoff = self._density(
+            node_attrs,
+            edge_index,
+            edge_vec,
+            edge_len,
+        )
+
+        non_scalar_dim = self.irreps_out_dim - self.hidden_dim
+        center = torch.cat(
+            (
+                self.center_proj(node_attrs),
+                node_attrs.new_zeros((node_attrs.shape[0], non_scalar_dim)),
+            ),
+            dim=-1,
+        )
+
+        correlation = density
+        ordered_features = []
+        first_order = self.order_mix[0](correlation)
+        ordered_features.append(first_order)
+        output = center + first_order
+
+        for contraction, mix in zip(self.contractions, self.order_mix[1:]):
+            correlation = contraction(correlation, density)
+            ordered = mix(correlation)
+            ordered_features.append(ordered)
+            output = output + ordered
+
+        moment_tokens = [
+            projection(ordered)
+            for projection, ordered in zip(self.moment_token_proj, ordered_features)
+        ]
+        num_nodes = node_attrs.shape[0]
+        device = node_attrs.device
+        dtype = edge_len.dtype
+        receiver = edge_index[1]
+
+        token_features = torch.cat([edge_features, *moment_tokens], dim=0)
+        moment_receiver = torch.arange(num_nodes, device=device, dtype=receiver.dtype).repeat(
+            self.num_moment_tokens
+        )
+        token_receiver = torch.cat((receiver, moment_receiver), dim=0)
+        token_length = torch.cat(
+            (
+                edge_len,
+                torch.zeros(
+                    num_nodes * self.num_moment_tokens,
+                    device=device,
+                    dtype=dtype,
+                ),
+            ),
+            dim=0,
+        )
+        token_cutoff = torch.cat(
+            (
+                cutoff,
+                torch.ones(
+                    num_nodes * self.num_moment_tokens,
+                    device=device,
+                    dtype=cutoff.dtype,
+                ),
+            ),
+            dim=0,
+        )
+        token_kind = torch.cat(
+            (
+                torch.zeros(receiver.shape[0], device=device, dtype=torch.long),
+                torch.arange(
+                    1,
+                    self.num_moment_tokens + 1,
+                    device=device,
+                    dtype=torch.long,
+                ).repeat_interleave(num_nodes),
+            ),
+            dim=0,
+        )
+        return (
+            output,
+            token_features,
+            token_receiver,
+            token_length,
+            token_cutoff,
+            token_kind,
+        )
+
+
+class ACEV4CumulantTokenDescriptor(ACEV3TokenDescriptor):
+    """TRACE v4 fixed tokens with an exact distinct-neighbor pair correction.
+
+    Let ``A_i = sum_j a_ij`` be the local equivariant density and let ``B`` be
+    TRACE's learned equivariant bilinear contraction.  The second correlation
+    normally contains both ``B(a_ij, a_ij)`` self terms and terms involving two
+    distinct neighbors.  v4 exposes the latter exactly as
+
+        ``B(A_i, A_i) - sum_j B(a_ij, a_ij)``.
+
+    This is a connected/distinct-neighbor *pair* density token.  It is not
+    presented as a complete cumulant expansion at higher correlation order:
+    doing that exactly requires the full set-partition algebra and would make
+    local inference substantially more expensive.  Higher v4 moments recurse
+    from this corrected pair token and retain TRACE's linear-neighbor-sum
+    scaling.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.register_buffer(
+            "correlation_channel_mask",
+            torch.ones(self.irreps_correlation_dim),
+            persistent=True,
+        )
+        self.active_correlation_rank = int(self.irreps_correlation[0].mul)
+
+    def set_correlation_rank(self, rank: int) -> None:
+        """Activate a nested prefix of correlation multiplicities.
+
+        Each retained irrep type receives the same fraction of its available
+        multiplicities.  Whole irrep copies, never Cartesian components, are
+        masked, so the curriculum preserves O(3) equivariance exactly.
+        """
+        maximum = int(self.irreps_correlation[0].mul)
+        rank = max(1, min(int(rank), maximum))
+        pieces = []
+        for multiplicity, irrep in self.irreps_correlation:
+            active = max(1, int(round(multiplicity * rank / maximum)))
+            copy_mask = torch.zeros(multiplicity, device=self.correlation_channel_mask.device)
+            copy_mask[:active] = 1.0
+            pieces.append(copy_mask.repeat_interleave(irrep.dim))
+        self.correlation_channel_mask.copy_(torch.cat(pieces))
+        self.active_correlation_rank = rank
+
+    def forward(
+        self,
+        node_attrs: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_len: torch.Tensor,
+    ):
+        density, edge_features, cutoff = self._density(
+            node_attrs, edge_index, edge_vec, edge_len
+        )
+        mask = self.correlation_channel_mask.to(dtype=density.dtype)
+        density = density * mask
+        edge_features = edge_features * mask
+
+        non_scalar_dim = self.irreps_out_dim - self.hidden_dim
+        center = torch.cat(
+            (self.center_proj(node_attrs), node_attrs.new_zeros((node_attrs.shape[0], non_scalar_dim))),
+            dim=-1,
+        )
+        ordered_features = [self.order_mix[0](density)]
+        output = center + ordered_features[0]
+
+        if self.correlation_order >= 3:
+            receiver = edge_index[1]
+            pair = self.contractions[0](density, density)
+            edge_self = self.contractions[0](edge_features, edge_features)
+            self_sum = torch.zeros_like(pair)
+            self_sum.index_add_(0, receiver, edge_self)
+            correlation = pair - self_sum
+            ordered = self.order_mix[1](correlation)
+            ordered_features.append(ordered)
+            output = output + ordered
+            contraction_offset = 1
+        else:
+            correlation = density
+            contraction_offset = 0
+
+        for contraction, mix in zip(
+            self.contractions[contraction_offset:],
+            self.order_mix[2:] if self.correlation_order >= 3 else self.order_mix[1:],
+        ):
+            correlation = contraction(correlation, density)
+            ordered = mix(correlation)
+            ordered_features.append(ordered)
+            output = output + ordered
+
+        num_nodes = node_attrs.shape[0]
+        receiver = edge_index[1]
+        moment_tokens = [
+            projection(ordered)
+            for projection, ordered in zip(self.moment_token_proj, ordered_features)
+        ]
+        token_features = torch.cat([edge_features, *moment_tokens], dim=0)
+        moment_receiver = torch.arange(num_nodes, device=node_attrs.device, dtype=receiver.dtype).repeat(
+            self.num_moment_tokens
+        )
+        token_receiver = torch.cat((receiver, moment_receiver), dim=0)
+        token_length = torch.cat(
+            (edge_len, torch.zeros(num_nodes * self.num_moment_tokens, device=node_attrs.device, dtype=edge_len.dtype)),
+            dim=0,
+        )
+        token_cutoff = torch.cat(
+            (cutoff, torch.ones(num_nodes * self.num_moment_tokens, device=node_attrs.device, dtype=cutoff.dtype)),
+            dim=0,
+        )
+        token_kind = torch.cat(
+            (
+                torch.zeros(receiver.shape[0], device=node_attrs.device, dtype=torch.long),
+                torch.arange(1, self.num_moment_tokens + 1, device=node_attrs.device, dtype=torch.long).repeat_interleave(num_nodes),
+            ),
+            dim=0,
+        )
+        return output, token_features, token_receiver, token_length, token_cutoff, token_kind

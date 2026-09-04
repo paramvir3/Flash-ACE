@@ -13,6 +13,20 @@ def test_native_pair_style_allows_mpi_with_newton_guard():
     assert "local_rank() % count" in source
 
 
+def test_native_pair_style_enforces_the_model_unit_system():
+    source = (ROOT / "lammps/pair_style/pair_transformers_ace.cpp").read_text()
+
+    assert '"update.h"' in source
+    assert "update->unit_style" in source
+    assert "requires 'units metal'" in source
+
+
+def test_native_cuda_path_does_not_claim_million_atom_readiness():
+    source = (ROOT / "lammps/pair_style/pair_transformers_ace.cpp").read_text()
+
+    assert "GPU-resident million-atom backend" in source
+
+
 def test_lammps_examples_use_newton_on_for_parallel_force_comm():
     inputs = [
         ROOT / "lammps/pair_style/in.transformers_ace",

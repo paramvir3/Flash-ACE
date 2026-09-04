@@ -1,0 +1,10 @@
+Loading Transformers-ACE from /home/user/TRACE/training/h100_run/model_h100.pt on cuda...
+/usr/lib/python3.12/copyreg.py:99: FutureWarning: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+  return cls.__new__(cls, *args)
+/home/user/TRACE/.venv/lib/python3.12/site-packages/torch/_inductor/compile_fx.py:320: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+  verify energy  max |delta| = 0.000e+00 eV   [ok]
+  verify forces  max |delta| = 2.384e-06 eV/A   [ok]
+  verify virial  max |delta| = 6.676e-06 eV   [ok]
+Wrote TRACE AOTI force program: /home/user/TRACE/trace_h100.pt2
+Wrote metadata: /home/user/TRACE/trace_h100.pt2.metadata.txt

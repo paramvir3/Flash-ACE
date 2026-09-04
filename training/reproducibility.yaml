@@ -1,3 +1,19 @@
+# ==============================================================================
+# SUPERSEDED -- this manifest describes the pre-fix run (checkpoint epoch 76,
+# trained 2026-06-28) whose .pt files have been deleted.
+#
+# That run predates the P3/D2/D3/D4 corrections:
+#   * its layer scale was stored per component, so the trained model was NOT
+#     O(3)-equivariant (energy spread ~5.96 meV/atom under rotation);
+#   * the attention temperature reached T_att ~ 4.4 in training while validation
+#     and deployment used T_att = 1;
+#   * the reported energy RMSE was dominated by a drifting energy zero;
+#   * the local-linearisation term was ~49% dropout variance.
+#
+# Retained only as a record of what produced the previous figures. A new manifest
+# must be written after the retrain.
+# ==============================================================================
+
 schema_version: 3
 run_name: cspbi3_cpu_100_epoch_muon_ace_attention_v2
 code:

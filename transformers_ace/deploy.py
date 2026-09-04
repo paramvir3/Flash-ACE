@@ -31,6 +31,9 @@ class LAMMPSEnergyModel(nn.Module):
         energy_shift_per_atom: float = 0.0,
     ) -> None:
         super().__init__()
+        self.architecture_version = int(getattr(model, "architecture_version", 0))
+        if self.architecture_version not in (2, 3, 4):
+            raise ValueError("LAMMPSEnergyModel supports TRACE architecture versions 2 and 3")
         self.hidden_dim = int(model.hidden_dim)
         self.emb = model.emb
         self.ace = model.ace
@@ -74,25 +77,40 @@ class LAMMPSEnergyModel(nn.Module):
         )
         edge_len = torch.norm(edge_vec, dim=1)
 
-        h, edge_features, cutoff = self.ace(
-            self.emb(z),
-            edge_index,
-            edge_vec,
-            edge_len,
-            return_edge_features=True,
-        )
-        receiver = edge_index[1]
-        for layer in self.layers:
-            h = layer(
-                h,
-                edge_features,
-                receiver,
+        if self.architecture_version == 2:
+            h, edge_features, cutoff = self.ace(
+                self.emb(z),
+                edge_index,
+                edge_vec,
                 edge_len,
-                cutoff,
-                temperature_scale=1.0,
+                return_edge_features=True,
             )
-
-        atomic_energy = self.readout(h[:, : self.hidden_dim]).view(-1)
+            receiver = edge_index[1]
+            for layer in self.layers:
+                h = layer(
+                    h,
+                    edge_features,
+                    receiver,
+                    edge_len,
+                    cutoff,
+                    temperature_scale=1.0,
+                )
+            atomic_energy = self.readout(h[:, : self.hidden_dim]).view(-1)
+        else:
+            h, tokens, receiver, token_length, token_cutoff, token_kind = self.ace(
+                self.emb(z), edge_index, edge_vec, edge_len
+            )
+            for layer in self.layers:
+                h = layer(
+                    h,
+                    tokens,
+                    receiver,
+                    token_length,
+                    token_cutoff,
+                    token_kind,
+                    temperature_scale=1.0,
+                )
+            atomic_energy = self.readout(h).view(-1)
         mask = local_mask.to(dtype=atomic_energy.dtype)
         energy = torch.sum(atomic_energy * mask)
 
@@ -102,6 +120,63 @@ class LAMMPSEnergyModel(nn.Module):
         else:
             energy = energy + self.energy_shift_per_atom * torch.sum(mask)
         return energy.reshape(())
+
+
+class LAMMPSAOTForceModel(nn.Module):
+    """Statically exportable TRACE energy, force, and virial program.
+
+    The force and virial are evaluated as derivatives of the same scalar energy
+    as the reference LAMMPS wrapper.  ``torch.func.grad`` is intentionally used
+    here instead of imperative ``autograd.grad`` so AOTInductor can capture the
+    derivative program ahead of time.  A Kokkos CUDA pair style can therefore
+    invoke one compiled program on device-resident buffers without constructing
+    a dynamic autograd graph at every MD step.
+    """
+
+    def __init__(self, energy_model: LAMMPSEnergyModel) -> None:
+        super().__init__()
+        self.energy_model = energy_model
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        pos: torch.Tensor,
+        cell: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_shift: torch.Tensor,
+        strain: torch.Tensor,
+        local_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        def energy_from_pos_and_strain(
+            positions: torch.Tensor,
+            strain_parameters: torch.Tensor,
+        ) -> torch.Tensor:
+            return self.energy_model(
+                z,
+                positions,
+                cell,
+                edge_index,
+                edge_shift,
+                strain_parameters,
+                local_mask,
+            )
+
+        energy = energy_from_pos_and_strain(pos, strain)
+        grad_pos, grad_strain = torch.func.grad(
+            energy_from_pos_and_strain,
+            argnums=(0, 1),
+        )(pos, strain)
+        virial = torch.stack(
+            (
+                -grad_strain[0],
+                -grad_strain[1],
+                -grad_strain[2],
+                -0.5 * grad_strain[3],
+                -0.5 * grad_strain[4],
+                -0.5 * grad_strain[5],
+            )
+        )
+        return energy, -grad_pos, virial
 
 
 def _synthetic_atoms(type_map: Sequence[str], cutoff: float) -> Atoms:
@@ -157,17 +232,28 @@ def export_lammps_model(
 ) -> None:
     calculator = TransformersACECalculator(model_path=str(checkpoint), device=device)
     model = calculator.model.eval()
-    if int(getattr(model, "architecture_version", 0)) != 2:
-        raise ValueError("Native LAMMPS export currently supports architecture_version=2 checkpoints")
+    if int(getattr(model, "architecture_version", 0)) not in (2, 3, 4):
+        raise ValueError("Native LAMMPS export supports architecture_version=2, 3, or 4 checkpoints")
     for parameter in model.parameters():
         parameter.requires_grad_(False)
 
+    # The trace must run on the device the model will be deployed to.
+    # LAMMPSEnergyModel builds its strain basis with
+    #   torch.eye(3, dtype=pos.dtype, device=pos.device)
+    # and torch.jit.trace evaluates `pos.device` once and bakes the result in as
+    # a constant. Tracing on CPU therefore produces a module that always mixes a
+    # CPU constant into `pos @ deformation`, and running it on CUDA fails with
+    #   "Expected all tensors to be on the same device, but got mat2 is on cpu".
+    # This previously forced model.cpu() and built CPU example inputs regardless
+    # of `device`, so the flag was silently ignored and every exported artifact
+    # was CPU-only.
+    target = torch.device(device)
     atomic_energy_tensor = calculator.atomic_energy_tensor
     if atomic_energy_tensor is not None:
-        atomic_energy_tensor = atomic_energy_tensor.detach().cpu()
+        atomic_energy_tensor = atomic_energy_tensor.detach().to(target)
 
     deploy_model = LAMMPSEnergyModel(
-        model.cpu(),
+        model.to(target),
         atomic_energy_tensor=atomic_energy_tensor,
         energy_shift_per_atom=calculator.energy_shift_per_atom,
     ).eval()
@@ -176,7 +262,9 @@ def export_lammps_model(
         atoms = _synthetic_atoms(type_map, calculator.r_max)
     else:
         atoms = read(example_structure.expanduser())
-    example_inputs = _example_tensors(atoms, calculator.r_max)
+    example_inputs = tuple(
+        tensor.to(target) for tensor in _example_tensors(atoms, calculator.r_max)
+    )
 
     traced = torch.jit.trace(deploy_model, example_inputs, check_trace=False)
     metadata = _metadata_text(
@@ -187,8 +275,39 @@ def export_lammps_model(
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.jit.save(traced, str(output), _extra_files={"metadata.txt": metadata})
+    _verify_traced_model(output, deploy_model, example_inputs, target)
     print(f"Wrote LAMMPS TorchScript model: {output}")
     print(metadata, end="")
+
+
+def _verify_traced_model(output, eager, example_inputs, target) -> None:
+    """Reload the saved module on the target device and compare against eager.
+
+    ``check_trace=False`` disables the only check torch performs, and the test
+    suite runs on CPU, so nothing else exercises the saved artifact on the
+    device it will be deployed to. That combination let a module ship whose
+    strain basis was a baked CPU constant: it loaded cleanly and then aborted on
+    the first CUDA step with "mat2 is on cpu". Reloading here closes the gap,
+    and does so on the device that actually matters.
+    """
+    reloaded = torch.jit.load(str(output), map_location=target).eval()
+    with torch.no_grad():
+        expected = eager(*example_inputs)
+        produced = reloaded(*example_inputs)
+    if isinstance(expected, torch.Tensor):
+        expected, produced = (expected,), (produced,)
+    deviation = max(
+        float((p - e).abs().max()) for p, e in zip(produced, expected)
+    )
+    # float32 kernels may reassociate between eager and the traced module, so
+    # this is a round-off bound, not an equality test.
+    print(f"  verify traced module: max |delta| = {deviation:.3e}  "
+          f"[{'ok' if deviation <= 1e-3 else 'FAILED'}] on {target}")
+    if deviation > 1e-3:
+        raise RuntimeError(
+            f"Traced TorchScript module does not reproduce the eager model on "
+            f"{target}: max |delta| = {deviation:.3e}"
+        )
 
 
 def parse_args() -> argparse.Namespace:

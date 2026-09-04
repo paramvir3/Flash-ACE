@@ -9,6 +9,7 @@
 #include "neigh_list.h"
 #include "neigh_request.h"
 #include "neighbor.h"
+#include "update.h"
 
 #include <algorithm>
 #include <cmath>
@@ -193,6 +194,11 @@ void PairTransformersACE::coeff(int narg, char **arg)
   lammps_type_to_z_.assign(ntypes + 1, -1);
   if (comm->me == 0) {
     std::cout << "Transformers-ACE: loading " << model_path << " on " << device_ << "\n";
+    if (device_.is_cuda()) {
+      std::cout << "Transformers-ACE: CUDA uses the validated LibTorch interface; "
+                << "the current path transfers host tensors and is not the "
+                << "GPU-resident million-atom backend.\n";
+    }
     std::cout << "Transformers-ACE type mapping:\n";
   }
   for (int itype = 1; itype <= ntypes; itype++) {
@@ -220,6 +226,9 @@ void PairTransformersACE::coeff(int narg, char **arg)
 void PairTransformersACE::init_style()
 {
   if (!model_loaded_) error->all(FLERR, "pair_coeff must be set before pair_style transformers_ace");
+  if (strcmp(update->unit_style, "metal") != 0) {
+    error->all(FLERR, "pair_style transformers_ace requires 'units metal' (eV and Angstrom)");
+  }
   if (comm->nprocs > 1 && !force->newton_pair) {
     error->all(FLERR, "parallel pair_style transformers_ace requires 'newton on' so ghost-atom forces are reverse-communicated");
   }
@@ -249,6 +258,15 @@ torch::Tensor PairTransformersACE::cell_tensor() const
 void PairTransformersACE::compute(int eflag, int vflag)
 {
   ev_init(eflag, vflag);
+
+  // Checked before any work, not after: the model returns a single extensive
+  // energy and a global virial, so neither per-atom decomposition exists. The
+  // arrays ev_init just zeroed would otherwise be reported as genuine zeros by
+  // compute pe/atom and compute stress/atom.
+  if (eflag_atom)
+    error->all(FLERR, "pair_style transformers_ace does not provide per-atom energy");
+  if (vflag_atom)
+    error->all(FLERR, "pair_style transformers_ace does not provide per-atom virial");
 
   const int nlocal = atom->nlocal;
   const int nall = atom->nlocal + atom->nghost;
@@ -376,8 +394,5 @@ void PairTransformersACE::compute(int eflag, int vflag)
     virial[3] += -0.5 * g[3];
     virial[4] += -0.5 * g[4];
     virial[5] += -0.5 * g[5];
-  }
-  if (vflag_atom) {
-    error->all(FLERR, "pair_style transformers_ace does not support per-atom virial yet");
   }
 }

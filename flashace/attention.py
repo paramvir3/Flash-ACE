@@ -1,12 +1,15 @@
-"""Inactive experimental attention prototype; not part of TRACE-V2.
+"""Inactive experimental attention prototype; not part of TRACE.
 
-This module is not imported by the TRACE-V2 model constructor, training path,
+This module is not imported by the TRACE model constructors, training path,
 ASE calculator, deployment code, or LAMMPS interface. It is retained only as
 historical experimental code and must not be used to infer the architecture
 described in the TRACE manuscript.
 
-The active implementation is
-``flashace.model.StrictLocalEquivariantAttentionBlock``.
+The active implementations are in ``flashace/model.py``:
+
+* TRACE v2: ``StrictLocalEquivariantAttentionBlock``
+* TRACE v3: ``TensorialFixedEnvironmentAttentionBlock``
+* TRACE v4: ``CumulantMultiQueryTensorialAttentionBlock``
 """
 
 import importlib.util

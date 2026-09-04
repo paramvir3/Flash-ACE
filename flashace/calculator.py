@@ -3,7 +3,7 @@ import numpy as np
 from ase.calculators.calculator import Calculator, all_changes
 from ase.neighborlist import neighbor_list
 from .checkpoint import load_checkpoint
-from .model import LegacyTransformersACE, TransformersACE
+from .model import LegacyTransformersACE, TransformersACE, TransformersACEV3, TransformersACEV4
 
 
 def _load_checkpoint(path, map_location):
@@ -59,12 +59,16 @@ class TransformersACECalculator(Calculator):
             model_class = LegacyTransformersACE
         elif architecture_version == 2:
             model_class = TransformersACE
+        elif architecture_version == 3:
+            model_class = TransformersACEV3
+        elif architecture_version == 4:
+            model_class = TransformersACEV4
         else:
             raise ValueError(f"Unsupported architecture_version: {architecture_version}")
         radial_mlp_default = 64 if architecture_version == 1 else 32
 
         # 3. Initialize Architecture
-        self.model = model_class(
+        model_kwargs = dict(
             r_max=self.r_max,
             l_max=conf['l_max'],
             num_radial=conf['num_radial'],
@@ -89,6 +93,12 @@ class TransformersACECalculator(Calculator):
             use_aux_force_head=False,
             use_aux_stress_head=False,
         )
+        if architecture_version == 4:
+            model_kwargs.update(
+                attention_num_shells=conf.get('attention_num_shells', 4),
+                correlation_rank_initial=conf.get('correlation_rank_initial', None),
+            )
+        self.model = model_class(**model_kwargs)
         
         # 4. Load Weights
         self.model.load_state_dict(checkpoint['model_state_dict'], strict=True)

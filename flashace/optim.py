@@ -320,6 +320,8 @@ def _is_hidden_muon_matrix(name: str, param: torch.nn.Parameter) -> bool:
     hidden_patterns = (
         "layers.*.q_proj.weight",
         "layers.*.k_proj.weight",
+        "layers.*.q_scalar.weight",
+        "layers.*.k_scalar.weight",
         "layers.*.scalar_ffn.*.weight",
     )
     excluded_patterns = (

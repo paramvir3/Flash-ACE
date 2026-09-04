@@ -10,7 +10,7 @@ from ase.io import read
 from ase.data import atomic_numbers, chemical_symbols
 from e3nn import o3
 from flashace.checkpoint import load_checkpoint
-from flashace.model import TransformersACE
+from flashace.model import TransformersACE, TransformersACEV3, TransformersACEV4
 from flashace.optim import build_optimizer, optimizer_group_summary
 from flashace.plotting import plot_metric_history
 from ase.neighborlist import neighbor_list
@@ -27,6 +27,26 @@ def _make_grad_scaler(enabled):
         return torch.amp.GradScaler("cuda", enabled=enabled)
     except (AttributeError, TypeError):
         return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def configure_determinism(config) -> bool:
+    """Optionally force bitwise-reproducible CUDA execution.
+
+    TRACE scatters edge contributions onto atoms with ``index_add_``, whose CUDA
+    implementation uses non-deterministic atomics: run-to-run energies differ by
+    ~1e-5 meV/atom and gradients by ~1e-6 relative. That is far below the model
+    error, but it makes a training run impossible to reproduce bitwise, which is
+    what ``reproducibility.yaml`` promises. Enabling deterministic kernels costs
+    about 7% and removes the variation entirely (measured on an RTX 5060 Ti).
+    """
+    if not bool(config.get('deterministic', False)):
+        return False
+    # cuBLAS needs this set before the first CUDA context to be reproducible.
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.benchmark = False
+    print("Deterministic mode: ON (CUBLAS_WORKSPACE_CONFIG=:4096:8, ~7% slower)")
+    return True
 
 
 def _load_config(config_arg: Optional[str]):
@@ -58,7 +78,7 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, en
         'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
         'config': {
-            'architecture_version': 2,
+            'architecture_version': int(model.architecture_version),
             'r_max': config['r_max'],
             'l_max': config['l_max'],
             'num_radial': config['num_radial'],
@@ -87,6 +107,10 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, config, en
             'attention_dropout': config.get('attention_dropout', config.get('transformer_dropout', 0.0)),
             'attention_layer_scale_init': config.get('attention_layer_scale_init', 1e-2),
             'attention_distance_penalty': config.get('attention_distance_penalty', True),
+            'attention_mode': config.get('attention_mode', 'full'),
+            'attention_num_shells': config.get('attention_num_shells', 4),
+            'correlation_rank_initial': config.get('correlation_rank_initial', None),
+            'correlation_rank_warmup_epochs': config.get('correlation_rank_warmup_epochs', 0),
         }
     }
     torch.save(checkpoint, path)
@@ -218,16 +242,81 @@ class AtomisticDataset(Dataset):
     @staticmethod
     def collate_fn(batch): return batch
 
+    @staticmethod
+    def collate_batched(items):
+        """Concatenate structures into ONE disconnected graph.
+
+        Atom indices of structure b are offset by the running atom count, so the
+        edge lists of different structures can never connect: the graph is a
+        disjoint union and every per-atom quantity is unchanged. ``batch`` maps
+        atom -> structure so the readout can be scattered back per structure.
+
+        The GPU is launch-bound for single small cells, so one batched graph
+        costs roughly the same as one structure while doing len(items) times the
+        work. See docs/CUDA_NOTES.md.
+        """
+        z, pos, cells, vols, batch_idx = [], [], [], [], []
+        e_idx, e_shift = [], []
+        t_E, t_F, t_S, has_S = [], [], [], []
+        offset = 0
+        for b, it in enumerate(items):
+            n = int(it['z'].shape[0])
+            z.append(it['z']); pos.append(it['pos'])
+            cells.append(it['cell']); vols.append(it['volume'].reshape(()))
+            batch_idx.append(torch.full((n,), b, dtype=torch.long))
+            e_idx.append(it['edge_index'] + offset)
+            e_shift.append(it['edge_shift'])
+            t_E.append(it['t_E'].reshape(())); t_F.append(it['t_F'])
+            t_S.append(it['t_S']); has_S.append(it['has_stress'].reshape(()))
+            offset += n
+        return {
+            'z': torch.cat(z), 'pos': torch.cat(pos),
+            'cell': torch.stack(cells), 'volume': torch.stack(vols),
+            'batch': torch.cat(batch_idx), 'n_structures': len(items),
+            'edge_index': torch.cat(e_idx, dim=1), 'edge_shift': torch.cat(e_shift),
+            't_E': torch.stack(t_E), 't_F': torch.cat(t_F),
+            't_S': torch.stack(t_S), 'has_stress': torch.stack(has_S),
+            'n_atoms': torch.tensor([int(it['z'].shape[0]) for it in items], dtype=torch.long),
+        }
+
 class MetricTracker:
+    """Accumulates energy, force and stress errors.
+
+    Besides RMSE_E (Eq. 42) this also tracks the *offset-free* energy error, the
+    standard deviation of the per-atom energy error about its own mean.  RMSE_E
+    is dominated by a global additive shift whenever the reference energy is a
+    single scalar; the offset-free number isolates the part of the error that a
+    constant reference cannot absorb, and is the quantity that is stable across
+    epochs and library versions.
+    """
+
     def __init__(self): self.reset()
     def reset(self):
         self.sse_e = 0.0; self.sse_s = 0.0
+        # Weighted Welford accumulators for the offset-free energy error. The
+        # naive <e^2> - <e>^2 form suffers catastrophic cancellation once the
+        # energy zero drifts, which is exactly the regime this metric exists to
+        # diagnose, so the streaming form is used instead.
+        self._w_sum = 0.0
+        self._mean_e = 0.0
+        self._m2_e = 0.0
         self.sum_force_mse = 0.0
         self.sum_force_mae = 0.0
         self.n_atoms = 0; self.n_stress_comp = 0; self.n_struct = 0
     def update(self, p_E, p_F, p_S, t_E, t_F, t_S, include_stress, n_ats):
-        err_e = (p_E - t_E).item() / n_ats
+        # Promote to float64 *before* subtracting. Total energies are O(10^3 eV)
+        # for a 40-atom CsPbI3 cell while the error is O(10^-1 eV); a float32
+        # difference of two such numbers loses roughly three significant digits
+        # of the quantity being measured.
+        # ``.detach()`` first: p_E still carries the autograd graph here, and
+        # calling float() on a requires_grad tensor warns and pins the graph alive.
+        err_e = (p_E.detach().double().item() - torch.as_tensor(t_E).detach().double().item()) / n_ats
         self.sse_e += err_e**2 * n_ats
+        weight = float(n_ats)
+        self._w_sum += weight
+        delta = err_e - self._mean_e
+        self._mean_e += delta * weight / self._w_sum
+        self._m2_e += weight * delta * (err_e - self._mean_e)
         diff_f = p_F - t_F
         # Per-structure force MSE/MAE averaged over 3N components.
         force_mse = diff_f.pow(2).mean().item()
@@ -241,13 +330,79 @@ class MetricTracker:
             ).pow(2).sum().item()
             self.n_stress_comp += 6
         self.n_atoms += n_ats
+    def update_batched(self, p_E, p_F, p_S, t_E, t_F, t_S, stress_mask, batch, n_atoms):
+        """Accumulate a whole batch without a single host synchronisation.
+
+        Every ``.item()`` forces the CPU to wait for the GPU. With one structure
+        per call that was ~4 syncs x |B| per step; here the batch statistics are
+        reduced on device and merged into the running totals with Chan's
+        parallel variance formula, which is algebraically identical to the
+        sequential Welford update but needs no per-structure round trip. The
+        only synchronisation is in ``get_metrics`` once per epoch.
+        """
+        n = n_atoms.double()
+        err_e = (p_E.detach().double() - t_E.detach().double()) / n          # [B] eV/atom
+        self.sse_e = self.sse_e + (err_e ** 2 * n).sum()
+
+        # ---- Chan et al. parallel merge of (weight, mean, M2) ----
+        w_b = n.sum()
+        mean_b = (err_e * n).sum() / w_b
+        m2_b = (n * (err_e - mean_b) ** 2).sum()
+        w_a = self._w_sum
+        delta = mean_b - self._mean_e
+        w_new = w_a + w_b
+        self._mean_e = self._mean_e + delta * w_b / w_new
+        self._m2_e = self._m2_e + m2_b + delta ** 2 * w_a * w_b / w_new
+        self._w_sum = w_new
+
+        diff_f = (p_F.detach() - t_F.detach()).double()                       # [N_tot, 3]
+        sq = torch.zeros_like(err_e).index_add(0, batch, diff_f.pow(2).sum(dim=1))
+        ab = torch.zeros_like(err_e).index_add(0, batch, diff_f.abs().sum(dim=1))
+        self.sum_force_mse = self.sum_force_mse + (sq / (3.0 * n)).sum()
+        self.sum_force_mae = self.sum_force_mae + (ab / (3.0 * n)).sum()
+
+        mask = stress_mask.detach().double()
+        if float(mask.sum()) > 0.0:
+            d2 = ((p_S.detach() - t_S.detach()).double() ** 2).flatten(1)
+            voigt = d2[:, [0, 4, 8, 5, 2, 1]].sum(dim=1)                      # xx yy zz yz xz xy
+            self.sse_s = self.sse_s + (mask * voigt).sum()
+            self.n_stress_comp += int(6 * mask.sum().item())
+
+        self.n_struct += int(p_E.shape[0])
+        self.n_atoms = self.n_atoms + n.sum()
+
+    def _as_float(self, x):
+        return float(x) if not torch.is_tensor(x) else float(x.detach().cpu())
+
     def get_metrics(self):
-        rmse_e = np.sqrt(self.sse_e / self.n_atoms) if self.n_atoms > 0 else 0.0
-        rmse_s = np.sqrt(self.sse_s / self.n_stress_comp) if self.n_stress_comp > 0 else 0.0
-        force_mse = (self.sum_force_mse / self.n_struct) if self.n_struct > 0 else 0.0
-        force_mae = (self.sum_force_mae / self.n_struct) if self.n_struct > 0 else 0.0
+        """Return metrics. This is the ONLY host synchronisation point."""
+        sse_e   = self._as_float(self.sse_e)
+        sse_s   = self._as_float(self.sse_s)
+        n_atoms = self._as_float(self.n_atoms)
+        sum_mse = self._as_float(self.sum_force_mse)
+        sum_mae = self._as_float(self.sum_force_mae)
+        w_sum   = self._as_float(self._w_sum)
+        mean_e  = self._as_float(self._mean_e)
+        m2_e    = self._as_float(self._m2_e)
+
+        rmse_e = np.sqrt(sse_e / n_atoms) if n_atoms > 0 else 0.0
+        rmse_s = np.sqrt(sse_s / self.n_stress_comp) if self.n_stress_comp > 0 else 0.0
+        force_mse = (sum_mse / self.n_struct) if self.n_struct > 0 else 0.0
+        force_mae = (sum_mae / self.n_struct) if self.n_struct > 0 else 0.0
         force_rmse = np.sqrt(force_mse)
-        return rmse_e * 1000, force_rmse, rmse_s, force_mse, force_mae
+        # Offset-free energy error: the N_s-weighted standard deviation of the
+        # per-atom error about its own mean. Exactly invariant under a constant
+        # shift of the energy reference, unlike rmse_e.
+        if w_sum > 0.0:
+            rmse_e_free = np.sqrt(max(m2_e / w_sum, 0.0))
+        else:
+            mean_e = 0.0
+            rmse_e_free = 0.0
+        return (
+            rmse_e * 1000, force_rmse, rmse_s, force_mse, force_mae,
+            rmse_e_free * 1000, mean_e * 1000,
+        )
+
 
 def compute_mean_energy_per_atom(atoms_seq):
     total_energy = 0.0
@@ -280,7 +435,24 @@ def compute_atomic_energies_from_dataset(atoms_seq):
     X = np.array(counts, dtype=float)
     y = np.array(energies, dtype=float)
 
-    coeffs, *_ = np.linalg.lstsq(X, y, rcond=None)
+    coeffs, _residuals, rank, _sv = np.linalg.lstsq(X, y, rcond=None)
+
+    # With a fixed stoichiometry (every frame Cs8Pb8I24, say) the composition
+    # matrix is rank deficient and the individual per-species energies are not
+    # identifiable -- only their composition-weighted sum is. lstsq silently
+    # returns the minimum-norm solution, which splits the degenerate species
+    # equally. That baseline is still exactly right for every training frame, but
+    # the individual numbers are arbitrary and must not be transferred to a
+    # different composition.
+    if rank < len(species):
+        symbols = ", ".join(chemical_symbols[z] for z in species)
+        print(
+            f"WARNING: the composition matrix has rank {rank} < {len(species)} species "
+            f"({symbols}). Per-species reference energies are not separately "
+            "identifiable from this dataset; the minimum-norm solution is used. The "
+            "total reference per structure is correct, but do not reuse these "
+            "per-species values for a different composition."
+        )
     return {z: float(e) for z, e in zip(species, coeffs)}
 
 
@@ -381,12 +553,89 @@ def split_trajectory_frames(
         sorted(excluded),
     )
 
+
+def _batched_train_step(
+    model, items, device, temp_scale,
+    energy_weight, force_weight, stress_weight,
+    sobolev_weight, sobolev_sigma,
+    baseline_energy, metrics, scaler, norm,
+):
+    """One optimiser sub-step over a batch evaluated as a single graph.
+
+    Reproduces Eqs. (37)-(41) exactly, but vectorised over structures. The
+    per-structure normalisations matter: energies are divided by N_s before
+    squaring, force errors averaged over 3N_s, stress over its six Voigt
+    components, and stress-free structures contribute zero while still counting
+    in the batch denominator.
+    """
+    bat = AtomisticDataset.collate_batched(items)
+    for k, v in bat.items():
+        if isinstance(v, torch.Tensor):
+            bat[k] = v.to(device, non_blocking=True)
+
+    n_at = bat['n_atoms'].to(device).to(bat['pos'].dtype)          # [B]
+    has_s = bat['has_stress'].to(device).to(bat['pos'].dtype)      # [B]
+    want_stress = bool(has_s.any().item()) and stress_weight > 0.0
+
+    sob_active = sobolev_weight > 0.0 and sobolev_sigma > 0.0
+    rng_cpu = torch.get_rng_state() if sob_active else None
+    rng_dev = (
+        torch.cuda.get_rng_state(device)
+        if sob_active and torch.device(device).type == 'cuda' else None
+    )
+
+    E, F, S, _ = model.forward_batched(
+        bat, training=True, temperature_scale=temp_scale, compute_stress=want_stress
+    )
+
+    base = torch.stack([baseline_energy(it['z'].to(device)) for it in items]).reshape(-1)
+    target_E = bat['t_E'].reshape(-1) - base
+    loss_e = (((E - target_E) / n_at) ** 2).sum()
+
+    dF2 = (F - bat['t_F']) ** 2                                    # [N_total, 3]
+    per_struct_f = torch.zeros_like(E).index_add(0, bat['batch'], dF2.sum(dim=1))
+    loss_f = (per_struct_f / (3.0 * n_at)).sum()
+
+    loss = energy_weight * loss_e + force_weight * loss_f
+    if want_stress:
+        dS2 = ((S - bat['t_S']) ** 2).flatten(1)                   # [B, 9]
+        voigt = dS2[:, [0, 4, 8, 5, 2, 1]].sum(dim=1)              # xx yy zz yz xz xy
+        loss = loss + stress_weight * (has_s * voigt / 6.0).sum()
+
+    if sob_active:
+        delta = torch.randn_like(bat['pos']) * sobolev_sigma
+        pert = dict(bat); pert['pos'] = bat['pos'] + delta
+        torch.set_rng_state(rng_cpu)
+        if rng_dev is not None:
+            torch.cuda.set_rng_state(rng_dev, device)
+        E_p, _, _, _ = model.forward_batched(
+            pert, training=True, temperature_scale=temp_scale,
+            detach_pos=True, compute_stress=False,
+        )
+        fd_lin = torch.zeros_like(E).index_add(0, bat['batch'], (F.detach() * delta).sum(dim=1))
+        loss = loss + sobolev_weight * (((E_p - E) + fd_lin) ** 2).sum()
+
+    scaler.scale(loss / norm).backward()
+
+    with torch.no_grad():
+        S_all = S.detach() if want_stress else torch.zeros(
+            len(items), 3, 3, device=device, dtype=bat['pos'].dtype
+        )
+        mask = has_s if want_stress else torch.zeros_like(has_s)
+        metrics.update_batched(
+            E, F, S_all, target_E, bat['t_F'], bat['t_S'],
+            mask, bat['batch'], bat['n_atoms'].to(device),
+        )
+    return loss.detach()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Transformers-ACE")
     parser.add_argument("--config", "-c", default=None, help="Path to YAML config file")
     args = parser.parse_args()
 
     config, config_path = _load_config(args.config)
+    configure_determinism(config)
     print(f"--- Loading {config_path} ---")
 
     seed = int(config.get('seed', 42))
@@ -502,7 +751,17 @@ def main():
                               collate_fn=AtomisticDataset.collate_fn, num_workers=num_workers)
 
     print("--- Initializing Transformers-ACE ---")
-    model = TransformersACE(
+    architecture_version = int(config.get('architecture_version', 2))
+    if architecture_version == 2:
+        model_class = TransformersACE
+    elif architecture_version == 3:
+        model_class = TransformersACEV3
+    elif architecture_version == 4:
+        model_class = TransformersACEV4
+    else:
+        raise ValueError("architecture_version must be 2, 3, or 4 for training")
+
+    model_kwargs = dict(
         r_max=config['r_max'], l_max=config['l_max'], num_radial=config['num_radial'],
         hidden_dim=config['hidden_dim'], num_layers=config['num_layers'],
         radial_basis_type=config.get('radial_basis_type', 'bessel'),
@@ -514,13 +773,20 @@ def main():
         attention_dropout=config.get('attention_dropout', config.get('transformer_dropout', 0.0)),
         attention_layer_scale_init=config.get('attention_layer_scale_init', 1e-2),
         attention_distance_penalty=config.get('attention_distance_penalty', True),
+        attention_mode=config.get('attention_mode', 'full'),
         radial_mlp_hidden=config.get('radial_mlp_hidden', 32),
         radial_mlp_layers=config.get('radial_mlp_layers', 2),
         correlation_order=config.get('correlation_order', 4),
         correlation_channels=config.get('correlation_channels', 16),
         use_aux_force_head=False,
         use_aux_stress_head=False,
-    ).to(device)
+    )
+    if architecture_version == 4:
+        model_kwargs.update(
+            attention_num_shells=config.get('attention_num_shells', 4),
+            correlation_rank_initial=config.get('correlation_rank_initial', None),
+        )
+    model = model_class(**model_kwargs).to(device)
     
     optimizer = build_optimizer(model, config)
     print(f"Optimizer: {config.get('optimizer', 'adam')}")
@@ -602,11 +868,11 @@ def main():
         print(f"--- Loading checkpoint from {resume_path} ---")
         checkpoint = load_checkpoint(resume_path, map_location=device)
         checkpoint_version = int(checkpoint.get('config', {}).get('architecture_version', 1))
-        if checkpoint_version != TransformersACE.architecture_version:
+        if checkpoint_version != architecture_version:
             raise ValueError(
                 f"Cannot resume architecture v{checkpoint_version} weights in the "
-                f"v{TransformersACE.architecture_version} model. Start a new v2 run; "
-                "the calculator can still evaluate the legacy checkpoint."
+                f"v{architecture_version} model. Start a matching architecture run; "
+                "the calculator can still evaluate older checkpoints."
             )
         model.load_state_dict(checkpoint['model_state_dict'])
 
@@ -659,6 +925,10 @@ def main():
         'val_loss': [],
         'train_energy_rmse': [],
         'val_energy_rmse': [],
+        'train_energy_rmse_offset_free': [],
+        'val_energy_rmse_offset_free': [],
+        'train_energy_bias': [],
+        'val_energy_bias': [],
         'train_force_rmse': [],
         'val_force_rmse': [],
         'train_stress_rmse': [],
@@ -667,26 +937,56 @@ def main():
 
     ckpt_interval = int(config.get('checkpoint_interval', 0) or 0)
 
-    # Temperature curriculum for attention sharpness.
+    # Attention-temperature curriculum.
+    #
+    # T_att must be a deterministic function of the epoch alone and must reach
+    # exactly 1 before training ends, because validation, the ASE calculator and
+    # every deployed path evaluate the model at T_att = 1.  Any residual
+    # T_att != 1 at the final epoch means the optimizer is shaping a *different*
+    # function from the one that is later deployed.
     temp_scale_start = float(config.get('temperature_scale_start', 1.0))
-    temp_scale_end = float(config.get('temperature_scale_end', temp_scale_start))
+    temp_scale_end = float(config.get('temperature_scale_end', 1.0))
     temp_scale_epochs = int(config.get('temperature_scale_epochs', 0) or 0)
 
-    def _temperature_scale(epoch_idx: int, force_ema: Optional[float] = None):
-        base = temp_scale_start
-        if temp_scale_epochs > 0:
-            frac = min(1.0, epoch_idx / float(temp_scale_epochs))
-            base = temp_scale_start + frac * (temp_scale_end - temp_scale_start)
-        ref = float(config.get('temperature_force_ref', 0.0))
-        gamma = float(config.get('temperature_force_exponent', 0.0))
-        if force_ema is not None and ref > 0.0 and gamma != 0.0:
-            scale = (force_ema / ref) ** gamma
-            if isinstance(scale, torch.Tensor):
-                scale = scale.detach().item()
-            base *= float(scale)
-        return base
+    if abs(temp_scale_end - 1.0) > 1e-12:
+        raise ValueError(
+            "temperature_scale_end must be 1.0: validation and inference evaluate the "
+            f"model at T_att = 1, but the schedule ends at {temp_scale_end}. Training "
+            "would optimize a different function from the one deployed."
+        )
+    if temp_scale_epochs > 0 and temp_scale_epochs >= int(config['epochs']):
+        raise ValueError(
+            f"temperature_scale_epochs ({temp_scale_epochs}) must be smaller than "
+            f"epochs ({int(config['epochs'])}) so that T_att reaches 1 before training ends."
+        )
+    # The force-loss feedback term made T_att data-dependent and left it at
+    # ~4.4 at convergence while validation used 1.0.  It is no longer supported.
+    for _legacy_key in ('temperature_force_ref', 'temperature_force_exponent'):
+        if float(config.get(_legacy_key, 0.0) or 0.0) != 0.0:
+            raise ValueError(
+                f"'{_legacy_key}' is no longer supported: it made the attention "
+                "temperature depend on the running force loss, so training and "
+                "inference used different temperatures. Remove it from the config "
+                "(the epoch schedule already anneals T_att to 1)."
+            )
 
+    def _temperature_scale(epoch_idx: int) -> float:
+        """T_att as a pure function of epoch, annealing to exactly 1."""
+        if temp_scale_epochs <= 0:
+            return 1.0
+        frac = min(1.0, epoch_idx / float(temp_scale_epochs))
+        return temp_scale_start + frac * (temp_scale_end - temp_scale_start)
+
+    # Evaluate a whole batch as one disconnected graph. The GPU is launch-bound
+    # for single small cells, so this is a large throughput win; it is
+    # numerically identical to the per-structure path (tests/test_batched_graph.py).
+    batched_graphs = bool(config.get('batched_graphs', False))
     force_consistency_weight = float(config.get('force_consistency_weight', 0.0))
+    if batched_graphs and force_consistency_weight > 0.0:
+        raise ValueError(
+            "batched_graphs does not support force_consistency_weight; the batched "
+            "path always differentiates the batched position tensor."
+        )
     displacement_prob = float(config.get('displacement_prob', 0.0))
     displacement_sigma = float(config.get('displacement_sigma', 0.0))
     if displacement_prob > 0.0:
@@ -712,13 +1012,23 @@ def main():
     epochs_completed = start_epoch
     
     print(
-        f"{'Epoch':>5} | {'Loss':>10} | {'E (meV)':>10} | {'force_RMSE':>12} | {'force_MSE':>12} | {'force_MAE':>12} | {'S_RMSE':>10} || "
-        f"{'Val Loss':>10} | {'Val E':>10} | {'Val force_RMSE':>16} | {'Val force_MSE':>16} | {'Val S_RMSE':>12}"
+        f"{'Epoch':>5} | {'Loss':>10} | {'E (meV)':>10} | {'E_free':>9} | {'force_RMSE':>12} | {'force_MSE':>12} | {'force_MAE':>12} | {'S_RMSE':>10} || "
+        f"{'Val Loss':>10} | {'Val E':>10} | {'Val E_free':>10} | {'Val force_RMSE':>16} | {'Val force_MSE':>16} | {'Val S_RMSE':>12}"
     )
     print("-" * 170)
     
     force_loss_ema = None
     for epoch in range(start_epoch, config['epochs']):
+        if architecture_version == 4:
+            max_rank = int(model.ace.irreps_correlation[0].mul)
+            initial_rank = int(config.get('correlation_rank_initial') or max_rank)
+            rank_warmup = max(0, int(config.get('correlation_rank_warmup_epochs', 0)))
+            if rank_warmup > 0:
+                fraction = min(1.0, float(epoch + 1) / float(rank_warmup))
+                active_rank = round(initial_rank + fraction * (max_rank - initial_rank))
+            else:
+                active_rank = max_rank
+            model.set_correlation_rank(active_rank)
         force_weight = _force_weight(epoch)
         stress_weight = _stress_weight(epoch)
         model.train()
@@ -735,6 +1045,26 @@ def main():
             # --- GRADIENT ACCUMULATION (FP32/AMP) ---
             items = list(batch)
 
+            if batched_graphs:
+                batch_loss = _batched_train_step(
+                    model, items, device, _temperature_scale(epoch),
+                    config['energy_weight'], force_weight, stress_weight,
+                    sobolev_weight, sobolev_sigma,
+                    baseline_energy, train_metrics, scaler,
+                    len(items) * grad_accum_steps,
+                )
+                total_items_seen += len(items)
+                if (batch_idx + 1) % grad_accum_steps == 0:
+                    if config.get('clip_grad_norm', None):
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config['clip_grad_norm'])
+                    scaler.step(optimizer); scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    if scheduler_interval == 'step':
+                        scheduler.step()
+                total_loss = total_loss + batch_loss
+                continue
+
             for item in items:
                 for k, v in item.items():
                     if isinstance(v, torch.Tensor):
@@ -744,10 +1074,22 @@ def main():
 
                 # Standard Forward with optional AMP
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-                    temp_scale = _temperature_scale(epoch, force_loss_ema)
+                    temp_scale = _temperature_scale(epoch)
                     stress_target = (
                         bool(item['has_stress'].item())
                         and stress_weight > 0.0
+                    )
+                    # The local-linearisation term (Eq. 41) compares two forward
+                    # passes.  With independent attention-dropout masks their
+                    # difference is dominated by dropout variance rather than by
+                    # curvature, so the RNG state is captured here and replayed for
+                    # the second pass, giving both passes identical masks.
+                    sobolev_active = sobolev_weight > 0.0 and sobolev_sigma > 0.0
+                    rng_state_cpu = torch.get_rng_state() if sobolev_active else None
+                    rng_state_dev = (
+                        torch.cuda.get_rng_state(device)
+                        if sobolev_active and device_type == 'cuda'
+                        else None
                     )
                     p_E, p_F, p_S, aux = model(
                         item,
@@ -782,10 +1124,15 @@ def main():
                             ]))**2
                         )
 
-                    if sobolev_weight > 0.0 and sobolev_sigma > 0.0:
+                    if sobolev_active:
+                        # Draw the displacement first, then rewind the RNG so the
+                        # perturbed pass replays exactly the dropout masks used above.
                         delta = torch.randn_like(item['pos']) * sobolev_sigma
                         pos_pert = item['pos'] + delta
                         perturbed = {**item, 'pos': pos_pert}
+                        torch.set_rng_state(rng_state_cpu)
+                        if rng_state_dev is not None:
+                            torch.cuda.set_rng_state(rng_state_dev, device)
                         p_E_pert, _, _, _ = model(
                             perturbed,
                             training=True,
@@ -793,6 +1140,8 @@ def main():
                             detach_pos=True,
                             compute_stress=False,
                         )
+                        # E(r+d) - E(r) + F.d  vanishes to first order; with matched
+                        # masks this measures curvature, not dropout variance.
                         fd = (p_E_pert - p_E) + (p_F.detach() * delta).sum()
                         loss_item = loss_item + sobolev_weight * fd.pow(2)
 
@@ -815,9 +1164,12 @@ def main():
                 batch_loss += loss_item.item()
 
                 with torch.no_grad():
-                    pred_E_abs = p_E + baseline_energy(item['z'])
+                    # Pass the *shifted* energies. The composition baseline cancels
+                    # in the difference, so this is analytically identical to
+                    # comparing absolute energies but avoids differencing two
+                    # O(10^3 eV) float32 numbers to extract an O(10^-1 eV) error.
                     train_metrics.update(
-                        pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'],
+                        p_E, p_F, p_S, target_E, item['t_F'], item['t_S'],
                         stress_target, n_ats,
                     )
                     if force_loss_ema is None:
@@ -853,13 +1205,51 @@ def main():
                 scheduler.step()
 
         avg_train_loss = total_loss / max(1, total_items_seen)
-        tr_e, tr_f, tr_s, tr_f_mse, tr_f_mae = train_metrics.get_metrics()
+        if torch.is_tensor(avg_train_loss):
+            avg_train_loss = float(avg_train_loss.detach().cpu())
+        tr_e, tr_f, tr_s, tr_f_mse, tr_f_mae, tr_e_free, tr_e_bias = train_metrics.get_metrics()
         # Validation
         model.eval()
         val_metrics = MetricTracker()
         val_loss_accum = 0.0
 
         for batch in valid_loader:
+            if batched_graphs:
+                items = list(batch)
+                bat = AtomisticDataset.collate_batched(items)
+                for k, v in bat.items():
+                    if isinstance(v, torch.Tensor):
+                        bat[k] = v.to(device, non_blocking=True)
+                n_at = bat['n_atoms'].to(device).to(bat['pos'].dtype)
+                has_s = bat['has_stress'].to(device).to(bat['pos'].dtype)
+                want_s = bool(has_s.any().item()) and stress_weight > 0.0
+                # Validation and deployment both evaluate at T_att = 1 (D2).
+                p_E, p_F, p_S, _ = model.forward_batched(
+                    bat, training=False, compute_stress=want_s
+                )
+                base = torch.stack(
+                    [baseline_energy(it['z'].to(device)) for it in items]
+                ).reshape(-1)
+                target_E = bat['t_E'].reshape(-1) - base
+                loss_e = (((p_E - target_E) / n_at) ** 2).sum()
+                dF2 = (p_F - bat['t_F']) ** 2
+                per_f = torch.zeros_like(p_E).index_add(0, bat['batch'], dF2.sum(dim=1))
+                loss_f = (per_f / (3.0 * n_at)).sum()
+                vloss = config['energy_weight'] * loss_e + force_weight * loss_f
+                if want_s:
+                    dS2 = ((p_S - bat['t_S']) ** 2).flatten(1)
+                    voigt = dS2[:, [0, 4, 8, 5, 2, 1]].sum(dim=1)
+                    vloss = vloss + stress_weight * (has_s * voigt / 6.0).sum()
+                val_loss_accum += vloss.detach()
+                S_all = p_S.detach() if want_s else torch.zeros(
+                    len(items), 3, 3, device=device, dtype=bat['pos'].dtype
+                )
+                val_metrics.update_batched(
+                    p_E, p_F, S_all, target_E, bat['t_F'], bat['t_S'],
+                    has_s if want_s else torch.zeros_like(has_s),
+                    bat['batch'], bat['n_atoms'].to(device),
+                )
+                continue
             for item in batch:
                 for k, v in item.items():
                     if isinstance(v, torch.Tensor):
@@ -893,20 +1283,23 @@ def main():
                         + (stress_weight * loss_s)
                     )
 
-                pred_E_abs = p_E + baseline_energy(item['z'])
                 val_metrics.update(
-                    pred_E_abs, p_F, p_S, item['t_E'], item['t_F'], item['t_S'],
+                    p_E, p_F, p_S, target_E, item['t_F'], item['t_S'],
                     stress_target, n_ats,
                 )
 
         avg_val_loss = val_loss_accum / len(val_atoms)
-        val_e, val_f, val_s, val_f_mse, val_f_mae = val_metrics.get_metrics()
+        val_e, val_f, val_s, val_f_mse, val_f_mae, val_e_free, val_e_bias = val_metrics.get_metrics()
         avg_val_loss = float(avg_val_loss.detach().cpu())
         history['epoch'].append(epoch + 1)
         history['train_loss'].append(float(avg_train_loss))
         history['val_loss'].append(avg_val_loss)
         history['train_energy_rmse'].append(float(tr_e))
         history['val_energy_rmse'].append(float(val_e))
+        history['train_energy_rmse_offset_free'].append(float(tr_e_free))
+        history['val_energy_rmse_offset_free'].append(float(val_e_free))
+        history['train_energy_bias'].append(float(tr_e_bias))
+        history['val_energy_bias'].append(float(val_e_bias))
         history['train_force_rmse'].append(float(tr_f))
         history['val_force_rmse'].append(float(val_f))
         history['train_stress_rmse'].append(float(tr_s))
@@ -916,8 +1309,8 @@ def main():
 
         print(
             f"{epoch+1:5d} | "
-            f"{avg_train_loss:10.4f} | {tr_e:10.2f} | {tr_f:12.6f} | {tr_f_mse:12.6f} | {tr_f_mae:12.6f} | {tr_s:10.4f} || "
-            f"{avg_val_loss:10.4f} | {val_e:10.2f} | {val_f:16.6f} | {val_f_mse:16.6f} | {val_s:12.6f}"
+            f"{avg_train_loss:10.4f} | {tr_e:10.2f} | {tr_e_free:9.2f} | {tr_f:12.6f} | {tr_f_mse:12.6f} | {tr_f_mae:12.6f} | {tr_s:10.4f} || "
+            f"{avg_val_loss:10.4f} | {val_e:10.2f} | {val_e_free:10.2f} | {val_f:16.6f} | {val_f_mse:16.6f} | {val_s:12.6f}"
         )
 
         epochs_completed = epoch + 1

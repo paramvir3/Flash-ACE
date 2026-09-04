@@ -1,0 +1,127 @@
+LAMMPS (22 Jul 2025 - Update 6)
+OMP_NUM_THREADS environment is not set. Defaulting to 1 thread.
+  using 1 OpenMP thread(s) per MPI task
+# Scaling benchmark. Same physics as in.bench, with the system size set by
+# -var rx/-var ry (replication factors) and capacities matched per size.
+units           metal
+atom_style      atomic
+newton          on
+boundary        p p p
+
+read_data       ../test_lammps_cspbi3_mpi/data.NVT
+Reading data file ...
+  triclinic box = (0 0 0) to (83.4736 76.648 71.044) with tilt (0 0 0)
+  1 by 1 by 1 MPI processor grid
+  reading atoms ...
+  10240 atoms
+  reading velocities ...
+  10240 velocities
+  read_data CPU = 0.048 seconds
+replicate       ${rx} ${ry} 1
+replicate       2 ${ry} 1
+replicate       2 5 1
+Replication is creating a 2x5x1 = 10 times larger system...
+  triclinic box = (0 0 0) to (166.9472 383.24 71.044) with tilt (0 0 0)
+  1 by 1 by 1 MPI processor grid
+  102400 atoms
+  replicate CPU = 0.011 seconds
+
+mass            1 132.905
+mass            2 204.199
+mass            3 126.900
+
+if "${style} == aot" then   "pair_style  transformers_ace/aot"   "pair_coeff  * * ${model} Cs Pb I" else   "pair_style  transformers_ace"   "pair_coeff  * * ${model} Cs Pb I"
+pair_style  transformers_ace
+pair_coeff  * * ${model} Cs Pb I
+pair_coeff  * * /home/user/TRACE/trace_h100.transformers_ace.pt Cs Pb I
+
+neighbor        1.0 bin
+neigh_modify    delay 5 every 1
+
+velocity        all create 400.0 1428 dist gaussian
+fix             1 all nve
+timestep        0.002
+
+thermo          50
+thermo_style    custom step temp pe ke etotal press
+run             30
+Neighbor list info ...
+  update: every = 1 steps, delay = 5 steps, check = yes
+  max neighbors/atom: 2000, page size: 100000
+  master list distance cutoff = 7
+  ghost atom cutoff = 7
+  binsize = 3.5, bins = 48 110 21
+  1 neighbor lists, perpetual/occasional/extra = 1 0 0
+  (1) pair transformers_ace, perpetual
+      attributes: full, newton on, ghost
+      pair build: full/bin/ghost
+      stencil: full/ghost/bin/3d
+      bin: standard
+Per MPI rank memory allocation (min/avg/max) = 41.62 | 41.62 | 41.62 Mbytes
+   Step          Temp          PotEng         KinEng         TotEng         Press     
+         0   400           -3264468.5      5294.4438     -3259174.1      6004.9094    
+        30   397.418       -3264434.2      5260.2682     -3259174        6698.9408    
+Loop time of 13.3186 on 1 procs for 30 steps with 102400 atoms
+
+Performance: 0.389 ns/day, 61.660 hours/ns, 2.252 timesteps/s, 230.654 katom-step/s
+87.3% CPU use with 1 MPI tasks x 1 OpenMP threads
+
+MPI task timing breakdown:
+Section |  min time  |  avg time  |  max time  |%varavg| %total
+---------------------------------------------------------------
+Pair    | 13.265     | 13.265     | 13.265     |   0.0 | 99.59
+Neigh   | 0          | 0          | 0          |   0.0 |  0.00
+Comm    | 0.008103   | 0.008103   | 0.008103   |   0.0 |  0.06
+Output  | 0.00052821 | 0.00052821 | 0.00052821 |   0.0 |  0.00
+Modify  | 0.032971   | 0.032971   | 0.032971   |   0.0 |  0.25
+Other   |            | 0.01235    |            |       |  0.09
+
+Nlocal:         102400 ave      102400 max      102400 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+Nghost:          35358 ave       35358 max       35358 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+Neighs:              0 ave           0 max           0 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+FullNghs:  2.92712e+06 ave 2.92712e+06 max 2.92712e+06 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+
+Total # of neighbors = 2927120
+Ave neighs/atom = 28.585156
+Neighbor list builds = 0
+Dangerous builds = 0
+reset_timestep  0
+run             100
+Per MPI rank memory allocation (min/avg/max) = 41.62 | 41.62 | 41.62 Mbytes
+   Step          Temp          PotEng         KinEng         TotEng         Press     
+         0   397.418       -3264434.2      5260.2682     -3259174        6698.9396    
+        50   402.11116     -3264496.2      5322.3874     -3259173.9      7892.6629    
+       100   405.45644     -3264540.8      5366.6658     -3259174.1      6406.5871    
+Loop time of 34.9964 on 1 procs for 100 steps with 102400 atoms
+
+Performance: 0.494 ns/day, 48.606 hours/ns, 2.857 timesteps/s, 292.601 katom-step/s
+84.5% CPU use with 1 MPI tasks x 1 OpenMP threads
+
+MPI task timing breakdown:
+Section |  min time  |  avg time  |  max time  |%varavg| %total
+---------------------------------------------------------------
+Pair    | 34.206     | 34.206     | 34.206     |   0.0 | 97.74
+Neigh   | 0.66005    | 0.66005    | 0.66005    |   0.0 |  1.89
+Comm    | 0.025359   | 0.025359   | 0.025359   |   0.0 |  0.07
+Output  | 0.0010372  | 0.0010372  | 0.0010372  |   0.0 |  0.00
+Modify  | 0.078847   | 0.078847   | 0.078847   |   0.0 |  0.23
+Other   |            | 0.02491    |            |       |  0.07
+
+Nlocal:         102400 ave      102400 max      102400 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+Nghost:          35166 ave       35166 max       35166 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+Neighs:              0 ave           0 max           0 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+FullNghs:  2.92289e+06 ave 2.92289e+06 max 2.92289e+06 min
+Histogram: 1 0 0 0 0 0 0 0 0 0
+
+Total # of neighbors = 2922894
+Ave neighs/atom = 28.543887
+Neighbor list builds = 3
+Dangerous builds = 0
+Total wall time: 0:00:51

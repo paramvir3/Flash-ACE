@@ -166,6 +166,15 @@ def test_quintic_cutoff_is_c2_at_boundary():
     np.testing.assert_allclose(float(second), 0.0, atol=1e-14)
 
 
+def test_quintic_cutoff_remains_nonnegative_in_float32_near_the_boundary():
+    cutoff = SmoothPolynomialCutoff(3.0)
+    distances = torch.tensor([2.99, 2.999, 2.9999, 3.0, 3.001], dtype=torch.float32)
+    values = cutoff(distances)
+
+    assert torch.all(values >= 0.0)
+    assert values[-2:].eq(0.0).all()
+
+
 def test_full_model_is_continuous_when_an_edge_leaves_the_neighbor_list():
     model = _model(cutoff=3.0)
     energies = []
@@ -282,10 +291,7 @@ def test_sparse_attention_matches_explicit_receiver_group_evaluation():
     logits = (queries[receiver] * keys).sum(dim=-1) / math.sqrt(layer.key_dim)
     logits = logits + layer.radial_bias(layer.radial_basis(edge_len))
     if layer.distance_log_scale is not None:
-        logits = (
-            logits
-            - F.softplus(layer.distance_log_scale)[None, :] * edge_len[:, None]
-        )
+        logits = logits - F.softplus(layer.distance_log_scale)[None, :] * edge_len[:, None]
 
     alpha = torch.zeros_like(logits)
     for center in range(num_nodes):
@@ -336,12 +342,8 @@ def test_irrepwise_attention_layer_scale_preserves_equivariance_after_training()
     positions = torch.tensor(
         [[0.1, 0.2, 0.3], [1.2, 0.4, 0.7], [0.5, 1.3, 0.8], [0.8, 0.7, 1.7]]
     )
-    rotation = torch.tensor(
-        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
-    )
-    energy, forces, _, _ = model(
-        _data(positions), training=False, compute_stress=False
-    )
+    rotation = torch.tensor([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    energy, forces, _, _ = model(_data(positions), training=False, compute_stress=False)
     rotated_energy, rotated_forces, _, _ = model(
         _data(positions @ rotation.T), training=False, compute_stress=False
     )

@@ -89,7 +89,10 @@ resume_load_scaler: false        # Load AMP GradScaler state when resuming
 use_checkpoint_energy_shift: true # Use the energy shift stored in the checkpoint when resuming
 energy_shift_per_atom: null       # Constant shift to subtract during training (eV/atom)
 atomic_energies: null             # Map of species reference energies, e.g. {H: -0.5, O: -17.0}
-solve_atomic_energies: false      # Fit per-species reference energies from the training set
+solve_atomic_energies: true       # D3 FIX: fit per-species reference energies by least squares.
+                                  # A single scalar shift lets the network's energy zero
+                                  # wander, which made RMSE_E swing 2->6 meV/atom between
+                                  # epochs while the offset-free error stayed at ~1.5.
 
 # ------------------------------------------------------------------------------
 # 4. LOSS WEIGHTS
@@ -113,9 +116,12 @@ sobolev_sigma: 0.02
 displacement_prob: 0.0           # Requires newly evaluated labels; do not reuse original DFT labels
 displacement_sigma: 0.0
 
-# Attention controls
-temperature_scale_start: 1.3
-temperature_scale_end: 1.0
-temperature_scale_epochs: 15
-temperature_force_ref: 0.5
-temperature_force_exponent: -0.25
+# Attention temperature curriculum (D2 FIX)
+# T_att must be a function of the epoch alone and must reach exactly 1 before
+# training ends, because validation and every deployed path evaluate at T_att = 1.
+# The former force-loss feedback term (temperature_force_ref /
+# temperature_force_exponent) left T_att ~ 4.4 at convergence while validation used
+# 1.0, i.e. a different function was optimised than deployed. It is now rejected.
+temperature_scale_start: 1.3      # Softer attention early for a stable start
+temperature_scale_end: 1.0        # Must be 1.0; the trainer enforces this
+temperature_scale_epochs: 15      # Must be < epochs so T_att = 1 for the rest of the run
