@@ -232,6 +232,14 @@ class ExportableSphericalHarmonics(nn.Module):
 
 def make_aot_compatible(model: nn.Module) -> nn.Module:
     """Return a frozen TRACE copy with export-safe equivariant primitives."""
+
+    # The residual layer scale is a compile-time constant at inference. Baking it
+    # removes a (mul, 2l+1) expand-and-concatenate from the exported graph, which
+    # the CUDA Triton backend of Inductor could not lower ("failed to set ranges
+    # [4, 1] ([N, 4, 5], [])"), and saves the broadcast at every MD step.
+    from flashace.model import freeze_layer_scales
+
+    freeze_layer_scales(model)
     converted = copy.deepcopy(model).eval()
 
     def replace(module: nn.Module) -> None:
@@ -291,10 +299,14 @@ def pad_lammps_inputs(
     return padded_z, padded_pos, cell, padded_edges, padded_shifts, strain, padded_mask
 
 
+AOTI_MODEL_NAME = "model"
+
+
 def compile_aot_force_program(
     program: nn.Module,
     inputs: tuple[torch.Tensor, ...],
     output: Path,
+    max_autotune: bool = False,
 ) -> Path:
     """Compile a fixed-shape energy/force/virial program into an AOTI package.
 
@@ -322,8 +334,55 @@ def compile_aot_force_program(
     # ``torch.export`` cannot capture this functional derivative graph on all
     # supported PyTorch releases. Package the already-static FX graph directly.
     # PyTorch 2.12 returns a single artifact while newer versions return a list.
-    artifacts = aot_compile(graph, inputs, options={"max_autotune": True})
+    # ``max_autotune`` is off by default. It is a poor trade for a one-shot AOT
+    # export: it benchmarks tens of thousands of Triton variants (minutes of pure
+    # CPU time) for a marginal gain, and on the CUDA backend it drove the
+    # derivative graph into a codegen assertion,
+    #   "failed to set ranges [4, 1] ([N, 4, 5], [])",
+    # where (4, 5) is the l=2 irrep block that e3nn materialises throughout the
+    # graph (193 such nodes; the shape is intrinsic to the layout, not removable).
+    # Plain Inductor lowering compiles the same graph.
+    # ``aot_inductor.package`` makes aot_compile emit the full artifact set
+    # (wrapper, kernels and their ``*_metadata.json`` entries) instead of a bare
+    # shared library. Without it the archive carries only a ``.so`` and the
+    # loader fails with "File not found: _metadata.json".
+    options = {"max_autotune": bool(max_autotune), "aot_inductor.package": True}
+    artifacts = aot_compile(graph, inputs, options=options)
     if isinstance(artifacts, (str, Path)):
         artifacts = [str(artifacts)]
-    package_aoti(str(output), artifacts)
+    # Package under an explicit model name, which must match the one the LAMMPS
+    # pair style asks for (``"model"``).
+    #
+    # Note on loaders: the Python ``torch._inductor.aoti_load_package`` helper
+    # cannot read this archive. It calls ``treespec_loads`` to recover the
+    # input/output pytree specs, and those are only written when packaging an
+    # ``ExportedProgram`` -- which is exactly the path ``torch.func.grad``
+    # blocks. That limitation does not affect deployment: the C++
+    # ``AOTIModelPackageLoader`` used by the pair style passes a flat tensor
+    # vector and never consults a pytree spec. ``load_aot_force_program`` below
+    # binds to that same C++ loader, so the Python and LAMMPS paths agree.
+    package_aoti(str(output), {AOTI_MODEL_NAME: artifacts})
     return output
+
+
+def load_aot_force_program(package: Path | str, device_index: int = -1):
+    """Load a ``.pt2`` produced by :func:`compile_aot_force_program`.
+
+    Binds the C++ ``AOTIModelPackageLoader`` -- the same loader the LAMMPS pair
+    style uses -- so a package validated here is validated for deployment.
+    Returns a callable mapping the padded LAMMPS inputs to
+    ``(energy, forces, virial)``.
+    """
+    loader = torch._C._aoti.AOTIModelPackageLoader(
+        str(Path(package).expanduser().resolve()),
+        AOTI_MODEL_NAME,
+        False,  # run_single_threaded
+        1,  # num_runners
+        device_index,
+    )
+
+    def run(*inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(loader.boxed_run(list(inputs)))
+
+    run.loader = loader  # keep the container alive for the caller
+    return run

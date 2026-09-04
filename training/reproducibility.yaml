@@ -1,3 +1,19 @@
+# ==============================================================================
+# SUPERSEDED -- this manifest describes the pre-fix run (checkpoint epoch 76,
+# trained 2026-06-28) whose .pt files have been deleted.
+#
+# That run predates the P3/D2/D3/D4 corrections:
+#   * its layer scale was stored per component, so the trained model was NOT
+#     O(3)-equivariant (energy spread ~5.96 meV/atom under rotation);
+#   * the attention temperature reached T_att ~ 4.4 in training while validation
+#     and deployment used T_att = 1;
+#   * the reported energy RMSE was dominated by a drifting energy zero;
+#   * the local-linearisation term was ~49% dropout variance.
+#
+# Retained only as a record of what produced the previous figures. A new manifest
+# must be written after the retrain.
+# ==============================================================================
+
 schema_version: 3
 run_name: cspbi3_cpu_100_epoch_muon_ace_attention_v2
 code:
@@ -21,7 +37,8 @@ dataset:
 
 configuration:
   path: training/config.yaml
-  sha256: ab4e178039bfba8e3511db960fac3ba79650bd35f6b263c74b6a8478f84e3ebf
+  sha256_at_run: ab4e178039bfba8e3511db960fac3ba79650bd35f6b263c74b6a8478f84e3ebf
+  current_sha256: b0ac5b5195e5d9b1008349f0dfb481f394b06d0dfe20f8e21122ff2adbdc13ce
   architecture_version: 2
   l_max: 2
   r_max: 6.0
@@ -31,7 +48,7 @@ configuration:
   optimizer: muon
   muon_parameter_mode: hidden
   muon_momentum: 0.95
-  muon_newton_schulz_steps: 5
+  muon_ns_steps: 5
   muon_nesterov: true
   muon_aux_optimizer: adamw
   energy_weight: 1.0
@@ -82,6 +99,7 @@ environment:
 notes:
   - The published checkpoint contains optimizer state and scheduler state.
   - The checkpoint config stores model architecture and energy-shift metadata; training optimizer settings are recorded in training/config.yaml and this manifest.
+  - After the run, training/config.yaml gained the explicit muon_ns_dtype=auto setting; the run-time configuration hash is retained above, and CPU behavior is unchanged because auto selects float32 on CPU.
   - The larger source trajectory training_examples/muon/training_cspbi3.extxyz is intentionally not tracked.
 
 reproducibility:

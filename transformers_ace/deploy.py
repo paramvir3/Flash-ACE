@@ -237,12 +237,23 @@ def export_lammps_model(
     for parameter in model.parameters():
         parameter.requires_grad_(False)
 
+    # The trace must run on the device the model will be deployed to.
+    # LAMMPSEnergyModel builds its strain basis with
+    #   torch.eye(3, dtype=pos.dtype, device=pos.device)
+    # and torch.jit.trace evaluates `pos.device` once and bakes the result in as
+    # a constant. Tracing on CPU therefore produces a module that always mixes a
+    # CPU constant into `pos @ deformation`, and running it on CUDA fails with
+    #   "Expected all tensors to be on the same device, but got mat2 is on cpu".
+    # This previously forced model.cpu() and built CPU example inputs regardless
+    # of `device`, so the flag was silently ignored and every exported artifact
+    # was CPU-only.
+    target = torch.device(device)
     atomic_energy_tensor = calculator.atomic_energy_tensor
     if atomic_energy_tensor is not None:
-        atomic_energy_tensor = atomic_energy_tensor.detach().cpu()
+        atomic_energy_tensor = atomic_energy_tensor.detach().to(target)
 
     deploy_model = LAMMPSEnergyModel(
-        model.cpu(),
+        model.to(target),
         atomic_energy_tensor=atomic_energy_tensor,
         energy_shift_per_atom=calculator.energy_shift_per_atom,
     ).eval()
@@ -251,7 +262,9 @@ def export_lammps_model(
         atoms = _synthetic_atoms(type_map, calculator.r_max)
     else:
         atoms = read(example_structure.expanduser())
-    example_inputs = _example_tensors(atoms, calculator.r_max)
+    example_inputs = tuple(
+        tensor.to(target) for tensor in _example_tensors(atoms, calculator.r_max)
+    )
 
     traced = torch.jit.trace(deploy_model, example_inputs, check_trace=False)
     metadata = _metadata_text(
@@ -262,8 +275,39 @@ def export_lammps_model(
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.jit.save(traced, str(output), _extra_files={"metadata.txt": metadata})
+    _verify_traced_model(output, deploy_model, example_inputs, target)
     print(f"Wrote LAMMPS TorchScript model: {output}")
     print(metadata, end="")
+
+
+def _verify_traced_model(output, eager, example_inputs, target) -> None:
+    """Reload the saved module on the target device and compare against eager.
+
+    ``check_trace=False`` disables the only check torch performs, and the test
+    suite runs on CPU, so nothing else exercises the saved artifact on the
+    device it will be deployed to. That combination let a module ship whose
+    strain basis was a baked CPU constant: it loaded cleanly and then aborted on
+    the first CUDA step with "mat2 is on cpu". Reloading here closes the gap,
+    and does so on the device that actually matters.
+    """
+    reloaded = torch.jit.load(str(output), map_location=target).eval()
+    with torch.no_grad():
+        expected = eager(*example_inputs)
+        produced = reloaded(*example_inputs)
+    if isinstance(expected, torch.Tensor):
+        expected, produced = (expected,), (produced,)
+    deviation = max(
+        float((p - e).abs().max()) for p, e in zip(produced, expected)
+    )
+    # float32 kernels may reassociate between eager and the traced module, so
+    # this is a round-off bound, not an equality test.
+    print(f"  verify traced module: max |delta| = {deviation:.3e}  "
+          f"[{'ok' if deviation <= 1e-3 else 'FAILED'}] on {target}")
+    if deviation > 1e-3:
+        raise RuntimeError(
+            f"Traced TorchScript module does not reproduce the eager model on "
+            f"{target}: max |delta| = {deviation:.3e}"
+        )
 
 
 def parse_args() -> argparse.Namespace:

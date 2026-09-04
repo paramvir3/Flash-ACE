@@ -1,8 +1,10 @@
+import math
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from e3nn import o3
 
 from flashace.calculator import TransformersACECalculator
@@ -255,6 +257,78 @@ def test_attention_does_not_read_updated_sender_hidden_states():
     second = layer(changed, edge_features, receiver, edge_len, cutoff)
 
     torch.testing.assert_close(first[0], second[0])
+
+
+def test_sparse_attention_matches_explicit_receiver_group_evaluation():
+    """Every center receives the exact update from all of its incoming edges."""
+    torch.manual_seed(17)
+    model = _model()
+    layer = model.layers[0]
+    layer.layer_scale_attn = None
+
+    num_nodes = 4
+    receiver = torch.tensor([2, 0, 3, 1, 0, 2, 1, 3], dtype=torch.long)
+    num_edges = receiver.numel()
+    node_features = torch.randn(num_nodes, model.attention_irreps.dim)
+    edge_features = torch.randn(num_edges, model.ace.irreps_correlation.dim)
+    edge_len = torch.linspace(0.6, 2.6, num_edges)
+    cutoff = model.ace.cutoff(edge_len)
+
+    actual = layer(node_features, edge_features, receiver, edge_len, cutoff)
+
+    x_norm = layer.node_norm(node_features)
+    queries = layer.q_proj(x_norm[:, : layer.hidden_dim]).view(
+        num_nodes,
+        layer.num_heads,
+        layer.key_dim,
+    )
+    edge_scalars = layer.edge_scalar_norm(edge_features[:, : layer.edge_scalar_dim])
+    keys = layer.k_proj(edge_scalars).view(
+        num_edges,
+        layer.num_heads,
+        layer.key_dim,
+    )
+    logits = (queries[receiver] * keys).sum(dim=-1) / math.sqrt(layer.key_dim)
+    logits = logits + layer.radial_bias(layer.radial_basis(edge_len))
+    if layer.distance_log_scale is not None:
+        logits = logits - F.softplus(layer.distance_log_scale)[None, :] * edge_len[:, None]
+
+    alpha = torch.zeros_like(logits)
+    for center in range(num_nodes):
+        incoming = torch.nonzero(receiver == center, as_tuple=False).flatten()
+        assert incoming.numel() > 0
+        for head in range(layer.num_heads):
+            center_max = torch.maximum(
+                logits.new_zeros(()),
+                logits[incoming, head].max(),
+            )
+            numerator = cutoff[incoming] * torch.exp(
+                logits[incoming, head] - center_max
+            )
+            denominator = torch.exp(-center_max) + numerator.sum()
+            alpha[incoming, head] = numerator / denominator
+
+    explicit_update = torch.zeros_like(node_features)
+    for head, value_layer in enumerate(layer.value_proj):
+        values = value_layer(edge_features)
+        for edge in range(num_edges):
+            explicit_update[receiver[edge]] += alpha[edge, head] * values[edge]
+
+    assert torch.all(torch.linalg.vector_norm(explicit_update, dim=1) > 0.0)
+    explicit_update = layer.out_proj(explicit_update / layer.num_heads)
+    expected = layer._apply_scalar_ffn(node_features + explicit_update)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+    permutation = torch.tensor([4, 2, 7, 0, 6, 1, 5, 3])
+    permuted = layer(
+        node_features,
+        edge_features[permutation],
+        receiver[permutation],
+        edge_len[permutation],
+        cutoff[permutation],
+    )
+    torch.testing.assert_close(permuted, actual, rtol=1e-5, atol=1e-6)
 
 
 def test_irrepwise_attention_layer_scale_preserves_equivariance_after_training():

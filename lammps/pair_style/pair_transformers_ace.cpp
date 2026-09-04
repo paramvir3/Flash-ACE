@@ -259,6 +259,15 @@ void PairTransformersACE::compute(int eflag, int vflag)
 {
   ev_init(eflag, vflag);
 
+  // Checked before any work, not after: the model returns a single extensive
+  // energy and a global virial, so neither per-atom decomposition exists. The
+  // arrays ev_init just zeroed would otherwise be reported as genuine zeros by
+  // compute pe/atom and compute stress/atom.
+  if (eflag_atom)
+    error->all(FLERR, "pair_style transformers_ace does not provide per-atom energy");
+  if (vflag_atom)
+    error->all(FLERR, "pair_style transformers_ace does not provide per-atom virial");
+
   const int nlocal = atom->nlocal;
   const int nall = atom->nlocal + atom->nghost;
   if (nlocal <= 0) return;
@@ -385,8 +394,5 @@ void PairTransformersACE::compute(int eflag, int vflag)
     virial[3] += -0.5 * g[3];
     virial[4] += -0.5 * g[4];
     virial[5] += -0.5 * g[5];
-  }
-  if (vflag_atom) {
-    error->all(FLERR, "pair_style transformers_ace does not support per-atom virial yet");
   }
 }

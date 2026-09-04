@@ -56,6 +56,6 @@ def test_stress_metric_uses_six_independent_components():
         1,
     )
 
-    _, _, stress_rmse, _, _ = tracker.get_metrics()
+    _, _, stress_rmse, _, _, _, _ = tracker.get_metrics()
     expected = torch.mean(stress_to_voigt(prediction) ** 2).sqrt().item()
     np.testing.assert_allclose(stress_rmse, expected)

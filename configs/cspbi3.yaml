@@ -37,6 +37,7 @@ weight_decay: 0.00001
 amsgrad: true
 muon_momentum: 0.95
 muon_ns_steps: 5
+muon_ns_dtype: "auto"             # CUDA uses BF16 like the Muon reference; CPU keeps FP32
 muon_nesterov: true
 muon_parameter_mode: "hidden"  # hidden = attention/FFN matrices only; all_matrices = experimental
 muon_include: []               # Optional fnmatch patterns, e.g. ["ace.center_proj.weight"]

@@ -1,0 +1,518 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[margin=2.0cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage[dvipsnames]{xcolor}
+\usepackage[most]{tcolorbox}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage[colorlinks=true,linkcolor=NavyBlue,urlcolor=NavyBlue]{hyperref}
+\usepackage{titlesec}
+
+% ---------------- colour scheme ----------------
+\definecolor{OKgreen}{RGB}{0,120,60}
+\definecolor{BADred}{RGB}{190,25,35}
+\definecolor{NEWblue}{RGB}{20,80,190}
+\definecolor{DERIVorange}{RGB}{200,105,0}
+\definecolor{lightgreen}{RGB}{240,250,244}
+\definecolor{lightred}{RGB}{253,242,242}
+\definecolor{lightblue}{RGB}{240,246,255}
+\definecolor{lightorange}{RGB}{255,248,238}
+
+\newcommand{\OK}[1]{\textcolor{OKgreen}{#1}}
+\newcommand{\BAD}[1]{\textcolor{BADred}{#1}}
+\newcommand{\NEW}[1]{\textcolor{NEWblue}{#1}}
+\newcommand{\DER}[1]{\textcolor{DERIVorange}{#1}}
+
+\newtcolorbox{okbox}[1]{colback=lightgreen,colframe=OKgreen,boxrule=0.6pt,
+  left=5pt,right=5pt,top=3pt,bottom=3pt,title={#1},
+  fonttitle=\footnotesize\bfseries,coltitle=white}
+\newtcolorbox{badbox}[1]{colback=lightred,colframe=BADred,boxrule=0.9pt,
+  left=5pt,right=5pt,top=3pt,bottom=3pt,title={#1},
+  fonttitle=\footnotesize\bfseries,coltitle=white}
+\newtcolorbox{planbox}[1]{colback=lightblue,colframe=NEWblue,boxrule=0.9pt,
+  left=5pt,right=5pt,top=3pt,bottom=3pt,title={#1},
+  fonttitle=\footnotesize\bfseries,coltitle=white}
+\newtcolorbox{derbox}[1]{colback=lightorange,colframe=DERIVorange,boxrule=0.6pt,
+  left=5pt,right=5pt,top=3pt,bottom=3pt,title={#1},
+  fonttitle=\footnotesize\bfseries,coltitle=white}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.6em}{}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+
+\newcommand{\rr}{\bm{r}}
+\newcommand{\aij}{\bm{a}_{ij}}
+\newcommand{\hh}{\bm{h}}
+\newcommand{\Ai}{\bm{A}_i}
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\title{\vspace{-1.2cm}\textbf{TRACE-v2 Equation Ledger}\\[2pt]
+\large Implemented equations, verified status, and planned changes}
+\author{Working document --- generated for architecture tracking}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-0.6cm}
+
+% =====================================================================
+\begin{tcolorbox}[colback=white,colframe=black!55,boxrule=0.6pt,left=6pt,right=6pt]
+\textbf{\normalsize Legend}\\[3pt]
+\begin{tabular}{@{}ll@{}}
+\OK{$\blacksquare$ \textbf{Green}}  & Implemented \emph{and} numerically verified correct. No change planned.\\
+\BAD{$\blacksquare$ \textbf{Red}}   & Implemented but \emph{defective}, or manuscript text disagrees with code. Must change.\\
+\NEW{$\blacksquare$ \textbf{Blue}}  & Planned replacement. Mathematically derived and (where stated) benchmarked.\\
+\DER{$\blacksquare$ \textbf{Orange}}& Derived from VMK, not yet implemented. Candidate, not yet committed.\\
+\end{tabular}\\[4pt]
+\footnotesize
+Manuscript equation numbers follow \code{docs/TRANSFORMERS\_ACE\_METHODS.tex}.
+\textbf{VMK} = Varshalovich, Moskalev \& Khersonskii, \emph{Quantum Theory of Angular
+Momentum} (World Scientific 1988; OA 2021), cited as VMK\,ch.sec(eq).
+Companion documents: \code{docs/PEER\_REVIEW.md} (defects),
+\code{docs/ANGULAR\_MOMENTUM\_REFERENCE.md} (derivations).
+\end{tcolorbox}
+
+% =====================================================================
+\section{Status summary}
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}llcl@{}}
+\toprule
+\textbf{Block} & \textbf{Equations} & \textbf{Status} & \textbf{Action}\\
+\midrule
+Local energy decomposition      & (2)          & \OK{verified}  & --- \\
+Periodic edges                  & (4)--(6)     & \OK{verified}  & --- \\
+Cutoff envelope                 & (7)--(8)     & \OK{verified}  & --- \\
+Radial basis                    & (9)--(10)    & \OK{verified}  & --- \\
+Edge tensor (ACE $A$-basis)     & (11)--(12)   & \OK{verified}  & \NEW{P1: refactor, bit-exact} \\
+Clebsch--Gordan product         & (13)         & \BAD{incomplete} & \BAD{D5} + \NEW{P2} \\
+Neighbour density               & (14)         & \OK{verified}  & --- \\
+ACE correlations                & (15)--(17)   & \OK{verified}  & \NEW{P2: symmetrise} \\
+Query / key                     & (18)--(19)   & \OK{verified}  & --- \\
+Attention logits                & (20)         & \BAD{code $\neq$ text} & \BAD{D2} + \NEW{P7} \\
+Cutoff softmax + null channel   & (21)         & \OK{verified}  & --- \\
+Values, residual, layer scale   & (22)--(23)   & \BAD{checkpoint} & \BAD{D1} + \NEW{P3} \\
+Scalar FFN                      & (24)--(28)   & \OK{verified}  & \DER{P4: rescale} \\
+Locality statement              & (29)--(30)   & \OK{verified}  & --- \\
+Readout \& forces               & (31)--(32)   & \OK{verified}  & \DER{P6: analytic kernel} \\
+Stress                          & (33)--(36)   & \OK{verified}  & --- \\
+Losses                          & (37)--(40)   & \OK{verified}  & --- \\
+Sobolev regulariser             & (41)         & \BAD{noise-dominated} & \BAD{D4} + \DER{P5} \\
+Error metrics                   & (42)--(44)   & \BAD{offset-contaminated} & \BAD{D3} \\
+Muon optimiser                  & (45)--(50)   & \OK{verified}  & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% =====================================================================
+\section{Implemented equations --- verified correct}
+
+\subsection{Geometry, cutoff, radial basis}
+
+\begin{okbox}{Eq.~(4)--(6) \ Periodic directed edges --- verified: PBC supercell test $2\times10^{-12}$~eV}
+\vspace{-6pt}
+\begin{align*}
+\rr_{ij} &= \rr_j - \rr_i + \bm{S}_{ij}\bm{h}, \qquad
+d_{ij} = \|\rr_{ij}\|_2, \qquad \hat{\rr}_{ij} = \rr_{ij}/d_{ij}\\
+\mathcal{N}(i) &= \{(j,\bm{S}_{ij}) : d_{ij} < r_{\mathrm c}\}
+\end{align*}
+\vspace{-10pt}\\
+\footnotesize\OK{Code: \code{model.py:784--788}. Sender/receiver/shift convention matches
+ASE \code{neighbor\_list('ijS')} exactly. Note $754/979$ CsPbI$_3$ frames violate the
+minimum-image condition, so one $(i,j)$ pair legitimately yields several edge tokens ---
+handled correctly.}
+\end{okbox}
+
+\begin{okbox}{Eq.~(7)--(9) \ Quintic envelope and Bessel basis --- verified $C^2$; $F\propto\varepsilon^{3}$ at $r_{\mathrm c}$}
+\vspace{-6pt}
+\begin{align*}
+f_{\mathrm c}(d) &= 1 - 10x^3 + 15x^4 - 6x^5 \equiv (1-x)^3(1+3x+6x^2), \quad x=d/r_{\mathrm c}\\
+B_n(d) &= f_{\mathrm c}(d)\sqrt{\tfrac{2}{r_{\mathrm c}}}\,\frac{\sin(\omega_n d/r_{\mathrm c})}{d},
+\qquad \omega_n = n\pi
+\end{align*}
+\vspace{-10pt}\\
+\footnotesize\OK{Normalisation $\int_0^{r_{\mathrm c}}B_n^2 d^2\,\mathrm dd = 1$ correct;
+$d\!\to\!0$ analytic limit $n\pi/r_{\mathrm c}$ correct (\code{physics.py:52--56}).
+The factored envelope avoids float32 cancellation near $x=1$.}
+\end{okbox}
+
+\subsection{ACE descriptor}
+
+\begin{okbox}{Eq.~(11)--(12) \ Edge tensor --- \textbf{verified rank-1 to $3.4\times10^{-16}$} (VMK 5.6(14))}
+\vspace{-6pt}
+\begin{equation*}
+\aij = \mathrm{TP}_{\mathrm{dens}}\!\left(\bm{e}_j,\{Y_{\ell m}(\hat{\rr}_{ij})\}_{\ell=0}^{\ell_{\max}};
+\mathrm{MLP}_r[\bm{B}(d_{ij})]\right),
+\qquad
+a^{(\ell,(-1)^\ell)}_{ij,cm} = Y_{\ell m}(\hat{\rr}_{ij})\sum_q R^{(\ell)}_{cq}[\bm{B}(d_{ij})]\,e_{j,q}
+\end{equation*}
+\vspace{-10pt}\\
+\footnotesize\OK{VMK 5.6(14) states $\{Y_{\ell_1}(\Omega)\otimes Y_{\ell_2}(\Omega)\}_{LM}
+= \sqrt{\tfrac{(2\ell_1+1)(2\ell_2+1)}{4\pi(2L+1)}}\,C^{L0}_{\ell_10\ell_20}Y_{LM}(\Omega)$.
+Since $\bm e_j$ is pure $0e$, the product collapses exactly to the component form above.
+Verified: the $(c,m)$ matrix has rank 1 for every edge; recovered constant $=1/\sqrt{2\ell+1}$ exactly.}
+\end{okbox}
+
+\begin{okbox}{Eq.~(14)--(17) \ Density, correlations, centre state --- permutation invariant}
+\vspace{-6pt}
+\begin{align*}
+\Ai &= \sum_{j\in\mathcal N(i)}\aij, \qquad
+\bm{C}^{[1]}_i = \Ai, \qquad
+\bm{C}^{[q+1]}_i = \mathrm{TP}_{q+1}\!\left(\bm{C}^{[q]}_i,\Ai\right)\\
+\hh^{(0)}_i &= \mathrm{Center}(\bm e_i) + \sum_{q=1}^{q_{\max}}\mathrm{Linear}_q\!\left(\bm{C}^{[q]}_i\right)
+\end{align*}
+\vspace{-10pt}\\
+\footnotesize\OK{Matches VMK 3.1(21). \code{correlation\_order} $=q_{\max}+1=4$ confirmed.
+\emph{Caveat retained in the manuscript and correct:} repeated neighbour indices mean
+$\bm C^{[q]}$ is not a pure $(q{+}1)$-body term. VMK 3.2(22)--(23) makes this exact ---
+for a \emph{single} neighbour the whole hierarchy collapses to one $Y_{\ell m}$.}
+\end{okbox}
+
+\subsection{Attention}
+
+\begin{okbox}{Eq.~(21) \ Cutoff-weighted softmax with unit null channel --- verified algebraically exact}
+\vspace{-6pt}
+\begin{equation*}
+\alpha^{(t)}_{ijp} = \frac{f_{\mathrm c}(d_{ij})\exp(\tilde s^{(t)}_{ijp})}
+{1 + \sum_{k\in\mathcal N(i)} f_{\mathrm c}(d_{ik})\exp(\tilde s^{(t)}_{ikp})}
+\end{equation*}
+\vspace{-10pt}\\
+\footnotesize\OK{\code{\_segment\_cutoff\_softmax} reproduces this identically after the
+$\exp(\max)$ rescaling. The ``$1+$'' null token is what prevents normalisation from
+cancelling $f_{\mathrm c}$ in the single-neighbour limit --- confirmed: $E$ continuous and
+$F\propto\varepsilon^3$ as the last edge leaves $r_{\mathrm c}$.
+\textbf{Note:} $\sum_j\alpha_{ij}<1$; this is a \emph{gated sum}, not a convex combination.}
+\end{okbox}
+
+\begin{okbox}{Eq.~(31)--(36) \ Readout, forces, stress --- verified against finite differences}
+\vspace{-6pt}
+\begin{align*}
+E &= \sum_i \mathrm{MLP}_E(\bar{\hh}_{i,\ell=0}) + E_{\mathrm{ref}},\qquad
+\bm F_i = -\left.\frac{\partial E}{\partial\rr_i}\right|_{\bm h}\\
+\sigma_{aa} &= \frac1V\left.\frac{\partial E}{\partial\eta_a}\right|_{\bm\eta=0},\qquad
+\sigma_{xy} = \frac{1}{2V}\left.\frac{\partial E}{\partial\eta_4}\right|_{\bm\eta=0}
+\end{align*}
+\vspace{-10pt}\\
+\footnotesize\OK{Forces vs.\ central FD: $2.6\times10^{-6}$~eV/\AA. $\sum_i\bm F_i = 4\times10^{-17}$.
+Stress vs.\ ASE \code{numeric\_stress}: $7\times10^{-5}$ relative, \emph{including} the
+factor $\tfrac12$ on shear (ASE divides by $4\mathrm dV$). Deployment virial
+$\bm W=-V\bm\sigma$ consistent (\code{deploy.py:169}).}
+\end{okbox}
+
+\begin{okbox}{Eq.~(37)--(40), (45)--(50) \ Losses and Muon --- line-by-line match}
+\footnotesize\OK{All four loss/metric definitions match the trainer, including the stated
+convention that stress-free batch items contribute zero while the denominator stays
+$|\mathcal B|$. Muon reproduces VMK-independent reference exactly: momentum, Nesterov
+form, transpose rule, five quintic Newton--Schulz steps with $(a,b,c)=(3.4445,-4.7750,2.0315)$,
+$\sqrt{\max(1,m/n)}$ scaling, decoupled decay $\Theta_{t+1}=(1-\eta\lambda)\Theta_t-\eta U_t$.}
+\end{okbox}
+
+% =====================================================================
+\section{\BAD{Defects --- implemented but wrong}}
+
+\begin{badbox}{D1 \ Eq.~(23) \ Layer scale breaks $O(3)$ equivariance in the published checkpoint}
+\vspace{-6pt}
+\begin{equation*}
+\widetilde{\hh}^{(t)}_i = \hh^{(t)}_i + \bm\gamma^{(t)}_{\mathrm{attn}}\odot\bm u^{(t)}_i
+\end{equation*}
+\vspace{-8pt}\\
+\footnotesize
+The manuscript states $\bm\gamma_{\mathrm{attn}}$ is \emph{shared over all magnetic
+components $m$ within each irrep copy}. The parameter is stored \emph{per component}
+(\code{irreps.dim}$=240$). The averaging fix (\code{\_irrepwise\_layer\_scale}) landed
+2026-07-11; \code{training/model.pt} was written 2026-06-28.\\[3pt]
+\BAD{\textbf{Proof the checkpoint predates the fix:}} with the fixed code all components of a
+copy receive identical gradients from a uniform init ($0.01$), so they can never diverge.
+Measured within-copy spread: $1.157$ ($\ell{=}1$), $1.356$ ($\ell{=}2$).\\[3pt]
+\BAD{\textbf{Magnitude:}} energy spread under random rotation $= 5.96$~meV/atom (max $7.31$);
+force mismatch $0.115$~eV/\AA. Compare reported accuracy $2.44$~meV/atom, $0.0388$~eV/\AA.
+\textbf{The symmetry violation is 2--3$\times$ larger than the model's own error.}
+Same checkpoint through the fixed path differs by $3.59$~meV/atom and $0.011$~eV/\AA\ RMS.
+\textbf{Requires retraining and regeneration of every figure.}
+\end{badbox}
+
+\begin{badbox}{D2 \ Eq.~(20) \ Attention temperature: code $\neq$ manuscript, and train $\neq$ inference}
+\vspace{-6pt}
+\begin{equation*}
+s^{(t)}_{ijp} = \frac{(\bm q^{(t)}_{ip})^{\!\top}\bm k^{(t)}_{ijp}}{\sqrt{d_k}}
++ b^{(t)}_p(\bm B(d_{ij})) - \mathrm{softplus}(\lambda^{(t)}_p)\,d_{ij},
+\qquad \tilde s^{(t)}_{ijp} = s^{(t)}_{ijp}/T_{\mathrm{att}}(\tau)
+\end{equation*}
+\vspace{-8pt}\\
+\footnotesize
+The text defines $T_{\mathrm{att}}(\tau)$ as a function of \emph{epoch} $\tau$. The code
+(\code{train.py:694--706}) additionally multiplies by a feedback factor
+$\left(\overline{\mathcal L_F}/0.5\right)^{-1/4}$ driven by the running force-loss EMA:
+\[
+\BAD{T_{\mathrm{att}} = T_{\mathrm{base}}(\tau)\cdot\big(\mathrm{EMA}[\mathcal L_F]/T_{\mathrm{ref}}\big)^{\gamma}},
+\qquad T_{\mathrm{ref}}=0.5,\ \gamma=-0.25 .
+\]
+At the final force MSE $1.39\times10^{-3}$ this gives $T_{\mathrm{att}}\approx\BAD{4.36}$, while
+validation (\code{train.py:906}) and the ASE calculator both use $T_{\mathrm{att}}=1$.
+Measured on the trained checkpoint: $E$ error $2.374\to5.156$~meV/atom between the two
+temperatures. \textbf{A different function is being trained than is deployed.}
+\end{badbox}
+
+\begin{badbox}{D3 \ Eq.~(42) \ Reported energy RMSE dominated by a drifting offset}
+\vspace{-6pt}
+\begin{equation*}
+\mathrm{RMSE}_E = \left[\frac{\sum_s N_s(\Delta E_s/N_s)^2}{\sum_s N_s}\right]^{1/2}
+\end{equation*}
+\vspace{-8pt}\\
+\footnotesize
+The formula is correct; the \emph{reference} is a single scalar shift
+($-31.8566$~eV/atom, \code{solve\_atomic\_energies: false}). Decomposition:
+epoch 76 $\to$ mean signed error $+1.832$, s.d.\ $1.509$ (RMSE $2.374$);
+epoch 100 $\to$ mean $+0.176$, s.d.\ $1.521$ (RMSE $1.531$).
+\BAD{The offset-free error is identical ($1.51$) --- the reported RMSE differs by 55\%
+purely from a wandering energy zero.} This explains the epoch-to-epoch oscillation
+($5.81\to2.11\to2.13\to4.20$) while force RMSE stays flat, and the non-reproducibility
+across e3nn versions.
+\end{badbox}
+
+\begin{badbox}{D4 \ Eq.~(41) \ Sobolev term measures dropout variance, not curvature}
+\vspace{-6pt}
+\begin{equation*}
+\mathcal L_{\mathrm{Sob}} = \frac1{|\mathcal B|}\sum_{s}\Big[E_s(\rr_s+\bm\delta_s)-E_s(\rr_s)
++\sum_i \bm F_{si}\!\cdot\!\bm\delta_{si}\Big]^2
+\end{equation*}
+\vspace{-8pt}\\
+\footnotesize
+The two energies are evaluated in \emph{separate forward passes} with \emph{independent}
+attention-dropout masks ($p=0.03$, active in \code{model.train()}).
+Measured on a 40-atom cell: dropout-induced $\mathrm{s.d.}(E) = 0.0504$~eV versus an
+intended residual of $0.0389$~eV --- \BAD{noise/signal $=1.3$}.
+\end{badbox}
+
+\begin{badbox}{D5 \ Eq.~(13) \ Missing channel sums}
+\vspace{-6pt}
+\begin{equation*}
+[\bm x\otimes_{\mathrm{CG}}\bm y]^{(\ell,p)}_{cm}
+= \sum_{\substack{\ell_1p_1c_1m_1\\ \ell_2p_2c_2m_2}}
+W^{\ell_1\ell_2\ell}_{c_1c_2c}\,C^{\ell m}_{\ell_1m_1,\ell_2m_2}\,
+x^{(\ell_1,p_1)}_{c_1m_1}y^{(\ell_2,p_2)}_{c_2m_2}
+\end{equation*}
+\vspace{-8pt}\\
+\footnotesize As printed the channel indices $c_1,c_2$ are not summed. Compare VMK 3.1(20).
+Editorial only --- the code is correct.
+\end{badbox}
+
+% =====================================================================
+\section{\NEW{Planned changes}}
+
+\begin{planbox}{P1 \ Species-factorised edge features --- \textbf{bit-exact}, $1.61\times$ faster, removes 41\% of parameters}
+\footnotesize\textbf{Current} (\code{physics.py:425}): a per-edge weight tensor of
+$1792$ floats is materialised, then contracted with the $64$-dim species embedding.\\[3pt]
+\textbf{Derivation.} By VMK 5.6(14) the output depends on the final radial layer $W_2$
+and the species embedding $E$ \emph{only} through
+\[
+\NEW{M[s,h,c] \;=\; \sum_q W_2[h,q,c]\,E[s,q]},
+\qquad
+a^{(\ell)}_{e,c,m} \;=\; \frac{1}{\sqrt{2\ell+1}}\Big(\sum_h \mathrm{hidden}_h(d_e)\,M[s(e),h,c]\Big)Y_{\ell m}(\hat{\rr}_e).
+\]
+$M$ has only $n_{\mathrm{spec}}\times32\times28$ degrees of freedom.\\[3pt]
+\begin{center}\footnotesize
+\begin{tabular}{@{}lccc@{}}
+\toprule
+$n_{\mathrm{spec}}$ & $W_2$ + used $E$ & d.o.f.\ in $M$ & redundant\\
+\midrule
+2 (water; C/H reaction) & 57{,}472 & 1{,}792 & \NEW{96.9\%}\\
+3 (CsPbI$_3$)           & 57{,}536 & 2{,}688 & \NEW{95.3\%}\\
+8                       & 57{,}856 & 7{,}168 & 87.6\%\\
+\bottomrule
+\end{tabular}
+\end{center}
+\vspace{2pt}
+\textbf{Verified.} A $50\times$ perturbation of $W_2$ inside the null space of $W_2\!\to\!M$
+changes the output by $9.2\times10^{-13}$ (output scale $1.96$).
+For CsPbI$_3$: \NEW{$54{,}656$ parameters $=41\%$ of the $132{,}005$-parameter model
+cannot affect any prediction.}\\[3pt]
+\textbf{Benchmarked.} Factorised path reproduces the current output to
+$5.7\times10^{-16}$ relative; $3.395\to2.107$~ms (\NEW{$1.61\times$}); dominant matmul
+$34.9\to0.72$~MFLOP (\NEW{$49\times$}); intermediate $[608,1792]\to[608,32]$ ($57\times$ smaller).\\[3pt]
+\textbf{Two options.} \emph{(a)} Exact refactor --- keep $W_2$, precompute $M$ once per
+species per forward. Identical model, identical parameters, $1.61\times$ faster.
+\emph{(b)} Re-parameterise --- learn $M$ directly ($2{,}688$ params). \emph{Same function
+class}, but $41\%$ fewer parameters, better conditioning, and no wasted Muon/AdamW
+update budget or weight decay on null directions. \textbf{Recommend (b).}
+\end{planbox}
+
+\begin{planbox}{P2 \ Symmetrise the first ACE contraction --- removes 4{,}136 dead weights}
+\footnotesize\textbf{Current}: \code{contractions[0](density, density)} is
+$\mathrm{TP}(\Ai,\Ai)$ --- the \emph{same} tensor in both slots.\\[3pt]
+\textbf{VMK 3.1(27)} (commuting tensors):
+$\{\bm{\mathfrak M}_{J_1}\otimes\bm{\mathfrak N}_{J_2}\}_{JM}
+= (-1)^{J_1+J_2-J}\{\bm{\mathfrak N}_{J_2}\otimes\bm{\mathfrak M}_{J_1}\}_{JM}$.\\[3pt]
+Consequently, for $\mathrm{TP}(\Ai,\Ai)$:
+\begin{center}\footnotesize
+\begin{tabular}{@{}lc@{}}
+\toprule
+Redundancy source & Dead weights\\
+\midrule
+Antisymmetric part of $W[c_1,c_2,c]$ on all $\ell_1=\ell_2$ paths & 2{,}600\\
+Mirror pairs $(\ell_1,\ell_2)\!\to\!\ell$ vs $(\ell_2,\ell_1)\!\to\!\ell$ & 1{,}536\\
+\midrule
+\textbf{Total} & \textbf{4{,}136 of 8{,}768 = \NEW{47.2\%}}\\
+\bottomrule
+\end{tabular}
+\end{center}
+\vspace{2pt}
+\textbf{Verified}: a large purely antisymmetric perturbation changes
+$\mathrm{TP}(\Ai,\Ai)$ by $2\times10^{-14}$; mirror-pair sensitivities collinear to $6\times10^{-16}$.\\[3pt]
+\NEW{\textbf{Change}}: parameterise only the symmetric part on $\ell_1=\ell_2$ paths and merge
+mirror pairs (equivalently use \code{o3.TensorSquare}). Frees $\sim$4k parameters at
+\emph{identical} expressivity. Alternative with \emph{more} expressivity: contract $\Ai$
+against a distinct learned linear image of $\Ai$, restoring the antisymmetric paths as
+genuine degrees of freedom.
+\end{planbox}
+
+\begin{planbox}{P3 \ Re-shape the layer scale so the broken state is unrepresentable}
+\footnotesize Store $\bm\gamma_{\mathrm{attn}}$ with \emph{one scalar per irrep copy}
+(shape $=\sum_\ell \mathrm{mul}_\ell$) instead of one per component
+($=\sum_\ell \mathrm{mul}_\ell(2\ell+1)$), rather than masking a 240-vector at forward time:
+\[
+\NEW{\bm\gamma \in \mathbb R^{\,64+32+16=112}} \quad\text{replacing}\quad \BAD{\bm\gamma\in\mathbb R^{240}} .
+\]
+Add a CI test asserting rotational invariance of a \emph{loaded checkpoint}. The existing
+test hand-sets the parameter and exercises the fixed path, so it cannot catch D1.
+\end{planbox}
+
+\begin{planbox}{P7 \ Make $T_{\mathrm{att}}$ consistent between training, validation and deployment}
+\footnotesize Either set \code{temperature\_force\_exponent: 0} so
+$T_{\mathrm{att}}\!\to\!1$ before training ends, or pass the same
+\code{temperature\_scale} into the validation forward. Then correct Eq.~(20) to describe
+whichever is used. \NEW{Recommend annealing to 1}, so the deployed potential is the one
+that was optimised.
+\end{planbox}
+
+% =====================================================================
+\section{\DER{Derived from VMK --- candidates, not yet committed}}
+
+\begin{derbox}{P4 \ Rescale the FFN invariants by $(2\ell+1)$}
+\vspace{-6pt}
+\begin{equation*}
+n^{(t)}_{ic\ell} = \sum_{m=-\ell}^{\ell}\big|\widetilde h^{(t,\ell)}_{icm}\big|^2
+\qquad\longrightarrow\qquad
+\DER{\hat n^{(t)}_{ic\ell} = \frac{1}{2\ell+1}\sum_m \big|\widetilde h^{(t,\ell)}_{icm}\big|^2}
+\end{equation*}
+\vspace{-8pt}\\
+\footnotesize By VMK 3.1(35), $(\bm{\mathfrak M}_J\cdot\bm{\mathfrak N}_J)
+=(-1)^{-J}\sqrt{2J+1}\,\{\bm{\mathfrak M}_J\otimes\bm{\mathfrak N}_J\}_{00}$, so the
+invariants carry an $\ell$-dependent natural scale ($\sqrt3$ at $\ell{=}1$, $\sqrt5$ at
+$\ell{=}2$). \code{LayerNorm} absorbs this at inference but it biases initialisation and
+early optimisation. Cost: zero.
+\end{derbox}
+
+\begin{derbox}{P5 \ Exact irreducible Sobolev term (replaces the stochastic finite difference of D4)}
+\vspace{-6pt}
+\begin{equation*}
+(\bm u\!\cdot\!\nabla)^n = (-1)^n\!\!\sum_{\ell_2\ldots\ell_n}\!\!(-1)^{\ell_n}
+\Big(\{\ldots\{\bm u_1\otimes\bm u_1\}_{\ell_2}\ldots\otimes\bm u_1\}_{\ell_n}\cdot
+\{\ldots\{\nabla_1\otimes\nabla_1\}_{\ell_2}\ldots\otimes\nabla_1\}_{\ell_n}\Big)
+\quad\text{\footnotesize VMK 3.2(44)}
+\end{equation*}
+\vspace{-8pt}\\
+\footnotesize The $n=2$ term is exactly the Hessian contraction $\mathcal L_{\mathrm{Sob}}$
+is trying to penalise, decomposed into $\ell=0$ and $\ell=2$ pieces. Using the closed form
+removes the two-forward-pass structure and therefore the dropout contamination of D4
+entirely, and makes the regulariser deterministic.
+\end{derbox}
+
+\begin{derbox}{P6 \ Analytic force kernel for the AOT/LAMMPS path}
+\vspace{-6pt}
+\begin{equation*}
+\nabla\!\left[f(r)Y_{\ell m}\right]
+= -\sqrt{\tfrac{\ell+1}{2\ell+1}}\Big(\tfrac{\mathrm df}{\mathrm dr}-\tfrac{\ell}{r}f\Big)\bm Y^{\ell+1}_{\ell m}
++ \sqrt{\tfrac{\ell}{2\ell+1}}\Big(\tfrac{\mathrm df}{\mathrm dr}+\tfrac{\ell+1}{r}f\Big)\bm Y^{\ell-1}_{\ell m}
+\quad\text{\footnotesize VMK 5.8(9)}
+\end{equation*}
+\vspace{-8pt}\\
+\footnotesize Closed irreducible form for the gradient of one edge feature. Enables an
+analytic (non-autograd) force kernel for the compiled LAMMPS path, and an independent
+check on the autograd forces. Requires VMK Ch.~7.3 (vector spherical harmonics) first.
+\end{derbox}
+
+\begin{derbox}{P8 \ Multipole expansion, if long-range electrostatics is added}
+\vspace{-6pt}
+\begin{equation*}
+\frac{1}{|\rr_1-\rr_2|} = \frac{4\pi}{r_2}\sum_{\ell}\frac{1}{2\ell+1}
+\Big(\frac{r_1}{r_2}\Big)^{\ell}\big(\bm Y_\ell(\Omega_1)\cdot\bm Y_\ell(\Omega_2)\big),
+\qquad r_1<r_2
+\quad\text{\footnotesize VMK 5.17(21)}
+\end{equation*}
+\vspace{-8pt}\\
+\footnotesize Composes directly with the existing $\ell$-channels. \S IV names the absence
+of a long-range term as a scope limitation; this is the form that would not require
+separate Ewald machinery.
+\end{derbox}
+
+% =====================================================================
+\section{Structural results worth stating in the manuscript}
+
+\begin{derbox}{S1 \ Natural parity \emph{is} the Gaunt selection rule}
+\footnotesize
+$C^{L0}_{\ell_10\ell_20}=0$ unless $\ell_1+\ell_2+L$ is even (VMK 5.6(9)). Verified in
+e3nn's real basis: every odd combination ($1,1\!\to\!1$; $1,2\!\to\!2$; $2,2\!\to\!1$;
+$2,2\!\to\!3$) evaluates to \emph{identically zero}. So the $(\ell,(-1)^\ell)$ truncation is
+not an arbitrary economy --- it keeps precisely the couplings that survive for harmonics of
+a single direction. One sentence in \S II A.
+\end{derbox}
+
+\begin{derbox}{S2 \ Association order is a $6j/9j$ basis change, \emph{not} extra expressivity}
+\footnotesize
+VMK 3.3(1) relates left- and right-associated triple products by a $6j$ symbol;
+VMK 3.3(11) relates the pairwise scheme $\{\{P\otimes Q\}\otimes\{R\otimes S\}\}$ to the
+left-associated one by a $9j$. At fixed $\ell_{\max}$ with fully connected channel mixing,
+all association orders reach the same tensor space. \textbf{Any advantage of the v4
+cumulant coupling must therefore be claimed as conditioning/optimisation, not capacity.}
+\end{derbox}
+
+\begin{derbox}{S3 \ Higher $q_{\max}$ requires $\ge 2$ distinct neighbours}
+\footnotesize
+VMK 3.2(22)--(23): a chain of tensor products of a \emph{single} vector equals one
+spherical harmonic times a power of the length. Hence for a one-neighbour environment the
+entire hierarchy $\bm C^{[1]}\ldots\bm C^{[q_{\max}]}$ carries no more information than
+$\{|\rr|, Y_{\ell m}(\hat{\rr})\}$. Testable prediction: accuracy gain from
+\code{correlation\_order} should scale with mean neighbour count --- weaker for
+gas-phase methyl migration than for dense CsPbI$_3$.
+\end{derbox}
+
+% =====================================================================
+\section{\BAD{Negative results --- do not re-try}}
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}p{7.6cm}p{4.2cm}p{4.2cm}@{}}
+\toprule
+\textbf{Hypothesis} & \textbf{Measured} & \textbf{Verdict}\\
+\midrule
+Hand-write \code{tp\_density} keeping per-edge weights
+& $2.281\to2.237$~ms & $1.02\times$; the TP is not the bottleneck, the per-edge weight \emph{tensor} is\\
+\addlinespace
+Fuse the $H$ per-head \code{o3.Linear} value projections
+& $H{=}2$: $1.13\times$; $H{=}4$: $1.01\times$; $H{=}8$: $0.98\times$
+& not worth it; worse at large $H$\\
+\addlinespace
+Addition theorem (VMK 5.17(9)) to replace $\sum_m$ with Legendre polynomials
+& cost $n(\ell{+}1)^2$ vs $n^2\ell$
+& wins only when $\ell_{\max}\gtrsim\bar n$; \textbf{a loss} at $\bar n\approx15$, $\ell_{\max}=2$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\footnotesize
+\textbf{Profile for reference} (40-atom cell, 608 edges, 1 CPU thread, energy+forces
+$=20.8$~ms): \code{aten::bmm} 38.4\% self CPU (1440 calls), \code{aten::einsum} 21.4\%
+of total (600 calls), \code{aten::fill\_} 6.4\%, \code{aten::mm} 5.1\%. The batched-matmul
+time is dominated by the per-edge weight contraction that P1 removes.
+
+\vfill
+\begin{center}\footnotesize\color{black!60}
+Verification scripts and raw numbers: see \code{docs/PEER\_REVIEW.md} and
+\code{docs/ANGULAR\_MOMENTUM\_REFERENCE.md}.
+All figures in this ledger were measured on the shipped \code{training/model.pt}
+(epoch 76) and \code{training/train.extxyz} (979 frames).
+\end{center}
+
+\end{document}

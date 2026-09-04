@@ -16,25 +16,57 @@ from .physics import (
 )
 
 
+def _layer_scale_num_copies(blocks: tuple[tuple[int, int], ...]) -> int:
+    """Number of irrep copies, i.e. the number of independent equivariant scales."""
+    return int(sum(multiplicity for multiplicity, _ in blocks))
+
+
 def _irrepwise_layer_scale(
     scale: torch.Tensor,
     blocks: tuple[tuple[int, int], ...],
 ) -> torch.Tensor:
-    """Tie a legacy componentwise layer-scale parameter within each irrep copy.
+    """Broadcast one scalar per irrep copy to all of its magnetic components.
 
-    A scalar multiplier may differ between copies of an irrep, but it must be
-    identical for all ``m`` components of one copy to commute with rotations.
-    Keeping the stored parameter shape preserves compatibility with existing
-    checkpoints; averaging its components gives the unique equivariant scale.
+    Equivariance requires the residual multiplier to be constant over the
+    ``2*l+1`` components ``m`` of a single irrep copy: only then does it commute
+    with the Wigner rotation ``D^{(l)}``.  The parameter is therefore *stored*
+    with one entry per copy, so a non-equivariant state is unrepresentable by
+    construction rather than being projected away at forward time.
+
+    ``scale`` has shape ``(sum_l mul_l,)`` and the return value has shape
+    ``(sum_l mul_l * (2*l+1),)``, matching ``irreps.dim``.
     """
     pieces = []
     offset = 0
     for multiplicity, irrep_dim in blocks:
-        width = multiplicity * irrep_dim
-        copy_scale = scale[offset : offset + width].reshape(multiplicity, irrep_dim)
-        pieces.append(copy_scale.mean(dim=-1, keepdim=True).expand(-1, irrep_dim).reshape(-1))
-        offset += width
+        copy_scale = scale[offset : offset + multiplicity]
+        pieces.append(copy_scale.unsqueeze(-1).expand(multiplicity, irrep_dim).reshape(-1))
+        offset += multiplicity
     return torch.cat(pieces)
+
+
+def freeze_layer_scales(model: torch.nn.Module) -> int:
+    """Bake the expanded residual layer scale as a constant, for inference only.
+
+    ``_irrepwise_layer_scale`` broadcasts one scalar per irrep copy to all of its
+    magnetic components. During inference the underlying parameter is fixed, so
+    the broadcast is a compile-time constant that is otherwise recomputed on
+    every step. Freezing it removes a ``(mul, 2l+1)`` expand-and-concatenate from
+    the traced graph, which matters for ahead-of-time compilation, and saves the
+    work at every MD step.
+
+    Returns the number of blocks frozen. Call only on a model in ``eval()`` mode;
+    training must keep the live parameter so gradients flow.
+    """
+    frozen = 0
+    for module in model.modules():
+        scale = getattr(module, "layer_scale_attn", None)
+        blocks = getattr(module, "_layer_scale_blocks", None)
+        if scale is None or blocks is None:
+            continue
+        module._frozen_layer_scale = _irrepwise_layer_scale(scale.detach(), blocks)
+        frozen += 1
+    return frozen
 
 
 def _segment_softmax(logits: torch.Tensor, index: torch.Tensor, num_nodes: int) -> torch.Tensor:
@@ -140,13 +172,18 @@ class LocalEquivariantAttentionBlock(nn.Module):
         )
         self.out_proj = o3.Linear(self.irreps, self.irreps)
         self.dropout = nn.Dropout(dropout)
-        self.layer_scale_attn = (
-            nn.Parameter(torch.full((self.irreps.dim,), float(layer_scale_init)))
-            if layer_scale_init is not None
-            else None
-        )
         self._layer_scale_blocks = tuple(
             (int(multiplicity), int(irrep.dim)) for multiplicity, irrep in self.irreps
+        )
+        self.layer_scale_attn = (
+            nn.Parameter(
+                torch.full(
+                    (_layer_scale_num_copies(self._layer_scale_blocks),),
+                    float(layer_scale_init),
+                )
+            )
+            if layer_scale_init is not None
+            else None
         )
 
         ffn_hidden = ffn_hidden or hidden_dim * 4
@@ -163,6 +200,13 @@ class LocalEquivariantAttentionBlock(nn.Module):
             if layer_scale_init is not None
             else None
         )
+
+    def _attention_layer_scale(self) -> torch.Tensor:
+        """Expanded residual scale, using the frozen constant when available."""
+        frozen = getattr(self, "_frozen_layer_scale", None)
+        if frozen is not None:
+            return frozen
+        return _irrepwise_layer_scale(self.layer_scale_attn, self._layer_scale_blocks)
 
     def forward(
         self,
@@ -196,7 +240,7 @@ class LocalEquivariantAttentionBlock(nn.Module):
         out = out / self.num_heads
         out = self.out_proj(out)
         if self.layer_scale_attn is not None:
-            out = out * _irrepwise_layer_scale(self.layer_scale_attn, self._layer_scale_blocks)
+            out = out * self._attention_layer_scale()
         x = x + out
 
         scalars = x[..., : self.hidden_dim]
@@ -332,9 +376,9 @@ class LegacyTransformersACE(nn.Module):
             # stress and does not pick up spurious rotational components. This
             # matches ACE-style stress evaluation by differentiating with
             # respect to symmetric lattice strains.
-            strain_params = torch.zeros(6, device=pos.device, requires_grad=True)
+            strain_params = torch.zeros(6, device=pos.device, dtype=pos.dtype, requires_grad=True)
 
-            epsilon = torch.zeros(3, 3, device=pos.device)
+            epsilon = torch.zeros(3, 3, device=pos.device, dtype=pos.dtype)
             epsilon[0, 0] = strain_params[0]
             epsilon[1, 1] = strain_params[1]
             epsilon[2, 2] = strain_params[2]
@@ -342,7 +386,7 @@ class LegacyTransformersACE(nn.Module):
             epsilon[0, 2] = epsilon[2, 0] = strain_params[4]
             epsilon[1, 2] = epsilon[2, 1] = strain_params[5]
 
-            deformation = torch.eye(3, device=pos.device) + epsilon
+            deformation = torch.eye(3, device=pos.device, dtype=pos.dtype) + epsilon
             pos = pos @ deformation
             if cell is not None:
                 cell = cell @ deformation
@@ -398,7 +442,7 @@ class LegacyTransformersACE(nn.Module):
         )[0]
         F = -grads if grads is not None else torch.zeros_like(pos)
         
-        S = torch.zeros(3, 3, device=pos.device)
+        S = torch.zeros(3, 3, device=pos.device, dtype=pos.dtype)
         if compute_stress and epsilon is not None:
             # Retain the graph so the outer loss.backward() can still traverse
             # the computation graph built when taking the strain derivative.
@@ -413,7 +457,7 @@ class LegacyTransformersACE(nn.Module):
                 # Map the 6 unique components back to a symmetric stress tensor
                 # and normalize by the deformed volume to avoid overestimating
                 # stress under volumetric strain.
-                stress = torch.zeros(3, 3, device=pos.device)
+                stress = torch.zeros(3, 3, device=pos.device, dtype=pos.dtype)
                 stress[0, 0] = g_eps[0]
                 stress[1, 1] = g_eps[1]
                 stress[2, 2] = g_eps[2]
@@ -517,8 +561,31 @@ class StrictLocalEquivariantAttentionBlock(nn.Module):
         radial_trainable: bool = False,
         gaussian_width: float = 0.5,
         use_distance_penalty: bool = True,
+        attention_mode: str = "full",
     ):
         super().__init__()
+        # Ablation arms. Everything outside the logit construction is identical,
+        # so an accuracy difference is attributable to the weighting itself and
+        # not to a different aggregation, readout or training path.
+        #
+        #   full     l = (q.k)/sqrt(K) + b_h(r) - softplus(s_h) r   (as published)
+        #   no_qk    l =                 b_h(r) - softplus(s_h) r   (distance only)
+        #   uniform  l = 0            -> alpha is the cutoff-weighted mean
+        #   none     the attention update is skipped entirely
+        #
+        # `no_qk` is the decisive control: it keeps a *learned radial filter*,
+        # which is what plain ACE/MACE already provide, and removes only the
+        # content-dependent query-key term. `uniform` drops learned weighting
+        # too; `none` leaves the ACE descriptor plus the scalar FFN and readout.
+        valid_modes = ("full", "no_qk", "uniform", "none")
+        if attention_mode not in valid_modes:
+            raise ValueError(
+                f"attention_mode must be one of {valid_modes}, got {attention_mode!r}"
+            )
+        self.attention_mode = attention_mode
+        self._uses_query_key = attention_mode == "full"
+        self._uses_learned_logits = attention_mode in ("full", "no_qk")
+        self._uses_attention_update = attention_mode != "none"
         self.node_irreps = o3.Irreps(node_irreps)
         self.edge_irreps = o3.Irreps(edge_irreps)
         self.hidden_dim = int(hidden_dim)
@@ -527,13 +594,18 @@ class StrictLocalEquivariantAttentionBlock(nn.Module):
         self.key_dim = key_dim or max(8, hidden_dim // self.num_heads)
 
         self.node_norm = ScalarPreNorm(hidden_dim)
-        self.edge_scalar_norm = nn.LayerNorm(self.edge_scalar_dim)
-        self.q_proj = nn.Linear(hidden_dim, self.num_heads * self.key_dim, bias=False)
-        self.k_proj = nn.Linear(
-            self.edge_scalar_dim,
-            self.num_heads * self.key_dim,
-            bias=False,
-        )
+        # Projections an arm does not use are not created, so each arm reports
+        # an honest parameter count rather than one padded with dead weights.
+        if self._uses_query_key:
+            self.edge_scalar_norm = nn.LayerNorm(self.edge_scalar_dim)
+            self.q_proj = nn.Linear(hidden_dim, self.num_heads * self.key_dim, bias=False)
+            self.k_proj = nn.Linear(
+                self.edge_scalar_dim, self.num_heads * self.key_dim, bias=False
+            )
+        else:
+            self.edge_scalar_norm = None
+            self.q_proj = None
+            self.k_proj = None
         self.radial_basis = SmoothACERadialBasis(
             r_max,
             num_radial,
@@ -542,30 +614,50 @@ class StrictLocalEquivariantAttentionBlock(nn.Module):
             gaussian_width=gaussian_width,
         )
         radial_hidden = max(16, self.num_heads * 4)
-        self.radial_bias = nn.Sequential(
-            nn.Linear(num_radial, radial_hidden),
-            nn.SiLU(),
-            nn.Linear(radial_hidden, self.num_heads),
+        self.radial_bias = (
+            nn.Sequential(
+                nn.Linear(num_radial, radial_hidden),
+                nn.SiLU(),
+                nn.Linear(radial_hidden, self.num_heads),
+            )
+            if self._uses_learned_logits
+            else None
         )
         self.distance_log_scale = (
             nn.Parameter(torch.zeros(self.num_heads))
-            if use_distance_penalty
+            if use_distance_penalty and self._uses_learned_logits
             else None
         )
 
-        self.value_proj = nn.ModuleList(
-            [o3.Linear(self.edge_irreps, self.node_irreps) for _ in range(self.num_heads)]
-        )
-        self.out_proj = o3.Linear(self.node_irreps, self.node_irreps)
-        self.dropout = nn.Dropout(dropout)
-        self.layer_scale_attn = (
-            nn.Parameter(torch.full((self.node_irreps.dim,), float(layer_scale_init)))
-            if layer_scale_init is not None
+        # The `none` arm performs no edge aggregation, so the equivariant value
+        # and output projections would be dead weight; leaving them out keeps its
+        # reported parameter count equal to what it actually uses.
+        self.value_proj = (
+            nn.ModuleList(
+                [o3.Linear(self.edge_irreps, self.node_irreps) for _ in range(self.num_heads)]
+            )
+            if self._uses_attention_update
             else None
         )
+        self.out_proj = (
+            o3.Linear(self.node_irreps, self.node_irreps)
+            if self._uses_attention_update
+            else None
+        )
+        self.dropout = nn.Dropout(dropout)
         self._layer_scale_blocks = tuple(
             (int(multiplicity), int(irrep.dim))
             for multiplicity, irrep in self.node_irreps
+        )
+        self.layer_scale_attn = (
+            nn.Parameter(
+                torch.full(
+                    (_layer_scale_num_copies(self._layer_scale_blocks),),
+                    float(layer_scale_init),
+                )
+            )
+            if layer_scale_init is not None and self._uses_attention_update
+            else None
         )
 
         self.non_scalar_irreps = o3.Irreps(self.node_irreps[1:])
@@ -596,6 +688,13 @@ class StrictLocalEquivariantAttentionBlock(nn.Module):
             scalar_update = scalar_update * self.layer_scale_ffn
         return torch.cat((scalars + scalar_update, rest), dim=-1)
 
+    def _attention_layer_scale(self) -> torch.Tensor:
+        """Expanded residual scale, using the frozen constant when available."""
+        frozen = getattr(self, "_frozen_layer_scale", None)
+        if frozen is not None:
+            return frozen
+        return _irrepwise_layer_scale(self.layer_scale_attn, self._layer_scale_blocks)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -605,19 +704,31 @@ class StrictLocalEquivariantAttentionBlock(nn.Module):
         cutoff: torch.Tensor,
         temperature_scale: float = 1.0,
     ) -> torch.Tensor:
-        if receiver.numel() == 0:
+        if receiver.numel() == 0 or not self._uses_attention_update:
+            # `none` still applies the scalar FFN, so the arms differ only by the
+            # attention update and not by the presence of a nonlinearity.
             return self._apply_scalar_ffn(x)
 
-        x_norm = self.node_norm(x)
-        queries = self.q_proj(x_norm[:, : self.hidden_dim]).view(
-            -1,
-            self.num_heads,
-            self.key_dim,
-        )
-        edge_scalars = self.edge_scalar_norm(edge_features[:, : self.edge_scalar_dim])
-        keys = self.k_proj(edge_scalars).view(-1, self.num_heads, self.key_dim)
-        logits = (queries[receiver] * keys).sum(dim=-1) / math.sqrt(self.key_dim)
-        logits = logits + self.radial_bias(self.radial_basis(edge_len))
+        if self._uses_query_key:
+            x_norm = self.node_norm(x)
+            queries = self.q_proj(x_norm[:, : self.hidden_dim]).view(
+                -1, self.num_heads, self.key_dim
+            )
+            edge_scalars = self.edge_scalar_norm(
+                edge_features[:, : self.edge_scalar_dim]
+            )
+            keys = self.k_proj(edge_scalars).view(-1, self.num_heads, self.key_dim)
+            logits = (queries[receiver] * keys).sum(dim=-1) / math.sqrt(self.key_dim)
+        else:
+            # Same shape and dtype as the full arm, so the softmax, the cutoff
+            # weighting and the aggregation below are bit-for-bit the same code.
+            logits = torch.zeros(
+                (receiver.shape[0], self.num_heads),
+                dtype=edge_features.dtype,
+                device=edge_features.device,
+            )
+        if self.radial_bias is not None:
+            logits = logits + self.radial_bias(self.radial_basis(edge_len))
         if self.distance_log_scale is not None:
             logits = logits - F.softplus(self.distance_log_scale)[None, :] * edge_len[:, None]
         logits = logits / max(float(temperature_scale), 1e-4)
@@ -634,9 +745,7 @@ class StrictLocalEquivariantAttentionBlock(nn.Module):
             )
         update = self.out_proj(update / self.num_heads)
         if self.layer_scale_attn is not None:
-            update = update * _irrepwise_layer_scale(
-                self.layer_scale_attn, self._layer_scale_blocks
-            )
+            update = update * self._attention_layer_scale()
         x = x + update
 
         return self._apply_scalar_ffn(x)
@@ -670,6 +779,7 @@ class TransformersACE(nn.Module):
         attention_dropout: float = 0.0,
         attention_layer_scale_init: float | None = 1e-2,
         attention_distance_penalty: bool = True,
+        attention_mode: str = "full",
         transformer_num_heads: int = 4,
         transformer_ffn_hidden: int | None = None,
         transformer_dropout: float = 0.0,
@@ -708,6 +818,7 @@ class TransformersACE(nn.Module):
             attention_dropout if attention_dropout is not None else transformer_dropout
         )
         edge_scalar_dim = self.ace.irreps_correlation[0].mul
+        self.attention_mode = str(attention_mode)
         self.layers = nn.ModuleList(
             [
                 StrictLocalEquivariantAttentionBlock(
@@ -726,6 +837,7 @@ class TransformersACE(nn.Module):
                     radial_trainable=radial_trainable,
                     gaussian_width=gaussian_width,
                     use_distance_penalty=attention_distance_penalty,
+                    attention_mode=attention_mode,
                 )
                 for _ in range(num_layers)
             ]
@@ -737,6 +849,115 @@ class TransformersACE(nn.Module):
         )
         self.aux_force_head = None
         self.aux_stress_head = None
+
+    def forward_batched(
+        self,
+        data,
+        training=False,
+        temperature_scale: float = 1.0,
+        detach_pos: bool = True,
+        compute_stress: bool | None = None,
+    ):
+        """Evaluate several structures as one disconnected graph.
+
+        ``data['batch']`` maps each atom to its structure, ``data['cell']`` and
+        ``data['volume']`` carry a leading structure dimension, and the edge
+        indices are already offset into the concatenated atom list.  Returns
+        *per-structure* energies and stresses; forces stay per atom.
+
+        This exists because the GPU is launch-bound for single small cells: one
+        batched graph issues the same number of kernels as one structure but
+        does B times the work inside them.  The single-structure ``forward`` is
+        left byte-identical so the deployed TorchScript/AOT paths cannot regress.
+        """
+        z, pos, edge_index = data['z'], data['pos'], data['edge_index']
+        batch = data['batch']
+        n_struct = int(data['n_structures'])
+        cell = data.get('cell', None)
+        edge_shift = data.get('edge_shift', None)
+        cell_volume = data.get('volume', None)
+
+        if compute_stress is None:
+            compute_stress = training
+
+        if detach_pos:
+            pos = pos.detach()
+        pos.requires_grad_(True)
+
+        if cell is not None:
+            cell = cell.to(device=pos.device, dtype=pos.dtype)
+
+        if compute_stress and (cell is not None or cell_volume is not None):
+            strain_params = torch.zeros(
+                n_struct, 6, device=pos.device, dtype=pos.dtype, requires_grad=True
+            )
+            epsilon = torch.zeros(n_struct, 3, 3, device=pos.device, dtype=pos.dtype)
+            epsilon[:, 0, 0] = strain_params[:, 0]
+            epsilon[:, 1, 1] = strain_params[:, 1]
+            epsilon[:, 2, 2] = strain_params[:, 2]
+            epsilon[:, 0, 1] = epsilon[:, 1, 0] = strain_params[:, 3]
+            epsilon[:, 0, 2] = epsilon[:, 2, 0] = strain_params[:, 4]
+            epsilon[:, 1, 2] = epsilon[:, 2, 1] = strain_params[:, 5]
+            deformation = torch.eye(3, device=pos.device, dtype=pos.dtype).unsqueeze(0) + epsilon
+            pos = torch.bmm(pos.unsqueeze(1), deformation[batch]).squeeze(1)
+            if cell is not None:
+                cell = torch.bmm(cell, deformation)
+        else:
+            strain_params = None
+            epsilon = None
+            deformation = None
+
+        edge_vec = pos[edge_index[0]] - pos[edge_index[1]]
+        if edge_shift is not None and cell is not None:
+            edge_shift = edge_shift.to(device=pos.device, dtype=pos.dtype)
+            edge_cell = cell[batch[edge_index[1]]]
+            edge_vec = edge_vec + torch.bmm(edge_shift.unsqueeze(1), edge_cell).squeeze(1)
+        edge_len = torch.norm(edge_vec, dim=1)
+
+        h, edge_features, cutoff = self.ace(
+            self.emb(z), edge_index, edge_vec, edge_len, return_edge_features=True
+        )
+        receiver = edge_index[1]
+        for layer in self.layers:
+            h = layer(
+                h, edge_features, receiver, edge_len, cutoff,
+                temperature_scale=temperature_scale,
+            )
+
+        atom_energy = self.readout(h[:, : self.hidden_dim]).squeeze(-1)
+        E = torch.zeros(n_struct, device=pos.device, dtype=atom_energy.dtype)
+        E = E.index_add(0, batch, atom_energy)
+        total = E.sum()
+
+        grads = torch.autograd.grad(
+            total, pos,
+            create_graph=training,
+            retain_graph=training or epsilon is not None,
+            allow_unused=True,
+        )[0]
+        F = -grads if grads is not None else torch.zeros_like(pos)
+
+        S = torch.zeros(n_struct, 3, 3, device=pos.device, dtype=pos.dtype)
+        if compute_stress and epsilon is not None:
+            g_eps = torch.autograd.grad(
+                total, strain_params,
+                create_graph=training, retain_graph=training, allow_unused=True,
+            )[0]
+            if g_eps is not None:
+                stress = torch.zeros(n_struct, 3, 3, device=pos.device, dtype=pos.dtype)
+                stress[:, 0, 0] = g_eps[:, 0]
+                stress[:, 1, 1] = g_eps[:, 1]
+                stress[:, 2, 2] = g_eps[:, 2]
+                stress[:, 0, 1] = stress[:, 1, 0] = 0.5 * g_eps[:, 3]
+                stress[:, 0, 2] = stress[:, 2, 0] = 0.5 * g_eps[:, 4]
+                stress[:, 1, 2] = stress[:, 2, 1] = 0.5 * g_eps[:, 5]
+                if cell is not None:
+                    volume = torch.det(cell).abs().clamp_min(1e-12)
+                else:
+                    volume = cell_volume * torch.det(deformation)
+                S = stress / volume.view(-1, 1, 1)
+
+        return E, F, S, {}
 
     def forward(
         self,
@@ -763,9 +984,9 @@ class TransformersACE(nn.Module):
             cell = cell.to(device=pos.device, dtype=pos.dtype)
 
         if compute_stress and cell_volume is not None:
-            strain_params = torch.zeros(6, device=pos.device, requires_grad=True)
+            strain_params = torch.zeros(6, device=pos.device, dtype=pos.dtype, requires_grad=True)
 
-            epsilon = torch.zeros(3, 3, device=pos.device)
+            epsilon = torch.zeros(3, 3, device=pos.device, dtype=pos.dtype)
             epsilon[0, 0] = strain_params[0]
             epsilon[1, 1] = strain_params[1]
             epsilon[2, 2] = strain_params[2]
@@ -773,7 +994,7 @@ class TransformersACE(nn.Module):
             epsilon[0, 2] = epsilon[2, 0] = strain_params[4]
             epsilon[1, 2] = epsilon[2, 1] = strain_params[5]
 
-            deformation = torch.eye(3, device=pos.device) + epsilon
+            deformation = torch.eye(3, device=pos.device, dtype=pos.dtype) + epsilon
             pos = pos @ deformation
             if cell is not None:
                 cell = cell @ deformation
@@ -818,7 +1039,7 @@ class TransformersACE(nn.Module):
         )[0]
         F = -grads if grads is not None else torch.zeros_like(pos)
 
-        S = torch.zeros(3, 3, device=pos.device)
+        S = torch.zeros(3, 3, device=pos.device, dtype=pos.dtype)
         if compute_stress and epsilon is not None:
             g_eps = torch.autograd.grad(
                 E,
@@ -828,7 +1049,7 @@ class TransformersACE(nn.Module):
                 allow_unused=True,
             )[0]
             if g_eps is not None:
-                stress = torch.zeros(3, 3, device=pos.device)
+                stress = torch.zeros(3, 3, device=pos.device, dtype=pos.dtype)
                 stress[0, 0] = g_eps[0]
                 stress[1, 1] = g_eps[1]
                 stress[2, 2] = g_eps[2]
@@ -939,14 +1160,19 @@ class TensorialFixedEnvironmentAttentionBlock(nn.Module):
         )
         self.out_proj = o3.Linear(self.node_irreps, self.node_irreps)
         self.dropout = nn.Dropout(dropout)
-        self.layer_scale_attn = (
-            nn.Parameter(torch.full((self.node_irreps.dim,), float(layer_scale_init)))
-            if layer_scale_init is not None
-            else None
-        )
         self._layer_scale_blocks = tuple(
             (int(multiplicity), int(irrep.dim))
             for multiplicity, irrep in self.node_irreps
+        )
+        self.layer_scale_attn = (
+            nn.Parameter(
+                torch.full(
+                    (_layer_scale_num_copies(self._layer_scale_blocks),),
+                    float(layer_scale_init),
+                )
+            )
+            if layer_scale_init is not None
+            else None
         )
 
         self.non_scalar_irreps = o3.Irreps(self.node_irreps[1:])
@@ -998,6 +1224,13 @@ class TensorialFixedEnvironmentAttentionBlock(nn.Module):
             update = update * self.layer_scale_ffn
         return torch.cat((scalars + update, rest), dim=-1)
 
+    def _attention_layer_scale(self) -> torch.Tensor:
+        """Expanded residual scale, using the frozen constant when available."""
+        frozen = getattr(self, "_frozen_layer_scale", None)
+        if frozen is not None:
+            return frozen
+        return _irrepwise_layer_scale(self.layer_scale_attn, self._layer_scale_blocks)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1044,9 +1277,7 @@ class TensorialFixedEnvironmentAttentionBlock(nn.Module):
             )
         update = self.out_proj(update / self.num_heads)
         if self.layer_scale_attn is not None:
-            update = update * _irrepwise_layer_scale(
-                self.layer_scale_attn, self._layer_scale_blocks
-            )
+            update = update * self._attention_layer_scale()
         return self._apply_scalar_ffn(x + update)
 
 
@@ -1145,9 +1376,7 @@ class CumulantMultiQueryTensorialAttentionBlock(TensorialFixedEnvironmentAttenti
         update.index_add_(0, token_receiver, coefficient.to(values.dtype) * values)
         update = self.out_proj(update)
         if self.layer_scale_attn is not None:
-            update = update * _irrepwise_layer_scale(
-                self.layer_scale_attn, self._layer_scale_blocks
-            )
+            update = update * self._attention_layer_scale()
         return self._apply_scalar_ffn(x + update)
 
 
@@ -1291,8 +1520,8 @@ class TransformersACEV3(nn.Module):
             cell = cell.to(device=pos.device, dtype=pos.dtype)
 
         if compute_stress and cell_volume is not None:
-            strain_params = torch.zeros(6, device=pos.device, requires_grad=True)
-            epsilon = torch.zeros(3, 3, device=pos.device)
+            strain_params = torch.zeros(6, device=pos.device, dtype=pos.dtype, requires_grad=True)
+            epsilon = torch.zeros(3, 3, device=pos.device, dtype=pos.dtype)
             epsilon[0, 0] = strain_params[0]
             epsilon[1, 1] = strain_params[1]
             epsilon[2, 2] = strain_params[2]

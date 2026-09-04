@@ -1,0 +1,22 @@
+# TRACE -- pinned runtime environment (architecture v2).
+#
+# These are exact pins, verified to resolve together on CPython 3.11, 3.12 and
+# 3.13 inside a virtual environment. They match the versions recorded in the
+# run manifest, so a training run made with this file is reproducible.
+#
+#   python -m pip install -r requirements.txt
+#
+# e3nn is pinned to the 0.6.x series deliberately: tensor-product normalisation
+# conventions changed between 0.4.x and 0.6.x, so a checkpoint trained under one
+# series does not reproduce the same energies under the other.
+
+torch==2.12.0
+e3nn==0.6.0
+ase==3.28.0
+numpy==2.4.6
+scipy==1.17.1
+opt_einsum==3.4.0
+opt-einsum-fx==0.1.4
+packaging==26.2
+PyYAML==6.0.3
+matplotlib==3.11.0

@@ -19,3 +19,6 @@ The committed files under `results/` were generated in one run with this exact
 checkpoint. Per-phase scratch directories and copied checkpoints remain ignored
 because mixing checkpoints between phases does not define a valid relative
 energy comparison.
+
+The 240-atom, 1-atm delta--cubic thermodynamic-integration workflow is documented
+in [free_energy_ti/README.md](free_energy_ti/README.md).

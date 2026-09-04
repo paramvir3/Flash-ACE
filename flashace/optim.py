@@ -4,22 +4,89 @@ from __future__ import annotations
 
 import math
 from fnmatch import fnmatch
-from typing import Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple, Union
 
 import torch
 
 
-def zeropower_via_newtonschulz5(matrix: torch.Tensor, steps: int = 5) -> torch.Tensor:
-    """Return the Newton-Schulz zero-power approximation used by Muon.
+NewtonSchulzDType = Union[str, torch.dtype, None]
 
-    This mirrors the NequIX/KellerJordan quintic Newton-Schulz iteration and
-    orthogonalizes along the last two dimensions.
+
+def _resolve_newton_schulz_dtype(
+    matrix: torch.Tensor, compute_dtype: NewtonSchulzDType,
+) -> torch.dtype:
+    """Select a stable arithmetic dtype for the Newton--Schulz iteration.
+
+    The reference Muon implementation uses bfloat16 on CUDA.  That is an
+    important throughput choice for modern NVIDIA GPUs, whereas CPU training
+    should retain the parameter precision.  ``auto`` therefore selects
+    bfloat16 only on CUDA and otherwise preserves a supported floating dtype.
+    """
+
+    if compute_dtype is None or str(compute_dtype).lower() == "auto":
+        if matrix.is_cuda and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        if matrix.dtype in {torch.float32, torch.float64, torch.bfloat16}:
+            return matrix.dtype
+        return torch.float32
+
+    if isinstance(compute_dtype, torch.dtype):
+        dtype = compute_dtype
+    elif isinstance(compute_dtype, str):
+        aliases = {
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float64": torch.float64,
+            "fp64": torch.float64,
+        }
+        try:
+            dtype = aliases[compute_dtype.strip().lower()]
+        except KeyError as error:
+            supported = ", ".join(sorted(aliases)) + ", auto"
+            raise ValueError(
+                f"Unsupported Muon Newton-Schulz dtype {compute_dtype!r}; "
+                f"choose one of: {supported}"
+            ) from error
+    else:
+        raise TypeError("Muon Newton-Schulz dtype must be a torch.dtype, string, or None")
+
+    if dtype not in {torch.float32, torch.float64, torch.bfloat16}:
+        raise ValueError("Muon Newton-Schulz arithmetic must use float32, float64, or bfloat16")
+    if (
+        dtype == torch.bfloat16
+        and matrix.device.type == "cuda"
+        and not torch.cuda.is_bf16_supported()
+    ):
+        raise ValueError("bfloat16 Muon Newton-Schulz requires CUDA bfloat16 support")
+    return dtype
+
+
+def zeropower_via_newtonschulz5(
+    matrix: torch.Tensor,
+    steps: int = 5,
+    compute_dtype: NewtonSchulzDType = "auto",
+) -> torch.Tensor:
+    """Approximate the Muon zero-power map along the last two dimensions.
+
+    For a matrix with singular-value decomposition ``G = U S V^T``, the
+    quintic Newton--Schulz iteration preserves ``U`` and ``V`` while mapping
+    the nonzero singular values toward a bounded value near one.  It therefore
+    approximates the semi-orthogonal update ``U V^T`` without an SVD.  Leading
+    dimensions are treated as independent batches, matching the current
+    Muon reference implementation.
     """
 
     if matrix.ndim < 2:
         raise ValueError("Muon zero-power update requires a matrix-shaped tensor")
+    if int(steps) <= 0:
+        raise ValueError("Muon Newton-Schulz steps must be a positive integer")
+    if not matrix.is_floating_point():
+        raise TypeError("Muon zero-power update requires a floating-point tensor")
 
-    update = matrix
+    result_dtype = matrix.dtype
+    update = matrix.to(dtype=_resolve_newton_schulz_dtype(matrix, compute_dtype))
     transposed = update.size(-2) > update.size(-1)
     if transposed:
         update = update.mT
@@ -32,7 +99,7 @@ def zeropower_via_newtonschulz5(matrix: torch.Tensor, steps: int = 5) -> torch.T
 
     if transposed:
         update = update.mT
-    return update
+    return update.to(dtype=result_dtype)
 
 
 def muon_update(
@@ -41,15 +108,25 @@ def muon_update(
     beta: float = 0.95,
     ns_steps: int = 5,
     nesterov: bool = True,
+    ns_dtype: NewtonSchulzDType = "auto",
 ) -> torch.Tensor:
-    """Compute one Muon update for a matrix-like parameter gradient."""
+    """Compute a Muon update for a matrix-like parameter gradient.
+
+    Two-dimensional weights are processed directly.  Four-dimensional
+    convolutional filters are flattened to ``(out_channels, -1)`` before the
+    zero-power map, as in the reference Muon implementation.  Other leading
+    dimensions are handled as a batch of matrices.
+    """
 
     momentum.lerp_(grad, 1.0 - beta)
     update = grad.lerp(momentum, beta) if nesterov else momentum
     if update.ndim == 4:
-        update = update.view(len(update), -1)
-    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
-    update = update * math.sqrt(max(1.0, grad.size(-2) / grad.size(-1)))
+        update = update.reshape(update.size(0), -1)
+    aspect_ratio_scale = math.sqrt(max(1.0, update.size(-2) / update.size(-1)))
+    update = zeropower_via_newtonschulz5(
+        update, steps=ns_steps, compute_dtype=ns_dtype,
+    )
+    update = update * aspect_ratio_scale
     return update.reshape_as(grad)
 
 
@@ -91,11 +168,14 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
                 group.setdefault("weight_decay", 0.0)
                 group.setdefault("ns_steps", 5)
                 group.setdefault("nesterov", True)
+                group.setdefault("ns_dtype", "auto")
+                _validate_muon_group(group)
             else:
                 group.setdefault("lr", 3.0e-4)
                 group.setdefault("betas", (0.9, 0.95))
                 group.setdefault("eps", 1.0e-10)
                 group.setdefault("weight_decay", 0.0)
+                _validate_adamw_group(group)
         super().__init__(groups, {})
 
     @torch.no_grad()
@@ -118,10 +198,12 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
         beta = group["momentum"]
         ns_steps = group["ns_steps"]
         nesterov = group["nesterov"]
+        # Checkpoints written before ``ns_dtype`` was introduced remain valid.
+        ns_dtype = group.get("ns_dtype", "auto")
 
         for param in group["params"]:
             if param.grad is None:
-                param.grad = torch.zeros_like(param)
+                continue
             grad = param.grad
             if grad.is_sparse:
                 raise RuntimeError("Muon does not support sparse gradients")
@@ -138,6 +220,7 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
                 beta=beta,
                 ns_steps=ns_steps,
                 nesterov=nesterov,
+                ns_dtype=ns_dtype,
             )
             if weight_decay != 0.0:
                 param.mul_(1.0 - lr * weight_decay)
@@ -150,7 +233,7 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
 
         for param in group["params"]:
             if param.grad is None:
-                param.grad = torch.zeros_like(param)
+                continue
             grad = param.grad
             if grad.is_sparse:
                 raise RuntimeError("AdamW auxiliary groups do not support sparse gradients")
@@ -177,6 +260,35 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
 
 
 SingleDeviceMuonWithAuxAdam = MuonWithAuxAdamW
+
+
+def _validate_muon_group(group: MutableMapping) -> None:
+    """Fail early for optimizer settings with undefined Muon dynamics."""
+
+    if float(group["lr"]) < 0.0:
+        raise ValueError("Muon learning rate must be nonnegative")
+    if float(group["weight_decay"]) < 0.0:
+        raise ValueError("Muon weight decay must be nonnegative")
+    if not 0.0 <= float(group["momentum"]) < 1.0:
+        raise ValueError("Muon momentum must satisfy 0 <= momentum < 1")
+    if int(group["ns_steps"]) <= 0:
+        raise ValueError("Muon Newton-Schulz steps must be a positive integer")
+    # Parse now so configuration errors are reported before a costly training run.
+    _resolve_newton_schulz_dtype(torch.empty(1, 1), group["ns_dtype"])
+
+
+def _validate_adamw_group(group: MutableMapping) -> None:
+    """Validate the AdamW part of the combined optimizer."""
+
+    if float(group["lr"]) < 0.0:
+        raise ValueError("AdamW learning rate must be nonnegative")
+    if float(group["weight_decay"]) < 0.0:
+        raise ValueError("AdamW weight decay must be nonnegative")
+    betas = tuple(float(beta) for beta in group["betas"])
+    if len(betas) != 2 or not all(0.0 <= beta < 1.0 for beta in betas):
+        raise ValueError("AdamW betas must contain two values in [0, 1)")
+    if float(group["eps"]) <= 0.0:
+        raise ValueError("AdamW epsilon must be positive")
 
 
 def _is_no_decay_name(name: str) -> bool:
@@ -208,6 +320,8 @@ def _is_hidden_muon_matrix(name: str, param: torch.nn.Parameter) -> bool:
     hidden_patterns = (
         "layers.*.q_proj.weight",
         "layers.*.k_proj.weight",
+        "layers.*.q_scalar.weight",
+        "layers.*.k_scalar.weight",
         "layers.*.scalar_ffn.*.weight",
     )
     excluded_patterns = (
@@ -229,6 +343,7 @@ def get_muon_param_groups(
     momentum: float = 0.95,
     ns_steps: int = 5,
     nesterov: bool = True,
+    ns_dtype: NewtonSchulzDType = "auto",
     aux_betas: Tuple[float, float] = (0.9, 0.95),
     aux_eps: float = 1.0e-10,
     parameter_mode: str = "hidden",
@@ -288,6 +403,7 @@ def get_muon_param_groups(
                 "weight_decay": weight_decay,
                 "ns_steps": int(ns_steps),
                 "nesterov": bool(nesterov),
+                "ns_dtype": ns_dtype,
             }
         )
     if aux_decay_params:
@@ -358,6 +474,7 @@ def build_optimizer(model: torch.nn.Module, config: Dict) -> torch.optim.Optimiz
             momentum=float(config.get("muon_momentum", 0.95)),
             ns_steps=int(config.get("muon_ns_steps", 5)),
             nesterov=_config_bool(config.get("muon_nesterov", True)),
+            ns_dtype=config.get("muon_ns_dtype", "auto"),
             aux_betas=(betas[0], betas[1]),
             aux_eps=float(config.get("muon_aux_eps", 1.0e-10)),
             parameter_mode=str(config.get("muon_parameter_mode", "hidden")),

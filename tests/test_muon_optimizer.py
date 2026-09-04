@@ -28,9 +28,9 @@ def _reference_muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True)
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp(momentum, beta) if nesterov else momentum
     if update.ndim == 4:
-        update = update.view(len(update), -1)
+        update = update.reshape(len(update), -1)
     update = _reference_zeropower(update, steps=ns_steps)
-    update *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5
+    update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
     return update.reshape_as(grad)
 
 
@@ -99,6 +99,40 @@ def test_muon_update_matches_nequix_reference_update():
     torch.testing.assert_close(momentum, ref_momentum)
 
 
+def test_muon_update_uses_flattened_convolutional_aspect_ratio():
+    torch.manual_seed(4)
+    grad = torch.randn(30, 1, 2, 7)
+    momentum = torch.zeros_like(grad)
+    expected_momentum = momentum.clone()
+
+    expected = _reference_muon_update(
+        grad.clone(), expected_momentum, beta=0.95, ns_steps=5,
+    )
+    actual = muon_update(
+        grad.clone(), momentum, beta=0.95, ns_steps=5, ns_dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(momentum, expected_momentum)
+
+
+def test_batched_matrix_muon_update_is_finite_and_preserves_shape():
+    torch.manual_seed(5)
+    grad = torch.randn(3, 7, 4)
+    momentum = torch.zeros_like(grad)
+    update = muon_update(grad, momentum, ns_dtype=torch.float32)
+
+    assert update.shape == grad.shape
+    assert torch.isfinite(update).all()
+
+
+def test_newton_schulz_returns_parameter_dtype_after_internal_precision_cast():
+    matrix = torch.randn(7, 5, dtype=torch.float32)
+    update = zeropower_via_newtonschulz5(matrix, compute_dtype=torch.bfloat16)
+    assert update.dtype == matrix.dtype
+    assert torch.isfinite(update).all()
+
+
 def test_aux_adam_update_matches_nequix_reference_update():
     torch.manual_seed(3)
     grad = torch.randn(5)
@@ -151,6 +185,56 @@ def test_muon_optimizer_steps_matrix_and_auxiliary_parameters():
     assert not torch.allclose(model.vector_weight, vector_before)
 
 
+def test_optimizer_skips_parameters_without_gradients():
+    matrix = torch.nn.Parameter(torch.randn(4, 3))
+    vector = torch.nn.Parameter(torch.randn(3))
+    groups = [
+        {
+            "params": [matrix],
+            "use_muon": True,
+            "lr": 0.1,
+            "weight_decay": 0.1,
+        },
+        {
+            "params": [vector],
+            "use_muon": False,
+            "lr": 0.1,
+            "weight_decay": 0.1,
+        },
+    ]
+    optimizer = MuonWithAuxAdamW(groups)
+    matrix_before = matrix.detach().clone()
+    vector_before = vector.detach().clone()
+
+    optimizer.step()
+
+    torch.testing.assert_close(matrix, matrix_before)
+    torch.testing.assert_close(vector, vector_before)
+    assert matrix not in optimizer.state
+    assert vector not in optimizer.state
+
+
+def test_optimizer_loads_checkpoints_written_before_ns_dtype_was_added():
+    parameter = torch.nn.Parameter(torch.randn(4, 3))
+    optimizer = MuonWithAuxAdamW([
+        {"params": [parameter], "use_muon": True, "lr": 1.0e-3},
+    ])
+    parameter.grad = torch.randn_like(parameter)
+    optimizer.step()
+    legacy_state = optimizer.state_dict()
+    legacy_state["param_groups"][0].pop("ns_dtype")
+
+    restored_parameter = torch.nn.Parameter(parameter.detach().clone())
+    restored = MuonWithAuxAdamW([
+        {"params": [restored_parameter], "use_muon": True, "lr": 1.0e-3},
+    ])
+    restored.load_state_dict(legacy_state)
+    restored_parameter.grad = torch.randn_like(restored_parameter)
+    restored.step()
+
+    assert torch.isfinite(restored_parameter).all()
+
+
 def test_default_muon_grouping_uses_only_transformer_hidden_matrices():
     from flashace.model import TransformersACE
 
@@ -178,3 +262,27 @@ def test_default_muon_grouping_uses_only_transformer_hidden_matrices():
     assert "layers.0.k_proj.weight" in muon_names
     assert "layers.0.scalar_ffn.0.weight" in muon_names
     assert "layers.0.scalar_ffn.3.weight" in muon_names
+
+
+def test_default_muon_grouping_covers_v3_and_v4_scalar_query_key_matrices():
+    from flashace.model import TransformersACEV3, TransformersACEV4
+
+    for model_class in (TransformersACEV3, TransformersACEV4):
+        model = model_class(
+            r_max=3.0,
+            l_max=1,
+            num_radial=3,
+            hidden_dim=8,
+            num_layers=1,
+            correlation_channels=4,
+            attention_num_heads=2,
+        )
+        groups = get_muon_param_groups(model, learning_rate=1.0e-3, weight_decay=1.0e-4)
+        muon_group = next(group for group in groups if group["use_muon"])
+        by_id = {id(param): name for name, param in model.named_parameters()}
+        muon_names = {by_id[id(param)] for param in muon_group["params"]}
+
+        assert "layers.0.q_scalar.weight" in muon_names
+        assert "layers.0.k_scalar.weight" in muon_names
+        assert "layers.0.scalar_ffn.0.weight" in muon_names
+        assert "layers.0.scalar_ffn.3.weight" in muon_names
