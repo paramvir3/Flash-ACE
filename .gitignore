@@ -25,6 +25,7 @@ checkpoints/
 # Published reproducibility bundle
 !training/train.extxyz
 !training/model.pt
+!training/model_last.pt
 !tests/run_lammps/model.transformers_ace.pt
 
 # Generated training artifacts
